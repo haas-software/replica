@@ -1,0 +1,15 @@
+[package]
+name = "replica-sqlite-smoke"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+replica-sqlite = { path = "../../sqlite" }
+applib = { git = "https://github.com/xinix00/HopOS.git", tag = "v3.0.0-alpha.16" }
+
+[lints]
+workspace = true

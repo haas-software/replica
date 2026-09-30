@@ -1,0 +1,18 @@
+[package]
+name = "replica-sqlite-persist"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+build = "build.rs"
+[[bin]]
+name = "replica-sqlite-persist"
+path = "src/main.rs"
+[dependencies]
+replica-sqlite = { path = "../../sqlite" }
+replica-core = { path = "../../core" }
+replica-hopos = { path = "../../hopos" }
+applib = { git = "https://github.com/xinix00/HopOS.git", tag = "v3.0.0-alpha.16" }
+[lints]
+workspace = true
