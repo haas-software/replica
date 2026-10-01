@@ -33,12 +33,17 @@ impl Environment for TestEnvironment {
     }
 }
 async fn probe(app: &'static App) {
-    match run(app).await {
+    // De looptijd in de marker (zoals smoke): de maat voor SQLite op HopFS
+    // met OP_SYNC, alleen en naast een bulk-app op dezelfde node.
+    let start = applib::clock::now_ns();
+    let result = run(app).await;
+    let us = applib::clock::now_ns().saturating_sub(start) / 1000;
+    match result {
         Ok(restored) => log!(
-            "REPLICA_SQLITE_PERSIST_{}",
+            "REPLICA_SQLITE_PERSIST_{} us={us}",
             if restored { "READ" } else { "WRITE" }
         ),
-        Err(e) => log!("REPLICA_SQLITE_PERSIST_FAIL {e}"),
+        Err(e) => log!("REPLICA_SQLITE_PERSIST_FAIL {e} us={us}"),
     }
     loop {
         EXEC.get().after(Duration::from_secs(60)).await;
