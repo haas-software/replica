@@ -335,6 +335,7 @@ impl Tracking {
             storage: b,
             marker,
             main: None,
+            deadline: None,
         }
     }
     fn learn(&mut self, bytes: &[u8]) -> Result {
@@ -376,16 +377,33 @@ pub struct Tracked<'a, B: Storage, M: CleanMarker<B>> {
     storage: &'a mut B,
     marker: &'a mut M,
     main: Option<FileId>,
+    deadline: Option<i64>,
 }
 fn sqlite_error(e: Error) -> replica_sqlite::Error {
     match e {
         Error::Storage(e) => e,
         Error::Memory => replica_sqlite::Error::MEMORY,
         Error::Limit => replica_sqlite::Error::FULL,
+        Error::LeaseLost => replica_sqlite::Error::READONLY,
         _ => replica_sqlite::Error::IO,
     }
 }
 impl<B: Storage, M: CleanMarker<B>> Tracked<'_, B, M> {
+    /// Vanaf `deadline` (Unix-milliseconden op de klok van de opslag) weigert
+    /// deze VFS iedere write met `SQLITE_READONLY`: de schrijverlease is dan
+    /// niet meer bevestigd.
+    pub fn until(mut self, deadline: i64) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+    fn fenced(&mut self) -> replica_sqlite::Result {
+        match self.deadline {
+            Some(deadline) if self.storage.unix_millis()? >= deadline => {
+                Err(replica_sqlite::Error::READONLY)
+            }
+            _ => Ok(()),
+        }
+    }
     fn unclean(&mut self) -> Result {
         if self.tracking.clean {
             self.marker.invalidate(self.storage)?;
@@ -436,6 +454,7 @@ impl<B: Storage, M: CleanMarker<B>> Storage for Tracked<'_, B, M> {
         self.storage.read(file, offset, dst)
     }
     fn write(&mut self, file: FileId, offset: u64, src: &[u8]) -> replica_sqlite::Result {
+        self.fenced()?;
         if self.main == Some(file) && !src.is_empty() {
             self.unclean().map_err(sqlite_error)?;
             if offset == 0 {
@@ -448,6 +467,7 @@ impl<B: Storage, M: CleanMarker<B>> Storage for Tracked<'_, B, M> {
         self.storage.write(file, offset, src)
     }
     fn truncate(&mut self, file: FileId, size: u64) -> replica_sqlite::Result {
+        self.fenced()?;
         if self.main == Some(file) {
             self.unclean().map_err(sqlite_error)?;
             self.tracking.dirty.add(1).map_err(sqlite_error)?;
@@ -456,6 +476,7 @@ impl<B: Storage, M: CleanMarker<B>> Storage for Tracked<'_, B, M> {
         self.storage.truncate(file, size)
     }
     fn sync(&mut self, file: FileId, flags: i32) -> replica_sqlite::Result {
+        self.fenced()?;
         if self.main == Some(file) {
             self.tracking
                 .journal
@@ -468,6 +489,7 @@ impl<B: Storage, M: CleanMarker<B>> Storage for Tracked<'_, B, M> {
         self.storage.size(file)
     }
     fn remove(&mut self, name: &CStr, dir: bool) -> replica_sqlite::Result {
+        self.fenced()?;
         // Een database verwijderen vereist eerst de volledige eigenaar stoppen.
         // SQLite verwijdert hier alleen journals en tijdelijke bestanden.
         if name == self.tracking.path.cstr().map_err(sqlite_error)? {

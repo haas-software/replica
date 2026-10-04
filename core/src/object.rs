@@ -1,10 +1,10 @@
 //! De bestaande objectgrens: atomic replace, sterke GET/LIST-consistentie, één schrijver.
 use crate::{
     Error, Result,
-    manifest::{Layout, MAX_COMMITS, Manifest},
+    manifest::{Layout, MAX_COMMITS, Manifest, Part},
     reserve, string,
 };
-use alloc::{string::String, vec::Vec};
+use alloc::{collections::VecDeque, string::String, vec::Vec};
 /// Fouten blijven herkenbaar; alleen Missing op een committed object bewijst schade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreError {
@@ -33,6 +33,16 @@ pub struct Object {
     /// Grootte indien het listingtransport die levert; hashes valideren altijd GET.
     pub size: Option<u64>,
 }
+/// Hoeveel GETs een store tegelijk doet, en hoeveel bytes die samen mogen zijn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Parallel {
+    /// Gelijktijdige GETs; één is na elkaar.
+    pub requests: usize,
+    /// Geheugenbudget van één ronde; één deel past altijd.
+    pub bytes: u64,
+}
+/// Antwoorden van [`Store::get_all`], in de volgorde van de sleutels.
+pub type Replies = Vec<core::result::Result<Vec<u8>, StoreError>>;
 /// Een objectstore voor één namespace-eigenaar.
 ///
 /// Implementaties mogen op de private stack async I/O parkeren. Put vervangt
@@ -43,6 +53,25 @@ pub trait Store {
     fn put(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError>;
     /// Weiger bodies boven `limit` vóór ze in hun geheel worden gealloceerd.
     fn get(&mut self, key: &str, limit: usize) -> core::result::Result<Vec<u8>, StoreError>;
+    /// Hoeveel [`Store::get_all`] tegelijk mag ophalen; standaard één.
+    fn parallel(&self) -> Parallel {
+        Parallel {
+            requests: 1,
+            bytes: 0,
+        }
+    }
+    /// Haalt hoogstens `parallel().requests` sleutels op, ieder met zijn eigen
+    /// grens zoals [`Store::get`]. Ieder antwoord staat op de plaats van zijn
+    /// sleutel; de buitenste fout geldt voor de hele ronde. Standaard na elkaar.
+    fn get_all(&mut self, keys: &[(&str, usize)]) -> core::result::Result<Replies, StoreError> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(keys.len())
+            .map_err(|_| StoreError::Limit)?;
+        for &(key, limit) in keys {
+            out.push(self.get(key, limit));
+        }
+        Ok(out)
+    }
     /// Duurzaam verwijderen; afwezig mag succes zijn.
     fn delete(&mut self, key: &str) -> core::result::Result<(), StoreError>;
     /// Alle pagina's onder deze prefix, maximaal `limit` objecten; nooit stil afkappen.
@@ -147,6 +176,72 @@ pub fn committed<S: Store>(store: &mut S, key: &str, limit: usize) -> Result<Vec
         return Err(Error::Limit);
     }
     Ok(bytes)
+}
+/// Haalt de committed delen van een herstel- of compactieplan vooruit op, in
+/// rondes binnen [`Store::parallel`], en geeft ze in planvolgorde terug.
+/// Toepassen blijft dus volgordelijk: een later deel overschrijft nooit een
+/// eerder. Een fout komt pas terug bij het deel waar hij hoort.
+pub(crate) struct Prefetch<'a> {
+    parts: &'a [&'a Part],
+    next: usize,
+    ready: VecDeque<core::result::Result<Vec<u8>, StoreError>>,
+}
+impl<'a> Prefetch<'a> {
+    pub(crate) fn new(parts: &'a [&'a Part]) -> Self {
+        Self {
+            parts,
+            next: 0,
+            ready: VecDeque::new(),
+        }
+    }
+    /// De bytes van het volgende deel, zoals [`committed`] ze geeft.
+    pub(crate) fn next<S: Store>(&mut self, store: &mut S) -> Result<Vec<u8>> {
+        if self.ready.is_empty() {
+            self.fill(store)?;
+        }
+        match self.ready.pop_front().ok_or(Error::State)? {
+            Ok(bytes) => Ok(bytes),
+            Err(StoreError::Missing) => Err(Error::Corrupt),
+            Err(e) => Err(e.into()),
+        }
+    }
+    fn fill<S: Store>(&mut self, store: &mut S) -> Result {
+        let parallel = store.parallel();
+        let mut keys = Vec::new();
+        let mut bytes = 0u64;
+        for part in &self.parts[self.next..] {
+            if keys.len() >= parallel.requests.max(1)
+                || (!keys.is_empty() && bytes.saturating_add(part.size) > parallel.bytes)
+            {
+                break;
+            }
+            let limit = usize::try_from(part.size).map_err(|_| Error::Limit)?;
+            reserve(&mut keys, 1)?;
+            keys.push((part.key.as_str(), limit));
+            bytes = bytes.saturating_add(part.size);
+        }
+        if keys.is_empty() {
+            return Err(Error::State);
+        }
+        let replies = store.get_all(&keys)?;
+        if replies.len() != keys.len() {
+            return Err(Error::State);
+        }
+        self.ready
+            .try_reserve(replies.len())
+            .map_err(|_| Error::Memory)?;
+        for (reply, &(_, limit)) in replies.into_iter().zip(&keys) {
+            self.ready.push_back(reply.and_then(|bytes| {
+                if bytes.len() > limit {
+                    Err(StoreError::Limit)
+                } else {
+                    Ok(bytes)
+                }
+            }));
+        }
+        self.next += keys.len();
+        Ok(())
+    }
 }
 pub(crate) fn read_manifest<S: Store>(store: &mut S, key: &str, prefix: &str) -> Result<Manifest> {
     Manifest::decode(

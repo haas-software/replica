@@ -1,5 +1,9 @@
 #![allow(dead_code, clippy::unwrap_used)]
-use replica_core::object::{Object, Store, StoreError};
+use replica_core::{
+    object::{Object, Parallel, Replies, Store, StoreError},
+    time::Time,
+    writer::{MemBackend, Role, Writer, claim},
+};
 use replica_sqlite::{Error, FileId, OpenFlags, Result, Storage};
 use std::{collections::BTreeMap, ffi::CStr};
 #[derive(Clone, Default)]
@@ -12,8 +16,24 @@ pub(crate) struct Bucket {
     pub fail_delete: Option<usize>,
     pub fail_after_delete: bool,
     pub get_error: Option<StoreError>,
+    /// Zonder waarde haalt de bucket na elkaar op, zoals een gewone store.
+    pub parallel: Option<Parallel>,
+    /// Iedere ronde van `get_all`: de sleutels en hun grenzen.
+    pub rounds: Vec<Vec<(String, usize)>>,
 }
 impl Store for Bucket {
+    fn parallel(&self) -> Parallel {
+        self.parallel.unwrap_or(Parallel {
+            requests: 1,
+            bytes: 0,
+        })
+    }
+    fn get_all(&mut self, keys: &[(&str, usize)]) -> core::result::Result<Replies, StoreError> {
+        assert!(keys.len() <= self.parallel().requests);
+        self.rounds
+            .push(keys.iter().map(|&(k, l)| (k.to_string(), l)).collect());
+        Ok(keys.iter().map(|&(k, l)| self.get(k, l)).collect())
+    }
     fn put(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError> {
         let fail = self.put_reply_lost
             || self
@@ -81,6 +101,9 @@ pub(crate) struct Fs {
     pub fail: Option<(usize, bool)>,
     pub ops: usize,
     pub random_calls: u8,
+    /// Milliseconden bovenop de vaste klok; gedeeld, zodat een toets de tijd
+    /// kan verzetten terwijl een SQLite-engine de opslag leent.
+    pub clock: std::rc::Rc<std::cell::Cell<i64>>,
 }
 #[derive(Clone)]
 pub(crate) struct Entry {
@@ -229,6 +252,16 @@ impl Storage for Fs {
         Ok(())
     }
     fn unix_millis(&mut self) -> Result<i64> {
-        Ok(1_790_765_296_000)
+        Ok(1_790_765_296_000 + self.clock.get())
+    }
+}
+/// Een schrijver met een lease die de hele toets geldt; eigen entropie, zodat
+/// de generatienamen van de toets niet verschuiven.
+pub(crate) fn writer() -> Writer {
+    let now = Time::unix(1_790_765_296, 0).unwrap();
+    let ttl = 10 * 365 * 86_400_000;
+    match claim(&mut Fs::default(), &mut MemBackend::new(), "test", ttl, now).unwrap() {
+        Role::Writer(w) => w,
+        Role::Reader { .. } => unreachable!("een lege lease geeft een schrijver"),
     }
 }

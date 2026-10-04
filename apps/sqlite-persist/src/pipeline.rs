@@ -8,6 +8,7 @@ use replica_core::{
     owner::{Config, Replica},
     prepare::Reason,
     time::Time,
+    writer::{self, MemBackend, Role},
 };
 use replica_sqlite::{Engine, Error, Result, Storage, Value};
 fn error(e: replica_core::Error) -> Error {
@@ -50,7 +51,13 @@ pub(super) unsafe fn run<B: Storage>(b: &mut B, heap: &mut [u64], restored: bool
     };
     let mut config = Config::new("replica/qemu", &destination, path, 65536).map_err(error)?;
     config.segment_bytes = 65536;
-    let mut replica = Replica::prepare(b, &mut bucket, config, now, |backend, name| {
+    // De bucket is RAM en deze node is alleen: de lease ook.
+    let mut lease = MemBackend::new();
+    let Role::Writer(writer) = writer::claim(b, &mut lease, "qemu", 30_000, now).map_err(error)?
+    else {
+        return Err(Error::MISUSE);
+    };
+    let mut replica = Replica::prepare(b, &mut bucket, writer, config, now, |backend, name| {
         // SAFETY: Deze eigenaar opent de enige C-engine; alle vorige scopes zijn gesloten.
         let mut engine = unsafe { Engine::initialize(heap, backend) }?;
         let mut db = engine.open(name.cstr()?)?;

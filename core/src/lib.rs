@@ -8,7 +8,6 @@ pub mod capture;
 pub mod compact;
 pub mod coverage;
 pub mod dirty;
-pub mod lease;
 pub mod local;
 pub mod maintenance;
 pub mod manifest;
@@ -21,6 +20,7 @@ pub mod restore;
 pub mod segment;
 pub mod time;
 pub mod tracking;
+pub mod writer;
 use alloc::{string::String, vec::Vec};
 /// Begrensde fouten; transportfouten worden nooit als bewezen corruptie behandeld.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +41,7 @@ pub enum Error {
     ForeignWrite,
     /// Lokale en remote gegevens hebben geen bewezen gezamenlijke herkomst.
     Unproven,
-    /// De databaselease is niet meer bevestigd; de eigenaar moet stoppen met schrijven.
+    /// De schrijverlease is niet meer bevestigd; de eigenaar moet stoppen met schrijven.
     LeaseLost,
     /// Een lokale SQLite/VFS-fout.
     Storage(replica_sqlite::Error),

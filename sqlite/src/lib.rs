@@ -40,6 +40,8 @@ pub struct Error {
 impl Error {
     /// Onvoldoende geheugen in de vaste SQLite-heap.
     pub const MEMORY: Self = Self { code: 7 };
+    /// Deze verbinding of node mag niet schrijven.
+    pub const READONLY: Self = Self { code: 8 };
     /// De opslag kon de opdracht niet uitvoeren.
     pub const IO: Self = Self { code: 10 };
     /// De opslaglimiet is bereikt.
@@ -102,6 +104,20 @@ impl<'a, B: Storage> Engine<'a, B> {
         let mut raw = ptr::null_mut();
         // SAFETY: self is de exclusieve runtime en path blijft geldig gedurende open.
         check(unsafe { ffi::replica_sqlite_open(path.as_ptr(), &mut raw) })?;
+        if raw.is_null() {
+            return Err(Error::MEMORY);
+        }
+        Ok(Connection {
+            raw,
+            _engine: PhantomData,
+        })
+    }
+    /// Opent één bestaande database alleen-lezen (`query_only`): iedere
+    /// schrijvende SQL faalt met `SQLITE_READONLY`.
+    pub fn open_read_only<'e>(&'e mut self, path: &CStr) -> Result<Connection<'e, 'a, B>> {
+        let mut raw = ptr::null_mut();
+        // SAFETY: self is de exclusieve runtime en path blijft geldig gedurende open.
+        check(unsafe { ffi::replica_sqlite_open_read_only(path.as_ptr(), &mut raw) })?;
         if raw.is_null() {
             return Err(Error::MEMORY);
         }

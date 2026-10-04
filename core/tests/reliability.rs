@@ -39,9 +39,14 @@ fn verify(fs: &mut Fs, name: &Name, heap: &mut [u64]) -> Result {
     Ok(())
 }
 fn prepare(fs: &mut Fs, store: &mut FaultStore, heap: &mut [u64], time: i64) -> Replica {
-    Replica::prepare(fs, store, config(), at(time), |b, name| {
-        verify(b, name, heap)
-    })
+    Replica::prepare(
+        fs,
+        store,
+        support::writer(),
+        config(),
+        at(time),
+        |b, name| verify(b, name, heap),
+    )
     .unwrap()
 }
 fn assert_restore(fs: &Fs, store: &mut FaultStore, r: &Replica, heap: &mut [u64]) {

@@ -27,9 +27,14 @@ fn begin_and_finish_let_sql_write_while_the_parts_upload() {
     let mut fs = Fs::default();
     let mut bucket = Bucket::default();
     let mut heap = vec![0u64; 512 * 1024];
-    let mut r = Replica::prepare(&mut fs, &mut bucket, config(), at(0), |_, _| {
-        panic!("empty bootstrap needs no restore")
-    })
+    let mut r = Replica::prepare(
+        &mut fs,
+        &mut bucket,
+        support::writer(),
+        config(),
+        at(0),
+        |_, _| panic!("empty bootstrap needs no restore"),
+    )
     .unwrap();
     let sql = |r: &mut Replica, fs: &mut Fs, heap: &mut [u64], sql: &std::ffi::CStr| {
         let mut vfs = r.vfs(fs).unwrap();

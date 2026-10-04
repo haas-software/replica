@@ -9,7 +9,7 @@ repo-grenzen. De kern van Replica verbiedt unsafe.
 ## SQLite op HopOS: één async opslagpad
 
 Er ontbraken twee HopOS-functies, geen SQLite-formaat. Beide zitten sinds SDK
-`v3.0.0-alpha.16` in de gewone Git-tag; alle manifests pinnen nu `v3.0.9`.
+`v3.0.0-alpha.16` in de gewone Git-tag; de apps pinnen nu HopOS `v3.0.10`.
 
 Replica gebruikt Hop `v3.0.9` voor het expliciete JSON-bytebudget en Lean
 `v3.1.10` voor delimiterlistings van generatieprefixen. Deze functies staan in
@@ -64,7 +64,7 @@ bijwerken.
 | `maintenance` | Go-bewaarschema en jaar-0001-tijdanker, multilevel samenvoegen; alle twaalf afgebroken verwijderstappen blijven herstelbaar |
 | `owner` | Prepare/VFS/Sync/Tick/Close samen, interval ook na fouten, herstelbeslissing duurzaam vóór nieuwe tracking, automatische reparatie met lineage |
 | `archive` | Begrensde catalogus met nanoseconden; offline Fetch weigert levende DB en sidecars, verificatie vóór publicatie |
-| `lease` | Go-owner/expiry-formaat, leeftijd, wachttijd bij overname, blijvend verlies na onzekere renewal, nooit andermans lease verwijderen |
+| `writer` | Hop-lease met CAS: tweede node is lezer, renew op leeftijd, deadline een derde TTL vóór verlopen, verloren PUT-antwoord alleen voor de eigen eigenaar, overname met hogere generatie, VFS en publicatie hard dicht na de deadline, read-only opslag |
 | `replica-s3` | Lean SigV4, begrensde streaming-GET en complete listings; annulering vergiftigt het transport |
 
 Bij generatieopruiming gaat eerst het snapshotmanifest weg, daarna de overige
@@ -85,11 +85,12 @@ Close. Eén eigenaar sluit gelijktijdige publicatie uit; Tick en onderhoud
 onthouden ook mislukte pogingen, zodat er geen hot retrylus ontstaat. Bewezen
 archiefschade en ongetrackte writes leiden naar een nieuwe snapshot; transport
 blijft een retry. Een onzekere persistente herstelbeslissing sluit de eigenaar.
-De host sluit SQLite vóór Sync, roept Tick vanuit zijn executor aan en bedient
-de lease-heartbeat. Er is geen verborgen thread of automatisch gestarte
-achtergrondtaak. De library-lease alleen maakt een langlopende netwerkupload
-nog niet automatisch veilig: de host moet de heartbeat tijdens wachten blijven
-bedienen en alle writes/publicatie bij verlies stoppen.
+De host sluit SQLite vóór Sync, roept Tick vanuit zijn executor aan en roept
+`Replica::renew` aan. Er is geen verborgen thread of automatisch gestarte
+achtergrondtaak. Na de leasedeadline weigert de VFS iedere write en gaat er
+geen manifest meer uit, ook niet aan het eind van een lange upload. Wie
+uploads langer dan een paar seconden heeft, gebruikt `begin`/`finish` en
+vernieuwt de lease daartussen.
 
 `archive::points` somt behouden herstelpunten op met nanoseconden, current en
 niveau, nieuwste eerst. Het resultaat is begrensd op maximaal 4.096 punten;
@@ -100,7 +101,7 @@ DB, padaliassen en zijn sidecars; het publiceert pas na de integriteitscallback.
 De host waarborgt ook hier exclusiviteit tegenover onderhoud.
 
 Performanceverschillen zijn expliciet: één exclusieve lokale kopie in plaats
-van meerdere korte leestransacties; sequentiële uploads/downloads; conservatieve
+van meerdere korte leestransacties; sequentiële uploads (downloads in begrensde rondes); conservatieve
 retransmissie van de dirty superset bij writes na capture; een volledige snapshot
 als een manifest is gecommit maar de lokale marker na een crash achterloopt.
 De snapshotlijst en

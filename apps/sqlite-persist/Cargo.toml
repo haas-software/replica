@@ -13,6 +13,6 @@ path = "src/main.rs"
 replica-sqlite = { path = "../../sqlite" }
 replica-core = { path = "../../core" }
 replica-hopos = { path = "../../hopos" }
-applib = { git = "https://github.com/xinix00/HopOS.git", tag = "v3.0.9" }
+applib = { git = "https://github.com/xinix00/HopOS.git", tag = "v3.0.10" }
 [lints]
 workspace = true

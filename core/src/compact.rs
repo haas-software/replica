@@ -96,13 +96,14 @@ pub fn merge<B: Storage, S: Store>(
     let mut size = 0;
     let mut source_index = 0;
     let mut minimum = inputs[0].min_size;
+    let mut prefetch = object::Prefetch::new(&refs);
     for m in inputs {
         minimum = minimum.min(m.min_size);
         if page_size != 0 && m.min_size < size {
             winners.truncate((m.min_size / u64::from(page_size)) as usize);
         }
         for part in &m.parts {
-            let bytes = object::committed(store, &part.key, part.size as usize)?;
+            let bytes = prefetch.next(store)?;
             let seg = part.read(&bytes)?;
             if (page_size != 0 && page_size != seg.page_size())
                 || m.min_size > seg.database_size()
@@ -141,8 +142,9 @@ pub fn merge<B: Storage, S: Store>(
     let segment_pages = segment_bytes / page_size as usize;
     reserve(&mut output.numbers, segment_pages)?;
     reserve(&mut output.data, segment_pages * page_size as usize)?;
-    for (index, part) in refs.into_iter().enumerate() {
-        let bytes = object::committed(store, &part.key, part.size as usize)?;
+    let mut prefetch = object::Prefetch::new(&refs);
+    for (index, part) in refs.iter().enumerate() {
+        let bytes = prefetch.next(store)?;
         let seg = part.read(&bytes)?;
         for (page, data) in seg.pages() {
             if winners.get((page - 1) as usize).copied() != Some(index as u32) {

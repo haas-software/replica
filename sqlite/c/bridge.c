@@ -137,9 +137,10 @@ void replica_sqlite_end(void) {
  active=0;
 }
 static int cooperate(void *unused) {(void)unused;return backend.cooperate(backend.context)!=SQLITE_OK;}
-int replica_sqlite_open(const char *path,sqlite3 **db) {
+static int open_with(const char *path,sqlite3 **db,int readonly) {
  if(!active || connection)return SQLITE_MISUSE;
- int rc=sqlite3_open_v2(path,db,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_NOMUTEX,"replica");
+ int flags=readonly?SQLITE_OPEN_READONLY:SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE;
+ int rc=sqlite3_open_v2(path,db,flags|SQLITE_OPEN_NOMUTEX,"replica");
  if(rc!=SQLITE_OK){if(*db)sqlite3_close(*db);*db=0;return rc;}
  connection=*db;
  sqlite3_progress_handler(*db,1000,cooperate,0);
@@ -150,9 +151,13 @@ int replica_sqlite_open(const char *path,sqlite3 **db) {
   * EXTRA vraagt die ook voor DELETE-journals; FULL alleen kan na power loss
   * een oud journal opnieuw zichtbaar maken en een bevestigde commit terugrollen. */
  rc=sqlite3_exec(*db,"PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; PRAGMA temp_store=MEMORY",0,0,0);
+ /* Een lezer: ook SQL die zou schrijven faalt, vóór de VFS het weigert. */
+ if(rc==SQLITE_OK && readonly)rc=sqlite3_exec(*db,"PRAGMA query_only=1",0,0,0);
  if(rc!=SQLITE_OK){replica_sqlite_close(*db);*db=0;}
  return rc;
 }
+int replica_sqlite_open(const char *path,sqlite3 **db) {return open_with(path,db,0);}
+int replica_sqlite_open_read_only(const char *path,sqlite3 **db) {return open_with(path,db,1);}
 /* TRANSIENT kopieert bindings: geen geleende Rust-buffer blijft in C hangen. */
 int replica_bind_text(sqlite3_stmt *s,int i,const unsigned char *p,int n){return sqlite3_bind_text(s,i,(const char *)p,n,SQLITE_TRANSIENT);}
 int replica_bind_blob(sqlite3_stmt *s,int i,const unsigned char *p,int n){return sqlite3_bind_blob(s,i,p,n,SQLITE_TRANSIENT);}

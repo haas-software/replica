@@ -100,6 +100,24 @@ fn merged_segment_matches_go_and_retains_truncation_history() {
     );
 }
 #[test]
+fn parallel_downloads_merge_to_the_same_go_segment() {
+    let (mut fs, mut store, mut marker, m2, m3, _, _) = fixture();
+    store.parallel = Some(replica_core::object::Parallel {
+        requests: 8,
+        bytes: u64::MAX,
+    });
+    let merged =
+        compact::merge(&mut fs, &mut store, NS, &mut marker, window(), &[&m2, &m3]).unwrap();
+    assert_eq!(
+        store.data[&merged.parts[0].key],
+        include_bytes!("fixtures/compact.bin")
+    );
+    // Twee lussen over dezelfde delen: twee rondes, elk met alle delen tegelijk.
+    let parts = m2.parts.len() + m3.parts.len();
+    assert_eq!(store.rounds.len(), 2);
+    assert!(store.rounds.iter().all(|r| r.len() == parts));
+}
+#[test]
 fn gap_or_unpublished_replacement_never_removes_raw_history() {
     let (mut fs, mut store, mut marker, m2, mut m3, key2, key3) = fixture();
     m3.first = 4;

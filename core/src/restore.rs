@@ -43,6 +43,12 @@ pub fn stage<B: Storage, S: Store>(
     page_limit: u32,
 ) -> Result<Staged> {
     let plan = layout.plan(at)?;
+    let mut parts = Vec::new();
+    for m in &plan {
+        reserve(&mut parts, m.parts.len())?;
+        parts.extend(m.parts.iter());
+    }
+    let mut prefetch = object::Prefetch::new(&parts);
     let scratch = destination.suffix(".replica-restore-data")?;
     let mut file = File::open(b, &scratch, true)?;
     file.truncate(0)?;
@@ -61,11 +67,7 @@ pub fn stage<B: Storage, S: Store>(
         }
         file.truncate(m.min_size)?;
         for part in &m.parts {
-            let bytes = object::committed(
-                store,
-                &part.key,
-                usize::try_from(part.size).map_err(|_| Error::Limit)?,
-            )?;
+            let bytes = prefetch.next(store)?;
             let seg = part.read(&bytes)?;
             let size = seg.page_size();
             if seg.database_size() / u64::from(size) > u64::from(page_limit) {

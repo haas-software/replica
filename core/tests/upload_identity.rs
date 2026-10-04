@@ -25,9 +25,14 @@ fn stale_uploads_are_rejected_without_acknowledging_new_writes() {
         65536,
     )
     .unwrap();
-    let mut replica = Replica::prepare(&mut fs, &mut store, config, at(0), |_, _| {
-        panic!("empty bootstrap needs no restore")
-    })
+    let mut replica = Replica::prepare(
+        &mut fs,
+        &mut store,
+        support::writer(),
+        config,
+        at(0),
+        |_, _| panic!("empty bootstrap needs no restore"),
+    )
     .unwrap();
     let mut heap = vec![0u64; 512 * 1024];
     let sql = |replica: &mut Replica, fs: &mut Fs, heap: &mut [u64], text: &std::ffi::CStr| {

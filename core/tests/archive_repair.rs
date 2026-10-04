@@ -35,7 +35,15 @@ fn repair_missing_metadata(compacted: bool, current: bool) {
     for restart in [false, true] {
         let mut fs = Fs::default();
         let mut store = Bucket::default();
-        let mut r = Replica::prepare(&mut fs, &mut store, config(), at(0), |_, _| Ok(())).unwrap();
+        let mut r = Replica::prepare(
+            &mut fs,
+            &mut store,
+            support::writer(),
+            config(),
+            at(0),
+            |_, _| Ok(()),
+        )
+        .unwrap();
         let mut header = vec![0; 1024];
         header[..16].copy_from_slice(b"SQLite format 3\0");
         header[16..18].copy_from_slice(&512u16.to_be_bytes());
@@ -69,9 +77,14 @@ fn repair_missing_metadata(compacted: bool, current: bool) {
         store.data.remove(&key).unwrap();
         if restart {
             fs = fs.cold();
-            r = Replica::prepare(&mut fs, &mut store, config(), at(720), |_, _| {
-                panic!("the proven local database must stay authoritative")
-            })
+            r = Replica::prepare(
+                &mut fs,
+                &mut store,
+                support::writer(),
+                config(),
+                at(720),
+                |_, _| panic!("the proven local database must stay authoritative"),
+            )
             .unwrap();
             assert_eq!(r.status().reason, Reason::Repair);
             assert!(!r.marker().complete);
@@ -132,8 +145,15 @@ fn an_unknown_repair_snapshot_commit_can_retry_while_current_still_points_to_our
         for accepted in [false, true] {
             let mut fs = Fs::default();
             let mut store = Bucket::default();
-            let mut r =
-                Replica::prepare(&mut fs, &mut store, config(), at(0), |_, _| Ok(())).unwrap();
+            let mut r = Replica::prepare(
+                &mut fs,
+                &mut store,
+                support::writer(),
+                config(),
+                at(0),
+                |_, _| Ok(()),
+            )
+            .unwrap();
             let mut header = vec![0; 1024];
             header[..16].copy_from_slice(b"SQLite format 3\0");
             header[16..18].copy_from_slice(&512u16.to_be_bytes());

@@ -30,9 +30,14 @@ fn full_owner_lifecycle_with_sql_unknown_puts_external_write_and_archive_repair(
     let mut fs = Fs::default();
     let mut bucket = Bucket::default();
     let mut heap = vec![0u64; 512 * 1024];
-    let mut r = Replica::prepare(&mut fs, &mut bucket, config(), at(0), |_, _| {
-        panic!("empty bootstrap needs no restore")
-    })
+    let mut r = Replica::prepare(
+        &mut fs,
+        &mut bucket,
+        support::writer(),
+        config(),
+        at(0),
+        |_, _| panic!("empty bootstrap needs no restore"),
+    )
     .unwrap();
     let sql = |r: &mut Replica, fs: &mut Fs, heap: &mut [u64], sql: &std::ffi::CStr| {
         let mut vfs = r.vfs(fs).unwrap();
@@ -157,15 +162,43 @@ fn clock_configuration_and_closed_state_fail_before_io() {
     let mut bucket = Bucket::default();
     let mut bad = config();
     bad.segment_bytes = 10;
-    assert!(Replica::prepare(&mut fs, &mut bucket, bad, at(0), |_, _| Ok(())).is_err());
-    assert!(Replica::prepare(&mut fs, &mut bucket, config(), Time::ZERO, |_, _| Ok(())).is_err());
+    assert!(
+        Replica::prepare(
+            &mut fs,
+            &mut bucket,
+            support::writer(),
+            bad,
+            at(0),
+            |_, _| Ok(())
+        )
+        .is_err()
+    );
+    assert!(
+        Replica::prepare(
+            &mut fs,
+            &mut bucket,
+            support::writer(),
+            config(),
+            Time::ZERO,
+            |_, _| Ok(())
+        )
+        .is_err()
+    );
     assert!(fs.files.is_empty() && bucket.data.is_empty());
 }
 #[test]
 fn uncertain_repair_marker_stops_the_owner_before_new_sql() {
     let mut fs = Fs::default();
     let mut bucket = Bucket::default();
-    let mut r = Replica::prepare(&mut fs, &mut bucket, config(), at(0), |_, _| Ok(())).unwrap();
+    let mut r = Replica::prepare(
+        &mut fs,
+        &mut bucket,
+        support::writer(),
+        config(),
+        at(0),
+        |_, _| Ok(()),
+    )
+    .unwrap();
     let mut header = [0u8; 512];
     header[..16].copy_from_slice(b"SQLite format 3\0");
     header[16..18].copy_from_slice(&512u16.to_be_bytes());

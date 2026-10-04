@@ -6,12 +6,12 @@ De bestaande Go-formaten blijven behouden: `SPINSEG1`, `SPINDRT1`, manifest v2,
 markers en objectnamen. Geen WASM, POSIX-bestandssysteem of verborgen executor.
 
 De replicatiebibliotheek bevat tracking, prepare/restore, snapshot/increment,
-onzekere-publicatieherstel, compactie, retentie, generatieopruiming, herstelpuntcatalogus, offline Fetch en leases.
+onzekere-publicatieherstel, compactie, retentie, generatieopruiming, herstelpuntcatalogus, offline Fetch en de schrijverlease in S3.
 Op HopOS (SDK `v3.0.0-alpha.16`) heeft SQLite echte persistente bestands-I/O
 via de parkeerbare C-stack (`applib::stacktask`) en de bevestigde barrière
 `sys::Client::sync` (OP_SYNC). Dit is nog geen vervanging van een bestaande
-Spin-instantie: de hostapp moet zijn database-eigenaar en lease-heartbeat nog
-op deze bibliotheek aansluiten.
+Spin-instantie: de hostapp moet zijn database-eigenaar en de renew van de
+schrijverlease nog op deze bibliotheek aansluiten.
 Zie [contracten en resterende aansluiting](docs/port.md).
 
 ## Onderdelen
@@ -19,7 +19,7 @@ Zie [contracten en resterende aansluiting](docs/port.md).
 | Crate | Verantwoordelijkheid |
 | --- | --- |
 | `replica-sqlite` | SQLite 3.53.4, C-shim, veilige verbindingen/statements, vaste `memsys5`-heap en VFS |
-| `replica-core` | Go-formaten, tracking/dirty logs, lokale markers, capture, publicatie, prepare, restore, compactie, retentie en leaseprotocol |
+| `replica-core` | Go-formaten, tracking/dirty logs, lokale markers, capture, publicatie, prepare, restore, compactie, retentie en schrijverlease |
 | `replica-s3` | Concrete objectadapter op Lean S3 v3.1.1, SigV4, begrensd streamen en volledige listings |
 | `replica-hopos` | Async system-client als SQLite-opslag via de private stack; `xSync` is OP_SYNC |
 | `replica-sqlite-smoke` | RAM-SQLite als echte Hop-job, twee onafhankelijke slots |
@@ -48,7 +48,7 @@ python3 tools/qemu-persist.py
 
 De gewone poort controleert de meegeleverde SQLite-bronhashes, formatting,
 strikte clippy, hosttests en volledige ARM64- en RISC-V-builds. Met `QEMU=1`
-start hij de RAM-probe tweemaal onder de **gepinde SDK v3.0.9**. Beide apps
+start hij de RAM-probe tweemaal onder de **gepinde SDK v3.0.10**. Beide apps
 bouwen ook voor RISC-V; uitvoering is alleen onder ARM64 QEMU getoetst.
 
 De laatste opdracht is de persist-proef, zonder kopie of patch: de app bouwt
@@ -84,12 +84,21 @@ archiefschade plant een nieuwe snapshot met behoud van repair-lineage;
 transportfouten behouden de bestaande generatie. `close` weigert nieuwe VFS-
 leningen en synchronisaties. `core/tests/owner.rs` toetst dit met echte SQLite.
 
-Start geen tweede writer voor dezelfde database of namespace; op HopOS is
-`update_policy: recreate` nodig. Een advisory lease is geen atomair proceslock.
+Er is precies één schrijver per namespace. Die houdt de hop-lease
+(`discovery`, hetzelfde protocol en formaat als het Hop-cluster) als object in
+de bucket, bijvoorbeeld `prefix/domain/lease`. Elke claim en renew is een
+voorwaardelijke PUT (`If-None-Match: *`, `If-Match: <etag>`). De backend moet
+die voorwaarden honoreren; de S3-lease kent de herkansingen van Hop voor
+geciteerde ETags (Hetzner, Ceph) en voor een Bunny-ghost.
 
-1. Maak `Lease`, verkrijg hem met `acquire` en plan `renew` uiterlijk iedere
-   vijf seconden. `Acquisition::Wait` geeft aan wanneer opnieuw geprobeerd
-   mag worden. Na onzeker leaseverlies stopt de eigenaar met schrijven.
+1. `writer::claim(b, &mut s3.lease(key, ttl_ms), node, ttl_ms, now)` geeft
+   `Role::Writer` of `Role::Reader`. Een lezer opent SQLite met
+   `Engine::open_read_only` op `writer::ReadOnly`; iedere write is dan
+   `SQLITE_READONLY`. Alleen een `Writer` kan een `Replica` maken.
+   Roep `Replica::renew` vaak aan (hij schrijft hoogstens eens per zesde TTL),
+   ook terwijl opslag of netwerk wacht. Een derde TTL vóór het verlopen
+   weigeren VFS, sync en manifestpublicatie hard; verlies sluit de eigenaar.
+   Een andere node neemt pas na het verlopen over, met een hogere generatie.
 2. Voer `prepare::run` uit **vóór** SQLite opent. De callback controleert een
    eventuele scratch-restore met echte SQLite `PRAGMA integrity_check`.
 3. Gebruik uitsluitend `prepared.tracking.wrap(&mut storage, &mut marker)`
@@ -115,7 +124,8 @@ db.execute(c"CREATE TABLE IF NOT EXISTS item(id INTEGER PRIMARY KEY, title TEXT)
    Plan `maintenance::run` hoogstens eens per minuut, ook na een fout.
    `maintenance::generations` verwijdert verlopen generaties in veilige volgorde.
 7. Sluit SQL vóór stoppen; de private taak verwerkt annulering en ruimt
-   C-handvatten op vóór de stack vrijgegeven wordt. Geef daarna de lease vrij.
+   C-handvatten op vóór de stack vrijgegeven wordt. `Replica::release` geeft
+   daarna de lease vrij, zodat een lezer meteen kan overnemen.
 
 `apps/sqlite-persist/src/pipeline.rs` toont de complete opslagketen op HopOS;
 `core/tests/replication.rs` doet hetzelfde met echte native SQLite en
@@ -130,9 +140,12 @@ de hele database. De lokale spool moet wel de gekopieerde data kunnen bevatten.
 Een restore heeft daarnaast ruimte voor een complete scratchdatabase nodig.
 
 De huidige capture houdt de bron tijdens de volledige lokale kopie exclusief.
-Uploads en downloads zijn opeenvolgend; de Go-optimalisaties met korte
-leestransacties, twee gelijktijdige uploads en download-prefetch zijn nog niet
-aangesloten. Writes na capture bewaren conservatief de hele dirty superset.
+Restore en compactie halen segmenten in rondes tegelijk op, binnen
+`Store::parallel` (aantal en bytes); `S3::with_transports` geeft de S3-store
+extra verbindingen, bijvoorbeeld 8 tegen Bunny's ongeveer 10 MB/s per download.
+Toepassen blijft in planvolgorde. Uploads zijn opeenvolgend; de
+Go-optimalisaties met korte leestransacties en twee gelijktijdige uploads zijn
+nog niet aangesloten. Writes na capture bewaren conservatief de hele dirty superset.
 Daarom is hiermee geen gelijkwaardige grote-databaseprestatie gemeten.
 
 De S3-adapter is getoetst met onder meer een 5 MiB-response, afgebroken bodies,

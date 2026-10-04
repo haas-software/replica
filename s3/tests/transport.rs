@@ -16,6 +16,7 @@ struct Reply {
     bytes: Vec<u8>,
     at: usize,
     length: Option<u64>,
+    etag: Option<String>,
 }
 impl AsyncRead for Reply {
     fn poll_read(
@@ -37,8 +38,10 @@ impl Response for Reply {
     fn reason(&self) -> &str {
         ""
     }
-    fn header(&self, _: &str) -> Option<&str> {
-        None
+    fn header(&self, name: &str) -> Option<&str> {
+        self.etag
+            .as_deref()
+            .filter(|_| name.eq_ignore_ascii_case("etag"))
     }
     fn content_length(&self) -> Option<u64> {
         self.length
@@ -48,7 +51,36 @@ impl Response for Reply {
 struct World {
     replies: VecDeque<Reply>,
     calls: Vec<String>,
+    conditions: Vec<String>,
     pause: bool,
+    /// Ieder verzoek wacht één poll op het net, zoals een echte verbinding.
+    slow: bool,
+}
+/// Eén keer Pending, daarna klaar: genoeg om overlap zichtbaar te maken.
+struct Once(bool);
+impl Future for Once {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if std::mem::replace(&mut self.0, true) {
+            Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+/// Pollt tot klaar, zoals de executor van een geparkeerde stack.
+struct Spin;
+impl Suspend for Spin {
+    fn wait<F: Future>(&self, f: F) -> Result<F::Output, Cancelled> {
+        let mut f = pin!(f);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(r) = f.as_mut().poll(&mut cx) {
+                return Ok(r);
+            }
+        }
+    }
 }
 struct Net(Rc<RefCell<World>>);
 impl Transport for Net {
@@ -65,9 +97,25 @@ impl Transport for Net {
             .borrow_mut()
             .calls
             .push(format!("{} {}", r.method, r.target));
+        for h in r.headers {
+            if h.name.eq_ignore_ascii_case("if-match")
+                || h.name.eq_ignore_ascii_case("if-none-match")
+            {
+                self.0.borrow_mut().conditions.push(format!(
+                    "{}: {}",
+                    h.name.to_ascii_lowercase(),
+                    h.value
+                ));
+            }
+        }
         let pause = self.0.borrow().pause;
         if pause {
             std::future::pending::<()>().await;
+        }
+        let slow = self.0.borrow().slow;
+        if slow {
+            Once(false).await;
+            self.0.borrow_mut().calls.push(format!("done {}", r.target));
         }
         self.0
             .borrow_mut()
@@ -108,7 +156,82 @@ fn reply(world: &Rc<RefCell<World>>, status: u16, bytes: Vec<u8>, length: Option
         bytes,
         at: 0,
         length,
+        etag: None,
     });
+}
+fn tagged(world: &Rc<RefCell<World>>, status: u16, bytes: &[u8], etag: &str) {
+    world.borrow_mut().replies.push_back(Reply {
+        status,
+        bytes: bytes.to_vec(),
+        at: 0,
+        length: Some(bytes.len() as u64),
+        etag: Some(etag.into()),
+    });
+}
+#[test]
+fn lease_is_a_conditional_put_and_412_means_held() {
+    use replica_core::writer::{Backend, LeaseState, discovery::Error};
+    let world = Rc::new(RefCell::new(World::default()));
+    let mut s = replica_s3::S3::new(client(), Net(world.clone()), Wait { cancel: false }).unwrap();
+    let mut lease = s.lease("replica/test/lease", 30_000);
+    let state = LeaseState {
+        generation: 1,
+        expires_at: 1_790_765_326_000,
+        owner: "a#1".into(),
+    };
+    reply(&world, 404, Vec::new(), Some(0));
+    assert_eq!(lease.read(), Err(Error::NoLease));
+    tagged(&world, 200, b"", "\"one\"");
+    assert_eq!(lease.write("", &state).unwrap(), "\"one\"");
+    let body = br#"{"generation":1,"expires_at":"2026-10-01T11:42:06Z","owner":"a#1"}"#;
+    tagged(&world, 200, body, "\"one\"");
+    let (read, etag) = lease.read().unwrap();
+    assert_eq!(
+        (read.owner.as_str(), read.generation, etag.as_str()),
+        ("a#1", 1, "\"one\"")
+    );
+    // Hetzner/Ceph: 412 op de geciteerde ETag, daarna lukt de kale.
+    reply(&world, 412, Vec::new(), Some(0));
+    tagged(&world, 200, b"", "\"two\"");
+    assert_eq!(lease.write("\"one\"", &state).unwrap(), "\"two\"");
+    // Ook de kale faalt: gehouden. Een 5xx is nooit "vrij".
+    reply(&world, 412, Vec::new(), Some(0));
+    reply(&world, 412, Vec::new(), Some(0));
+    assert_eq!(lease.write("\"two\"", &state), Err(Error::LeaseHeld));
+    // Bunny-ghost bij de eerste waarneming: HEAD wordt onthouden, geen overname.
+    reply(&world, 412, Vec::new(), Some(0));
+    tagged(&world, 200, b"", "\"ghost\"");
+    assert_eq!(lease.write("", &state), Err(Error::LeaseHeld));
+    reply(&world, 503, Vec::new(), Some(0));
+    assert_eq!(lease.write("\"two\"", &state), Err(Error::Unreachable));
+    // Een antwoord zonder ETag kan geen volgende CAS dragen.
+    reply(&world, 200, Vec::new(), Some(0));
+    assert_eq!(lease.write("", &state), Err(Error::Unreachable));
+    reply(&world, 200, b"{".to_vec(), Some(1));
+    assert_eq!(lease.read(), Err(Error::Unreachable));
+    reply(&world, 204, Vec::new(), Some(0));
+    lease.delete("\"two\"").unwrap();
+    assert_eq!(
+        world.borrow().conditions,
+        [
+            "if-none-match: *",
+            "if-match: \"one\"",
+            "if-match: one",
+            "if-match: \"two\"",
+            "if-match: two",
+            "if-none-match: *",
+            "if-match: \"two\"",
+            "if-none-match: *",
+            "if-match: \"two\"",
+        ]
+    );
+    assert!(
+        world
+            .borrow()
+            .calls
+            .iter()
+            .all(|c| c.contains("replica/test/lease"))
+    );
 }
 #[test]
 fn large_segment_streams_with_budget_and_checks_truncation() {
@@ -226,4 +349,89 @@ fn cancellation_of_directory_or_batch_listing_poison_the_store() {
         ));
         assert_eq!(world.borrow().calls.len(), 1);
     }
+}
+static CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_790_765_296);
+#[test]
+fn lease_ghost_is_taken_over_only_after_a_ttl_unchanged() {
+    use replica_core::writer::{Backend, LeaseState, discovery::Error};
+    use std::sync::atomic::Ordering;
+    let world = Rc::new(RefCell::new(World::default()));
+    let mut c = client();
+    c.now = Some(|| CLOCK.load(Ordering::Relaxed));
+    let mut s = replica_s3::S3::new(c, Net(world.clone()), Wait { cancel: false }).unwrap();
+    let state = LeaseState {
+        generation: 1,
+        expires_at: 1_790_765_356_000,
+        owner: "a#1".into(),
+    };
+    let mut create = |etag: &str| {
+        reply(&world, 412, Vec::new(), Some(0));
+        tagged(&world, 200, b"", etag);
+        s.lease("replica/test/lease", 30_000).write("", &state)
+    };
+    assert_eq!(create("\"g1\""), Err(Error::LeaseHeld));
+    CLOCK.store(1_790_765_326, Ordering::Relaxed);
+    // Een andere ETag is een levende schrijver: de termijn begint opnieuw.
+    assert_eq!(create("\"g2\""), Err(Error::LeaseHeld));
+    CLOCK.store(1_790_765_355, Ordering::Relaxed);
+    assert_eq!(create("\"g2\""), Err(Error::LeaseHeld));
+    CLOCK.store(1_790_765_356, Ordering::Relaxed);
+    reply(&world, 412, Vec::new(), Some(0));
+    tagged(&world, 200, b"", "\"g2\"");
+    tagged(&world, 200, b"", "\"mine\"");
+    let mut lease = s.lease("replica/test/lease", 30_000);
+    assert_eq!(lease.write("", &state).unwrap(), "\"mine\"");
+    assert_eq!(
+        world.borrow().conditions.last().map(String::as_str),
+        Some("if-match: \"g2\"")
+    );
+}
+#[test]
+fn segment_gets_overlap_across_transports_and_keep_their_order() {
+    let world = Rc::new(RefCell::new(World {
+        slow: true,
+        ..World::default()
+    }));
+    let net = || Net(world.clone());
+    let mut s = replica_s3::S3::new(client(), net(), Spin)
+        .unwrap()
+        .with_transports(vec![net(), net()], 1 << 20);
+    assert_eq!(s.parallel().requests, 3);
+    reply(&world, 200, vec![1; 10], Some(10));
+    reply(&world, 404, Vec::new(), Some(0));
+    reply(&world, 200, vec![3; 30], Some(30));
+    let replies = s.get_all(&[("g/a", 10), ("g/b", 10), ("g/c", 20)]).unwrap();
+    assert_eq!(replies[0], Ok(vec![1; 10]));
+    assert_eq!(replies[1], Err(StoreError::Missing));
+    assert_eq!(replies[2], Err(StoreError::Limit));
+    // Alle drie gestart vóór het eerste antwoord: echt tegelijk.
+    let calls = world.borrow().calls.clone();
+    assert_eq!(calls.len(), 6);
+    assert!(
+        calls[..3].iter().all(|c| c.starts_with("GET ")),
+        "{calls:?}"
+    );
+    assert!(
+        calls[3..].iter().all(|c| c.starts_with("done ")),
+        "{calls:?}"
+    );
+    // Meer sleutels dan transports is een fout van de aanroeper.
+    let four = [("g/a", 1), ("g/b", 1), ("g/c", 1), ("g/d", 1)];
+    assert!(matches!(s.get_all(&four), Err(StoreError::Limit)));
+}
+#[test]
+fn cancelled_parallel_round_poisons_the_store() {
+    let world = Rc::new(RefCell::new(World {
+        pause: true,
+        ..World::default()
+    }));
+    let mut s = replica_s3::S3::new(client(), Net(world.clone()), Wait { cancel: true })
+        .unwrap()
+        .with_transports(vec![Net(world.clone())], 1 << 20);
+    assert!(matches!(
+        s.get_all(&[("g/a", 10), ("g/b", 10)]),
+        Err(StoreError::Cancelled)
+    ));
+    world.borrow_mut().pause = false;
+    assert!(matches!(s.get("g/a", 10), Err(StoreError::Cancelled)));
 }

@@ -10,10 +10,11 @@ use crate::{
     string,
     time::Time,
     tracking::{Tracked, Tracking},
+    writer::{Backend, Writer},
 };
 use alloc::string::String;
 use replica_sqlite::Storage;
-/// Configuratie vóór Prepare. De app bezit transport, klok, entropie en lease-heartbeat.
+/// Configuratie vóór Prepare. De app bezit transport, klok en entropie.
 pub struct Config {
     /// `prefix/domain` in objectopslag.
     pub namespace: String,
@@ -100,11 +101,13 @@ pub struct Status {
 /// SQL is gesloten vóór `sync`/`tick`. Voor overlappende SQL en upload kan een app
 /// de losse capture/publicatie-API gebruiken met expliciete eigendomsoverdracht.
 ///
-/// De app garandeert exclusieve starts en bedient een eventuele lease-heartbeat
-/// ook terwijl opslag/netwerk parkeert. Bij leaseverlies stopt hij deze eigenaar.
-/// Deze bibliotheek verstopt geen achtergrondtaak, runtime of proceslock.
+/// Alleen de houder van de schrijverlease maakt een eigenaar. Na de deadline van
+/// die lease weigeren VFS, synchronisatie en publicatie hard; de app roept
+/// [`Replica::renew`] daarom ook aan terwijl opslag of netwerk parkeert.
+/// Deze bibliotheek verstopt geen achtergrondtaak of runtime.
 pub struct Replica {
     config: Config,
+    writer: Writer,
     prepared: Prepared,
     status: Status,
     maintenance_at: Option<Time>,
@@ -126,14 +129,17 @@ impl Pending {
 }
 impl Replica {
     /// Prepare vóór SQLite openen, inclusief geverifieerde restore waar nodig.
+    /// De [`Writer`] uit [`crate::writer::claim`] is het bewijs van de lease.
     pub fn prepare<B: Storage, S: Store>(
         b: &mut B,
         store: &mut S,
+        writer: Writer,
         config: Config,
         now: Time,
         verify: impl FnMut(&mut B, &Name) -> Result,
     ) -> Result<Self> {
         config.validate()?;
+        writer.check(now)?;
         let prepared = prepare::run(
             b,
             store,
@@ -155,6 +161,7 @@ impl Replica {
         };
         Ok(Self {
             config,
+            writer,
             prepared,
             status,
             maintenance_at: None,
@@ -163,11 +170,44 @@ impl Replica {
         })
     }
     /// De getrackte VFS. De lening sluit gelijktijdig synchroniseren of sluiten uit.
+    /// Na de leasedeadline weigert de VFS iedere write met `SQLITE_READONLY`.
     pub fn vfs<'a, B: Storage>(&'a mut self, b: &'a mut B) -> Result<Tracked<'a, B, LocalMarker>> {
         if self.closed {
             return Err(Error::State);
         }
-        Ok(self.prepared.tracking.wrap(b, &mut self.prepared.marker))
+        let deadline = self.fence(b)?;
+        Ok(self
+            .prepared
+            .tracking
+            .wrap(b, &mut self.prepared.marker)
+            .until(deadline))
+    }
+    /// De deadline op de klok van de opslag, of een harde fout als die voorbij is.
+    fn fence<B: Storage>(&self, b: &mut B) -> Result<i64> {
+        let deadline = i64::try_from(self.writer.deadline()).map_err(|_| Error::Limit)?;
+        if b.unix_millis()? >= deadline {
+            return Err(Error::LeaseLost);
+        }
+        Ok(deadline)
+    }
+    /// Vernieuwt de schrijverlease op leeftijd; zie [`Writer::renew`]. Na
+    /// verlies is deze eigenaar permanent dicht.
+    pub fn renew<L: Backend>(&mut self, lease: &mut L, now: Time) -> Result {
+        let result = self.writer.renew(lease, now);
+        if result == Err(Error::LeaseLost) {
+            self.closed = true;
+        }
+        result
+    }
+    /// De lease van deze eigenaar, met het fencing-token.
+    pub fn writer(&self) -> &Writer {
+        &self.writer
+    }
+    /// Sluit deze eigenaar en geeft de lease vrij, zodat een lezer meteen kan
+    /// overnemen. SQLite is dan al gesloten.
+    pub fn release<L: Backend>(mut self, lease: &mut L) -> Result {
+        self.close();
+        self.writer.release(lease)
     }
     /// Onveranderlijke marker voor status, archiefcatalogus en diagnose.
     pub fn marker(&self) -> &Marker {
@@ -178,7 +218,7 @@ impl Replica {
         self.status
     }
     /// Zet de eigenaar permanent dicht. Actieve VFS-leningen moeten eerst eindigen;
-    /// de host sluit SQLite en geeft daarna zijn lease vrij.
+    /// de host sluit SQLite en geeft daarna de lease vrij met [`Replica::release`].
     pub fn close(&mut self) {
         self.closed = true;
     }
@@ -208,7 +248,7 @@ impl Replica {
         {
             return Err(Error::State);
         }
-        Ok(())
+        self.writer.check(now)
     }
     /// Eén expliciete synchronisatie op de eigenaar: capture, upload en afronding
     /// in één beurt. Wie SQL wil laten doorlopen tijdens de upload van de delen
@@ -379,6 +419,9 @@ impl Replica {
         uploaded: Uploaded,
         now: Time,
     ) -> Result<Synced> {
+        // De upload kan lang duren; het manifest gaat alleen uit onder een
+        // geldige lease, gemeten nu en niet bij het begin van de beurt.
+        self.fence(b)?;
         if let Err(e) = pending.batch.finish(
             b,
             store,
