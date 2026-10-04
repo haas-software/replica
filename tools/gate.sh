@@ -31,10 +31,11 @@ cargo test --locked --workspace
 # Een RISC-V-build is nog geen RISC-V-apprun.
 for target in aarch64-unknown-none-softfloat riscv64gc-unknown-none-elf; do
     cargo build --locked --release --target "$target" \
-        -p replica-sqlite-smoke -p replica-sqlite-persist -p replica-core -p replica-s3
+        -p replica-sqlite-smoke -p replica-sqlite-persist -p replica-sqlite-bench \
+        -p replica-core -p replica-s3
     cargo clippy --locked --release --target "$target" \
-        -p replica-sqlite-smoke -p replica-sqlite-persist -p replica-hopos \
-        -p replica-core -p replica-s3 -- -D warnings
+        -p replica-sqlite-smoke -p replica-sqlite-persist -p replica-sqlite-bench \
+        -p replica-hopos -p replica-core -p replica-s3 -- -D warnings
 done
 if [ "${QEMU:-0}" = 1 ]; then
     python3 tools/qemu-smoke.py

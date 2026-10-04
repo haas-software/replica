@@ -5,5 +5,6 @@
 //! geen blokkerende of gepolde variant ernaast en geen geneste executor.
 #![no_std]
 #![forbid(unsafe_code)]
+extern crate alloc;
 mod storage;
-pub use storage::{Environment, Files, Wait};
+pub use storage::{Environment, Files, Stats, Wait};

@@ -29,10 +29,18 @@ Er is één pad: iedere VFS-callback (open, read, write, truncate, sync, size,
 delete, exists) wacht via `replica_sqlite::asynchronous::Bridge` en
 `replica_hopos::Wait` met `Suspender::wait` op de async system-client. Geen
 blokkerende of gepolde variant ernaast. SQLite-locks vragen geen I/O: de VFS
-houdt het lockniveau in C bij, want er is precies één eigenaar van de map.
+houdt het lockniveau in C bij, want er is precies één eigenaar van de map, en
+SQLite draait in `locking_mode=EXCLUSIVE`. Een tijdelijk bestand (sorter,
+temp-B-tree) krijgt van de VFS een naam `etilqs_` plus zestien hexcijfers in
+dezelfde map en verdwijnt bij sluiten.
 
 `replica-hopos::Files` bezit zijn system-client, met 16 generatienummers voor
-open bestanden, canonieke relatieve namen en maximaal 64 KiB per I/O-stap.
+open bestanden, canonieke relatieve namen en maximaal 1 MiB per I/O-stap. Per
+schrijfbaar bestand bundelt hij aaneengesloten writes tot 256 KiB in één call
+(weggeschreven vóór sync, lees, truncate, stat en close: de duurzaamheid blijft
+die van xSync), en bij een sequentiële lees leest hij een venster vooruit (64 KiB
+verdubbelend tot 1 MiB) dat een write erin meeneemt. `Stats::snapshot` telt
+callbacks en calls; `apps/sqlite-bench` drukt het verschil per stap af.
 Timeout, transportfout of protocolfout maakt die eigenaar onbruikbaar.
 `AsyncStorage::invalidate` en de bridge doen hetzelfde bij annulering.
 De C-progresscallback laat ook CPU-SQL periodiek parkeren; annuleren geeft

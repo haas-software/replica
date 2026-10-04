@@ -86,8 +86,15 @@ fn main() -> Result<(), BuildError> {
             "-DSQLITE_OMIT_LOAD_EXTENSION",
             "-DSQLITE_OMIT_LOCALTIME",
             "-DSQLITE_OMIT_WAL",
-            "-DSQLITE_TEMP_STORE=3",
-            "-DSQLITE_DEFAULT_MEMSTATUS=0",
+            // Tijdelijke bestanden (sorter, temp-B-trees) gaan naar de VFS zodra ze
+            // niet in cache_size passen, zoals op Linux; de heap is vast en klein.
+            "-DSQLITE_TEMP_STORE=1",
+            // Onder de soft heap limit (bridge.c) geeft de paginacache schone
+            // pagina's terug in plaats van NOMEM.
+            // De soft heap limit telt alleen met de geheugenstatistiek aan
+            // (anders loopt malloc buiten mallocWithAlarm om); zonder mutexen
+            // kost die teller niets.
+            "-DSQLITE_ENABLE_MEMORY_MANAGEMENT",
             "-DSQLITE_MAX_WORKER_THREADS=0",
             "-I../vendor/sqlite",
             "-Ic",

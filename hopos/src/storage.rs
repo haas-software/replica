@@ -1,6 +1,23 @@
 //! SQLite-bestanden in één exclusief gemounte map; iedere sync gaat naar HopFS.
+//!
+//! Elke call naar de kern is een ronde door de OS-core (op de M4 ongeveer
+//! 55 µs), en SQLite vraagt per pagina van 4 KiB één lees of schrijf. Wat
+//! Linux hiertegen heeft, de page cache met write-back en readahead, heeft
+//! deze laag in het klein: een schrijfbuffer per schrijfbaar bestand die
+//! aaneengesloten writes bundelt tot één call, weggeschreven vóór elke sync,
+//! lees, truncate, stat en close (duurzaamheid blijft die van SQLite: niets
+//! is beloofd vóór xSync), en één leesvenster dat bij een sequentiële lees
+//! (aansluitend op de vorige) vooruitleest, van 64 KiB verdubbelend tot
+//! 1 MiB, zoals Linux' readahead-venster. Eén eigenaar schrijft dit domein,
+//! dus het venster is altijd actueel: een write erin wordt erin gezet.
+//! GEMETEN 04-10 op QEMU (64 MiB): zie apps/sqlite-bench.
+use alloc::vec::Vec;
 use applib::{appnet::SystemClient, stacktask::Suspender, sys};
-use core::{ffi::CStr, future::Future};
+use core::{
+    ffi::CStr,
+    future::Future,
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
+};
 use replica_sqlite::{
     Error, FileId, OpenFlags, Result,
     asynchronous::{AsyncStorage, Cancelled, Suspend},
@@ -19,6 +36,94 @@ impl Suspend for Wait<'_> {
         self.0.wait(f).map_err(|_| Cancelled)
     }
 }
+/// De schrijfbuffer per schrijfbaar bestand: SQLite schrijft bij een commit
+/// zijn pagina's op volgorde, dus aaneengesloten runs tot deze maat gaan in
+/// één call (256 KiB is 64 pagina's; de kern neemt tot 1 MiB per call).
+const WRITE_BUF: usize = 256 << 10;
+/// Het leesvenster begint hier bij de eerste sequentiële miss.
+const AHEAD_MIN: usize = 64 << 10;
+/// En verdubbelt tot de maat van één call.
+const AHEAD_MAX: usize = sys::MAX_CHUNK;
+
+/// Nog niet weggeschreven bytes van één bestand: één aaneengesloten run.
+struct WriteBuf {
+    data: Vec<u8>,
+    start: u64,
+    len: usize,
+}
+impl WriteBuf {
+    const EMPTY: Self = Self {
+        data: Vec::new(),
+        start: 0,
+        len: 0,
+    };
+    fn end(&self) -> u64 {
+        self.start + self.len as u64
+    }
+    /// Raakt `[off, off + n)` de buffer?
+    fn overlaps(&self, off: u64, n: usize) -> bool {
+        self.len != 0 && off < self.end() && off + n as u64 > self.start
+    }
+}
+
+/// Het leesvenster: de laatst vooruitgelezen run van één bestand, en los
+/// daarvan de vorige lees (de stroomdetectie). Een lees ertussendoor (een
+/// interne B-tree-pagina in een scan) laat het venster staan; de scan gaat
+/// daarna gewoon verder uit het venster. Een dalende scan (SQLite's
+/// integrity_check loopt de cellen van achter naar voren, een ORDER BY DESC
+/// over een index ook) krijgt een venster dat op de lees eindigt.
+struct Window {
+    file: u32,
+    data: Vec<u8>,
+    start: u64,
+    len: usize,
+    /// Het bestand, het begin en het einde van de vorige lees.
+    last: (u32, u64, u64),
+    /// De maat van het volgende venster; groeit per sequentiële miss.
+    ahead: usize,
+}
+impl Window {
+    const EMPTY: Self = Self {
+        file: 0,
+        data: Vec::new(),
+        start: 0,
+        len: 0,
+        last: (0, 0, 0),
+        ahead: 0,
+    };
+    /// Een lees uit het venster, als hij er helemaal in ligt.
+    fn take(&mut self, id: FileId, off: u64, dst: &mut [u8]) -> bool {
+        if self.file != id.0
+            || off < self.start
+            || off + dst.len() as u64 > self.start + self.len as u64
+        {
+            return false;
+        }
+        let at = (off - self.start) as usize;
+        dst.copy_from_slice(&self.data[at..at + dst.len()]);
+        self.last = (id.0, off, off + dst.len() as u64);
+        true
+    }
+    /// Een write: in het venster als hij erin past, anders het venster weg.
+    fn patch(&mut self, id: FileId, off: u64, src: &[u8]) {
+        if self.file != id.0 || self.len == 0 {
+            return;
+        }
+        let end = self.start + self.len as u64;
+        if off >= self.start && off + src.len() as u64 <= end {
+            let at = (off - self.start) as usize;
+            self.data[at..at + src.len()].copy_from_slice(src);
+        } else if off < end && off + src.len() as u64 > self.start {
+            self.len = 0;
+        }
+    }
+    fn drop_file(&mut self, id: FileId) {
+        if self.file == id.0 {
+            self.len = 0;
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct File {
     name: [u8; 256],
@@ -45,6 +150,92 @@ impl Path {
         core::str::from_utf8(&self.bytes[..self.len]).map_err(|_| Error::TEXT)
     }
 }
+/// De meetlat: wat SQLite vroeg (de callbacks) tegenover wat er over de
+/// system-client ging (elke call is een ronde door de OS-core). Het verschil
+/// is wat deze laag wegneemt; de bench-app drukt beide per stap af. Tellers
+/// als atomics (handboek §1.3): zo leest de app ze terwijl SQLite de
+/// eigenaar geleend houdt.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Stats {
+    /// Read-callbacks.
+    pub reads: u64,
+    /// Bytes die SQLite las.
+    pub read_bytes: u64,
+    /// Write-callbacks.
+    pub writes: u64,
+    /// Bytes die SQLite schreef.
+    pub write_bytes: u64,
+    /// Sync-callbacks.
+    pub syncs: u64,
+    /// Leescalls naar de kern (`OP_READ`).
+    pub call_reads: u64,
+    /// Bytes die de kern terugstuurde.
+    pub call_read_bytes: u64,
+    /// Schrijfcalls naar de kern (`OP_WRITE`).
+    pub call_writes: u64,
+    /// Bytes naar de kern.
+    pub call_write_bytes: u64,
+    /// Barrières (`OP_SYNC`): elk een vastlegging van de hopfs-boom.
+    pub call_syncs: u64,
+    /// Alle andere calls: stat, truncate, remove.
+    pub call_other: u64,
+}
+static METER: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+const READS: usize = 0;
+const READ_BYTES: usize = 1;
+const WRITES: usize = 2;
+const WRITE_BYTES: usize = 3;
+const SYNCS: usize = 4;
+const CALL_READS: usize = 5;
+const CALL_READ_BYTES: usize = 6;
+const CALL_WRITES: usize = 7;
+const CALL_WRITE_BYTES: usize = 8;
+const CALL_SYNCS: usize = 9;
+const CALL_OTHER: usize = 10;
+fn count(i: usize, n: u64) {
+    if let Some(c) = METER.get(i) {
+        c.fetch_add(n, Relaxed);
+    }
+}
+impl Stats {
+    /// De stand van nu.
+    pub fn snapshot() -> Self {
+        let m = |i: usize| METER.get(i).map_or(0, |c| c.load(Relaxed));
+        Self {
+            reads: m(READS),
+            read_bytes: m(READ_BYTES),
+            writes: m(WRITES),
+            write_bytes: m(WRITE_BYTES),
+            syncs: m(SYNCS),
+            call_reads: m(CALL_READS),
+            call_read_bytes: m(CALL_READ_BYTES),
+            call_writes: m(CALL_WRITES),
+            call_write_bytes: m(CALL_WRITE_BYTES),
+            call_syncs: m(CALL_SYNCS),
+            call_other: m(CALL_OTHER),
+        }
+    }
+    /// Alle rondes door de OS-core samen.
+    pub fn calls(&self) -> u64 {
+        self.call_reads + self.call_writes + self.call_syncs + self.call_other
+    }
+    /// Het verschil met een eerdere stand, per stap.
+    pub fn since(&self, earlier: &Self) -> Self {
+        Self {
+            reads: self.reads - earlier.reads,
+            read_bytes: self.read_bytes - earlier.read_bytes,
+            writes: self.writes - earlier.writes,
+            write_bytes: self.write_bytes - earlier.write_bytes,
+            syncs: self.syncs - earlier.syncs,
+            call_reads: self.call_reads - earlier.call_reads,
+            call_read_bytes: self.call_read_bytes - earlier.call_read_bytes,
+            call_writes: self.call_writes - earlier.call_writes,
+            call_write_bytes: self.call_write_bytes - earlier.call_write_bytes,
+            call_syncs: self.call_syncs - earlier.call_syncs,
+            call_other: self.call_other - earlier.call_other,
+        }
+    }
+}
 /// Eén eigenaar van SystemClient en maximaal zestien SQLite-handvatten.
 /// Geen andere schrijver mag deze root gebruiken; de jobspec gebruikt recreate.
 pub struct Files<'a, E> {
@@ -52,6 +243,8 @@ pub struct Files<'a, E> {
     root: &'a str,
     env: E,
     files: [File; 16],
+    bufs: [WriteBuf; 16],
+    window: Window,
     poisoned: bool,
 }
 impl<'a, E: Environment> Files<'a, E> {
@@ -70,8 +263,55 @@ impl<'a, E: Environment> Files<'a, E> {
             root,
             env,
             files: [File::EMPTY; 16],
+            bufs: [const { WriteBuf::EMPTY }; 16],
+            window: Window::EMPTY,
             poisoned: false,
         })
+    }
+    /// Schrijft de buffer van bestand `i` in één call weg.
+    async fn flush(&mut self, i: usize) -> Result {
+        let len = self.bufs[i].len;
+        if len == 0 {
+            return Ok(());
+        }
+        let f = self.files[i];
+        let path = self.path(&f.name[..f.len])?;
+        count(CALL_WRITES, 1);
+        count(CALL_WRITE_BYTES, len as u64);
+        let r = self
+            .sys
+            .write_at(path.text()?, self.bufs[i].start, &self.bufs[i].data[..len])
+            .await;
+        self.bufs[i].len = 0;
+        if r.map_err(|e| self.error(e))? != len {
+            self.poisoned = true;
+            return Err(Error::IO);
+        }
+        Ok(())
+    }
+    /// Een lees rechtstreeks van de kern, in stappen van hoogstens één call.
+    async fn read_direct(&mut self, path: &Path, offset: u64, dst: &mut [u8]) -> Result<usize> {
+        let mut done = 0;
+        while done < dst.len() {
+            let end = dst.len().min(done + sys::MAX_CHUNK);
+            let off = offset.checked_add(done as u64).ok_or(Error::RANGE)?;
+            count(CALL_READS, 1);
+            let n = self
+                .sys
+                .read_into(path.text()?, off, &mut dst[done..end])
+                .await
+                .map_err(|e| self.error(e))?;
+            count(CALL_READ_BYTES, n as u64);
+            if n == 0 {
+                break;
+            }
+            if n > end - done {
+                self.poisoned = true;
+                return Err(Error::IO);
+            }
+            done += n;
+        }
+        Ok(done)
     }
     fn path(&self, name: &[u8]) -> Result<Path> {
         if name.is_empty() || name.len() > 255 || !canonical(name) {
@@ -158,9 +398,11 @@ impl<E: Environment> AsyncStorage for Files<'_, E> {
             .iter()
             .position(|f| !f.open && f.generation < 0xffffff)
             .ok_or(Error::FULL)?;
+        count(CALL_OTHER, 1);
         match self.sys.stat(path.text()?).await {
             Ok(_) => {}
             Err(sys::Error::NotFound { .. }) if flags.is_create() && flags.is_writable() => {
+                count(CALL_OTHER, 1);
                 self.sys
                     .truncate(path.text()?, 0)
                     .await
@@ -179,51 +421,135 @@ impl<E: Environment> AsyncStorage for Files<'_, E> {
     }
     async fn close(&mut self, id: FileId) -> Result {
         self.file(id)?;
-        self.files[(id.0 & 255) as usize].open = false;
+        let i = (id.0 & 255) as usize;
+        self.flush(i).await?;
+        self.bufs[i].data = Vec::new();
+        self.window.drop_file(id);
+        self.files[i].open = false;
         Ok(())
     }
     async fn read(&mut self, id: FileId, offset: u64, dst: &mut [u8]) -> Result<usize> {
         let path = self.file_path(id, false)?;
-        let mut done = 0;
-        while done < dst.len() {
-            let end = dst.len().min(done + sys::MAX_CHUNK);
-            let off = offset.checked_add(done as u64).ok_or(Error::RANGE)?;
-            let n = self
-                .sys
-                .read_into(path.text()?, off, &mut dst[done..end])
-                .await
-                .map_err(|e| self.error(e))?;
-            if n == 0 {
-                break;
-            }
-            if n > end - done {
-                self.poisoned = true;
-                return Err(Error::IO);
-            }
-            done += n;
+        count(READS, 1);
+        count(READ_BYTES, dst.len() as u64);
+        if self.window.take(id, offset, dst) {
+            return Ok(dst.len());
         }
-        Ok(done)
+        let i = (id.0 & 255) as usize;
+        // Ligt de lees vlak na de vorige (precies aansluitend, of een paar
+        // pagina's verder: wat ertussen zat had SQLite al in zijn cache) of
+        // vlak ervoor, dan is dit een scan: een venster vooruit (of achteruit)
+        // lezen, bij elke volgende miss een groter. Een losse lees haalt alleen
+        // zichzelf en laat het venster staan.
+        let w = &mut self.window;
+        let end = offset + dst.len() as u64;
+        let gap = AHEAD_MIN as u64;
+        let forward = w.last.0 == id.0 && (w.last.2..w.last.2 + gap).contains(&offset);
+        let backward = w.last.0 == id.0 && (w.last.1.saturating_sub(gap)..=w.last.1).contains(&end);
+        if !forward && !backward {
+            if self.bufs[i].overlaps(offset, dst.len()) {
+                self.flush(i).await?;
+            }
+            let n = self.read_direct(&path, offset, dst).await?;
+            self.window.last = (id.0, offset, offset + n as u64);
+            return Ok(n);
+        }
+        w.ahead = (w.ahead * 2).clamp(AHEAD_MIN, AHEAD_MAX);
+        if w.data.is_empty() {
+            let mut v = Vec::new();
+            if v.try_reserve_exact(AHEAD_MAX).is_ok() {
+                v.resize(AHEAD_MAX, 0);
+            }
+            w.data = v;
+        }
+        let want = w.ahead.max(dst.len()).min(w.data.len()).max(dst.len());
+        // Vooruit begint het venster bij deze lees, achteruit eindigt het erop.
+        let from = if forward {
+            offset
+        } else {
+            end.saturating_sub(want as u64)
+        };
+        if self.bufs[i].overlaps(from, want) {
+            self.flush(i).await?;
+        }
+        if want <= dst.len() {
+            // Geen geheugen voor een venster: alleen deze lees.
+            let n = self.read_direct(&path, offset, dst).await?;
+            self.window.last = (id.0, offset, offset + n as u64);
+            return Ok(n);
+        }
+        let mut data = core::mem::take(&mut self.window.data);
+        let r = self.read_direct(&path, from, &mut data[..want]).await;
+        self.window.data = data;
+        let n = r?;
+        let at = (offset - from) as usize;
+        let got = n.saturating_sub(at).min(dst.len());
+        dst[..got].copy_from_slice(&self.window.data[at..at + got]);
+        if got < dst.len() {
+            dst[got..].fill(0);
+        }
+        let w = &mut self.window;
+        (w.file, w.start, w.len) = (id.0, from, n);
+        w.last = (id.0, offset, offset + got as u64);
+        Ok(got)
     }
     async fn write(&mut self, id: FileId, offset: u64, src: &[u8]) -> Result {
         let path = self.file_path(id, true)?;
-        let mut done = 0;
-        for chunk in src.chunks(sys::MAX_CHUNK) {
-            let off = offset.checked_add(done as u64).ok_or(Error::RANGE)?;
-            let n = self
-                .sys
-                .write_at(path.text()?, off, chunk)
-                .await
-                .map_err(|e| self.error(e))?;
-            if n != chunk.len() {
-                self.poisoned = true;
-                return Err(Error::IO);
+        count(WRITES, 1);
+        count(WRITE_BYTES, src.len() as u64);
+        self.window.patch(id, offset, src);
+        let i = (id.0 & 255) as usize;
+        if self.bufs[i].data.is_empty() {
+            let mut v = Vec::new();
+            if v.try_reserve_exact(WRITE_BUF).is_ok() {
+                v.resize(WRITE_BUF, 0);
             }
-            done += n;
+            self.bufs[i].data = v;
         }
+        let b = &mut self.bufs[i];
+        if src.len() > b.data.len() {
+            // Te groot voor de buffer (of geen geheugen): eerst wat er lag, dan direct.
+            self.flush(i).await?;
+            for (k, chunk) in src.chunks(sys::MAX_CHUNK).enumerate() {
+                let off = offset
+                    .checked_add((k * sys::MAX_CHUNK) as u64)
+                    .ok_or(Error::RANGE)?;
+                count(CALL_WRITES, 1);
+                count(CALL_WRITE_BYTES, chunk.len() as u64);
+                let n = self
+                    .sys
+                    .write_at(path.text()?, off, chunk)
+                    .await
+                    .map_err(|e| self.error(e))?;
+                if n != chunk.len() {
+                    self.poisoned = true;
+                    return Err(Error::IO);
+                }
+            }
+            return Ok(());
+        }
+        if b.len != 0 && offset >= b.start && offset + src.len() as u64 <= b.end() {
+            // Een overschrijving binnen de run (pagina 1 bij een commit).
+            let at = (offset - b.start) as usize;
+            b.data[at..at + src.len()].copy_from_slice(src);
+            return Ok(());
+        }
+        if b.len != 0 && (offset != b.end() || b.len + src.len() > b.data.len()) {
+            self.flush(i).await?;
+        }
+        let b = &mut self.bufs[i];
+        if b.len == 0 {
+            b.start = offset;
+        }
+        b.data[b.len..b.len + src.len()].copy_from_slice(src);
+        b.len += src.len();
         Ok(())
     }
     async fn truncate(&mut self, id: FileId, size: u64) -> Result {
         let p = self.file_path(id, true)?;
+        self.flush((id.0 & 255) as usize).await?;
+        self.window.drop_file(id);
+        count(CALL_OTHER, 1);
         self.sys
             .truncate(p.text()?, size)
             .await
@@ -231,11 +557,16 @@ impl<E: Environment> AsyncStorage for Files<'_, E> {
     }
     async fn sync(&mut self, id: FileId, _flags: i32) -> Result {
         let p = self.file_path(id, false)?;
+        count(SYNCS, 1);
+        self.flush((id.0 & 255) as usize).await?;
+        count(CALL_SYNCS, 1);
         self.sys.sync(p.text()?).await.map_err(|e| self.error(e))?;
         Ok(())
     }
     async fn size(&mut self, id: FileId) -> Result<u64> {
         let p = self.file_path(id, false)?;
+        self.flush((id.0 & 255) as usize).await?;
+        count(CALL_OTHER, 1);
         self.sys.stat(p.text()?).await.map_err(|e| self.error(e))
     }
     async fn remove(&mut self, name: &CStr, sync_directory: bool) -> Result {
@@ -251,11 +582,13 @@ impl<E: Environment> AsyncStorage for Files<'_, E> {
         {
             return Err(Error { code: 5 });
         }
+        count(CALL_OTHER, 1);
         match self.sys.remove(p.text()?).await {
             Ok(()) | Err(sys::Error::NotFound { .. }) => {}
             Err(e) => return Err(self.error(e)),
         }
         if sync_directory {
+            count(CALL_SYNCS, 1);
             p.len = p.bytes[..p.len]
                 .iter()
                 .rposition(|&b| b == b'/')
@@ -269,6 +602,7 @@ impl<E: Environment> AsyncStorage for Files<'_, E> {
             return Err(Error::IO);
         }
         let p = self.path(name.to_bytes())?;
+        count(CALL_OTHER, 1);
         match self.sys.stat(p.text()?).await {
             Ok(_) => Ok(true),
             Err(sys::Error::NotFound { .. }) => Ok(false),

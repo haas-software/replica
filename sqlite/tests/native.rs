@@ -84,7 +84,11 @@ fn native_sqlite_contract() {
     assert!(memory.stats().reads > 0);
     assert!(memory.stats().writes > 0);
     assert!(memory.stats().syncs > 0);
-    assert!(memory.stats().deletes > 0);
+    // EXCLUSIVE: tussen de transacties blijft het journal open met een gewiste
+    // kop (geen verwijdering plus mapbarrière per commit); pas het sluiten van
+    // de verbinding verwijdert het, één keer.
+    assert_eq!(memory.stats().deletes, 1);
+    assert!(memory.contents(c"test.db-journal").is_err());
     assert_eq!(
         &memory.contents(c"test.db").unwrap()[..16],
         b"SQLite format 3\0"
@@ -98,12 +102,14 @@ fn native_sqlite_contract() {
     }
 
     // Een journalbarrière die faalt mag geen succesvolle commit opleveren.
+    // Vóór het commitpunt zijn dat er twee: de sync van het journal en die van
+    // de database (SAFE_APPEND spaart de kopherschrijving met haar sync uit).
     let fail_at = Cell::new(0);
     let mut faulty = Fault {
         inner: memory,
         fail_at: &fail_at,
     };
-    for barrier in 1..=3 {
+    for barrier in 1..=2 {
         {
             // SAFETY: Iedere voorgaande runtime is dicht; één testthread.
             let mut engine = unsafe { Engine::initialize(&mut heap, &mut faulty) }.unwrap();
@@ -121,6 +127,30 @@ fn native_sqlite_contract() {
             integrity(&mut db);
             assert_eq!(integer(&mut db, c"SELECT count(*) FROM item"), 2);
         }
+    }
+    // De derde sync wist de journalkop ná het commitpunt (atomiccommit.html
+    // 3.11: het ongeldig maken van het journal is de commit). Faalt die, dan
+    // meldt COMMIT een fout terwijl de transactie staat; na heropenen is de
+    // database consistent en is de wijziging er.
+    {
+        // SAFETY: Iedere voorgaande runtime is dicht; één testthread.
+        let mut engine = unsafe { Engine::initialize(&mut heap, &mut faulty) }.unwrap();
+        let mut db = engine.open(c"test.db").unwrap();
+        db.execute(c"BEGIN; INSERT INTO item(id,bytes) VALUES(3,x'00')")
+            .unwrap();
+        fail_at.set(3);
+        let err = db.execute(c"COMMIT").unwrap_err();
+        assert_eq!(err.code & 255, Error::IO.code);
+        fail_at.set(0);
+    }
+    {
+        // SAFETY: Vorige verbinding en runtime zijn weg; dezelfde thread.
+        let mut engine = unsafe { Engine::initialize(&mut heap, &mut faulty) }.unwrap();
+        let mut db = engine.open(c"test.db").unwrap();
+        integrity(&mut db);
+        assert_eq!(integer(&mut db, c"SELECT count(*) FROM item"), 3);
+        db.execute(c"DELETE FROM item WHERE id=3").unwrap();
+        assert_eq!(integer(&mut db, c"SELECT count(*) FROM item"), 2);
     }
     // De vaste SQLite-heap en opslag geven FULL/NOMEM, geen onbeperkte allocatie.
     {

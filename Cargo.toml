@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["sqlite", "core", "s3", "hopos", "apps/sqlite-smoke", "apps/sqlite-persist"]
+members = ["sqlite", "core", "s3", "hopos", "apps/sqlite-smoke", "apps/sqlite-persist", "apps/sqlite-bench"]
 default-members = ["sqlite", "core"]
 
 [workspace.package]

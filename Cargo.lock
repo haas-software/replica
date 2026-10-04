@@ -113,6 +113,15 @@ name = "replica-sqlite"
 version = "0.1.0"
 
 [[package]]
+name = "replica-sqlite-bench"
+version = "0.1.0"
+dependencies = [
+ "applib",
+ "replica-hopos",
+ "replica-sqlite",
+]
+
+[[package]]
 name = "replica-sqlite-persist"
 version = "0.1.0"
 dependencies = [

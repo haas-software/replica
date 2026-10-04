@@ -1,0 +1,9 @@
+{
+  "name": "replica-bench",
+  "driver": "hop",
+  "artifacts": [{"url": "http://10.0.2.2:8000/replica-sqlite-bench.elf"}],
+  "memory_limit": 134217728,
+  "env": {"REPLICA_BENCH_MIB": "64"},
+  "tags": {"sharegroup": "bench", "core-class": "big"},
+  "volumes": {"/volumes/replica-bench": "/data"}
+}

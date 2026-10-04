@@ -3,12 +3,20 @@
 #include "bridge.h"
 #include <string.h>
 #include <limits.h>
+#ifndef SQLITE_TEMP_FILE_PREFIX
+#define SQLITE_TEMP_FILE_PREFIX "etilqs_"
+#endif
 
+/* De naam van een tijdelijk bestand: het voorvoegsel van SQLite en 16 hexcijfers. */
+#define TEMP_NAME 32
 typedef struct {
  sqlite3_file base;
  ReplicaStorage *storage;
  uint32_t handle;
  int lock;
+ /* Een tijdelijk bestand (sorter, temp-B-tree): de VFS verzint de naam en
+  * verwijdert het bij sluiten (SQLITE_OPEN_DELETEONCLOSE), zoals unixOpen. */
+ char temp[TEMP_NAME];
 } ReplicaFile;
 static ReplicaStorage backend;
 static sqlite3 *connection;
@@ -17,6 +25,7 @@ static int active;
 static int file_close(sqlite3_file *file) {
  ReplicaFile *f=(ReplicaFile *)file;
  int rc=f->storage->close(f->storage->context,f->handle);
+ if(rc==SQLITE_OK && f->temp[0])rc=f->storage->remove(f->storage->context,f->temp,0);
  f->base.pMethods=0;
  return rc;
 }
@@ -56,8 +65,14 @@ static int file_control(sqlite3_file *file,int op,void *arg) {
  if(op==SQLITE_FCNTL_LOCKSTATE){*(int *)arg=((ReplicaFile *)file)->lock;return SQLITE_OK;}
  return SQLITE_NOTFOUND;
 }
-static int file_sector(sqlite3_file *file) {(void)file;return 512;}
-static int file_characteristics(sqlite3_file *file) {(void)file;return 0;}
+/* HopFS schrijft in blokken van 4 KiB; een deel van een blok is daar een
+ * lees-wijzig-schrijf. De journalkop wordt zo één heel blok. */
+static int file_sector(sqlite3_file *file) {(void)file;return 4096;}
+/* SAFE_APPEND: HopFS legt de boom (en dus de maat) pas vast na een flush van
+ * de data, dus een bestand groeit nooit vóór zijn bytes er staan. SQLite
+ * schrijft dan het aantal records niet meer in de journalkop en spaart per
+ * commit één sync van het journal (syncJournal). */
+static int file_characteristics(sqlite3_file *file) {(void)file;return SQLITE_IOCAP_SAFE_APPEND;}
 static const sqlite3_io_methods methods={
  .iVersion=1,.xClose=file_close,.xRead=file_read,.xWrite=file_write,
  .xTruncate=file_truncate,.xSync=file_sync,.xFileSize=file_size,
@@ -68,8 +83,16 @@ static int vfs_open(sqlite3_vfs *vfs,const char *name,sqlite3_file *file,int fla
  ReplicaFile *f=(ReplicaFile *)file;
  (void)vfs;
  memset(f,0,sizeof(*f));
- /* Tijdelijke werkdata is door TEMP_STORE=3 in SQLite-geheugen. */
- if(!name || (flags & SQLITE_OPEN_WAL))return SQLITE_CANTOPEN;
+ if(flags & SQLITE_OPEN_WAL)return SQLITE_CANTOPEN;
+ if(!name){
+  /* Een tijdelijk bestand zonder naam (unixGetTempname): etilqs_ plus 16 hexcijfers
+   * uit de entropie van de eigenaar, in dezelfde map als de database. */
+  unsigned char r[8];
+  if(!(flags & SQLITE_OPEN_DELETEONCLOSE) || backend.random(backend.context,r,sizeof r)!=sizeof r)return SQLITE_CANTOPEN;
+  memcpy(f->temp,SQLITE_TEMP_FILE_PREFIX,7);
+  for(int i=0;i<8;++i){f->temp[7+2*i]="0123456789abcdef"[r[i]>>4];f->temp[8+2*i]="0123456789abcdef"[r[i]&15];}
+  name=f->temp;
+ }else if(flags & SQLITE_OPEN_DELETEONCLOSE)return SQLITE_CANTOPEN;
  int rc=backend.open(backend.context,name,flags,&f->handle);
  if(rc!=SQLITE_OK)return rc;
  f->storage=&backend;
@@ -113,11 +136,22 @@ int sqlite3_os_end(void){return SQLITE_OK;}
 int replica_sqlite_init(void *heap,int bytes,const ReplicaStorage *storage) {
  if(active || bytes<65536 || !heap || !storage)return SQLITE_MISUSE;
  int rc=sqlite3_config(SQLITE_CONFIG_HEAP,heap,bytes,64);
+ /* Geen grote blokken: de sorter laat anders één buffer verdubbelen tot
+  * cache_size, en in memsys5 (machten van twee, de paginacache in de grootste
+  * blokken) is er dan geen aaneengesloten blok meer (NOMEM bij CREATE INDEX
+  * op 320.000 rijen, 04-10). Per record alloceren past wel. */
+ if(rc==SQLITE_OK)rc=sqlite3_config(SQLITE_CONFIG_SMALL_MALLOC,1);
  if(rc!=SQLITE_OK)return rc;
  backend=*storage;
  rc=sqlite3_initialize();
  if(rc==SQLITE_OK)rc=sqlite3_vfs_register(&vfs,1);
  if(rc!=SQLITE_OK){sqlite3_shutdown();memset(&backend,0,sizeof(backend));return rc;}
+ /* memsys5 rondt een pagina van 4 KiB plus kop af op 8 KiB, dus een cache_size
+  * past twee keer zo slecht als hij lijkt. Zonder deze grens geeft een volle
+  * heap NOMEM midden in een transactie (gemeten 04-10: 160.000 rijen in een
+  * heap van 64 MiB met cache_size=-40960); met de grens spilt de paginacache
+  * naar het bestand en gaat de transactie door. */
+ sqlite3_soft_heap_limit64(bytes-bytes/16);
  active=1;
  return SQLITE_OK;
 }
@@ -147,10 +181,14 @@ static int open_with(const char *path,sqlite3 **db,int readonly) {
  sqlite3_extended_result_codes(*db,1);
  sqlite3_db_config(*db,SQLITE_DBCONFIG_DEFENSIVE,1,0);
  sqlite3_db_config(*db,SQLITE_DBCONFIG_TRUSTED_SCHEMA,0,0);
- /* HopFS bewaart naamverwijdering pas na een bevestigde directorybarrière.
-  * EXTRA vraagt die ook voor DELETE-journals; FULL alleen kan na power loss
-  * een oud journal opnieuw zichtbaar maken en een bevestigde commit terugrollen. */
- rc=sqlite3_exec(*db,"PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; PRAGMA temp_store=MEMORY",0,0,0);
+ /* Eén eigenaar, dus EXCLUSIVE: SQLite houdt zijn slot en zijn journal open
+  * en kijkt niet bij elke transactie opnieuw naar een heet journal, pagina 1
+  * en de bestandsmaat (op QEMU 2 stat-rondes en een lees per puntread, 04-10).
+  * Het journal wordt na een commit niet verwijderd maar zijn kop gewist,
+  * met een sync; verwijderen plus de barrière van de map (EXTRA) spaart dat
+  * uit. HopFS bewaart naamverwijdering pas na een bevestigde
+  * directorybarrière; EXTRA vraagt die bij het sluiten nog steeds. */
+ rc=sqlite3_exec(*db,"PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA",0,0,0);
  /* Een lezer: ook SQL die zou schrijven faalt, vóór de VFS het weigert. */
  if(rc==SQLITE_OK && readonly)rc=sqlite3_exec(*db,"PRAGMA query_only=1",0,0,0);
  if(rc!=SQLITE_OK){replica_sqlite_close(*db);*db=0;}

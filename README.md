@@ -24,13 +24,26 @@ Zie [contracten en resterende aansluiting](docs/port.md).
 | `replica-hopos` | Async system-client als SQLite-opslag via de private stack; `xSync` is OP_SYNC |
 | `replica-sqlite-smoke` | RAM-SQLite als echte Hop-job, twee onafhankelijke slots |
 | `replica-sqlite-persist` | HopFS-commit, koude herstart, echte capture/restore en annulering van langlopende SQL |
+| `replica-sqlite-bench` | De meetkern: dezelfde stappen op HopOS (`tools/qemu-bench.py`, of als job op ijzer) en op de host (`cargo run -p replica-sqlite-bench`, RAM) naast `tools/bench-host.sh` (SQLite's unix-VFS) |
 
 De Go-versie gebruikte `ncruces/go-sqlite3` en SQLite in WASM. Beide versies
 gebruiken echte SQLite; de Rust-versie verandert de uitvoeringsomgeving.
-SQLite draait met één eigenaar, `journal_mode=DELETE` en
-**`synchronous=EXTRA`**. Bij DELETE-journals moet ook het verwijderen van het
+SQLite draait met één eigenaar, `locking_mode=EXCLUSIVE`, `journal_mode=DELETE`
+en **`synchronous=EXTRA`**. Bij DELETE-journals moet ook het verwijderen van het
 journal duurzaam worden: FULL alleen was in de koude HopFS-proef onvoldoende.
-WAL is niet ingebouwd.
+In EXCLUSIVE blijft het journal tussen transacties open met een gewiste kop en
+kijkt SQLite niet per transactie opnieuw naar een heet journal, pagina 1 en de
+bestandsmaat; verwijderd wordt het pas bij sluiten, met de mapbarrière van
+EXTRA. De VFS meldt HopFS' blok van 4 KiB als sector en `SAFE_APPEND` (de
+boom en dus de maat worden pas na een flush van de data vastgelegd), wat per
+commit één journalsync spaart. Tijdelijke bestanden (de sorter en temp-B-trees
+boven `cache_size`) gaan via de VFS, zoals op Linux; met de vaste
+`memsys5`-heap geeft de paginacache onder een soft heap limit pagina's terug in
+plaats van NOMEM. `replica-hopos` bundelt aaneengesloten writes tot één call en
+leest bij een sequentiële lees vooruit (64 KiB tot 1 MiB), want elke call is
+een ronde door de OS-core. WAL is niet ingebouwd: de replicatie leest het
+databasebestand als de enige waarheid (capture, dirty tracking, restore), en
+een WAL zou die pagina's pas bij een checkpoint laten zien.
 
 ## Bouwen en toetsen
 
@@ -44,6 +57,7 @@ elders stel je `SQLITE_CC` en `SQLITE_AR` in.
 tools/gate.sh
 QEMU=1 tools/gate.sh
 python3 tools/qemu-persist.py
+REPLICA_BENCH_MIB=64 python3 tools/qemu-bench.py
 ```
 
 De gewone poort controleert de meegeleverde SQLite-bronhashes, formatting,
