@@ -37,11 +37,16 @@ bestandsmaat; verwijderd wordt het pas bij sluiten, met de mapbarrière van
 EXTRA. De VFS meldt HopFS' blok van 4 KiB als sector en `SAFE_APPEND` (de
 boom en dus de maat worden pas na een flush van de data vastgelegd), wat per
 commit één journalsync spaart. Tijdelijke bestanden (de sorter en temp-B-trees
-boven `cache_size`) gaan via de VFS, zoals op Linux; met de vaste
-`memsys5`-heap geeft de paginacache onder een soft heap limit pagina's terug in
-plaats van NOMEM. `replica-hopos` bundelt aaneengesloten writes tot één call en
-leest bij een sequentiële lees vooruit (64 KiB tot 1 MiB), want elke call is
-een ronde door de OS-core. WAL is niet ingebouwd: de replicatie leest het
+boven `cache_size`) gaan via de VFS, zoals op Linux. De heap die de app leent
+wordt gesplitst: drie achtste is de paginacache (`SQLITE_CONFIG_PAGECACHE`, een
+pagina kost daar wat hij is; in `memsys5` kostte hij het dubbele) en elke
+verbinding opent met `cache_size` op die pool, de rest is `memsys5` voor de
+sorter, statements en schema, met een soft heap limit waardoor de sorter spilt
+en de paginacache pagina's teruggeeft in plaats van NOMEM. `replica-hopos`
+bundelt aaneengesloten writes tot één call en leest bij een sequentiële lees
+vooruit (64 KiB tot 512 KiB) in zestien vensters, één per stroom, zodat ook de
+merge van de sorter (tot zestien PMA's door elkaar uit één tempbestand) per
+stroom aaneengesloten leest; elke call is een ronde door de OS-core. WAL is niet ingebouwd: de replicatie leest het
 databasebestand als de enige waarheid (capture, dirty tracking, restore), en
 een WAL zou die pagina's pas bij een checkpoint laten zien.
 

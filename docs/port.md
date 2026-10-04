@@ -39,8 +39,13 @@ open bestanden, canonieke relatieve namen en maximaal 1 MiB per I/O-stap. Per
 schrijfbaar bestand bundelt hij aaneengesloten writes tot 256 KiB in één call
 (weggeschreven vóór sync, lees, truncate, stat en close: de duurzaamheid blijft
 die van xSync), en bij een sequentiële lees leest hij een venster vooruit (64 KiB
-verdubbelend tot 1 MiB) dat een write erin meeneemt. `Stats::snapshot` telt
-callbacks en calls; `apps/sqlite-bench` drukt het verschil per stap af.
+verdubbelend tot 512 KiB) dat een write erin meeneemt. Er zijn zestien vensters,
+één per stroom: een lees hoort bij het venster waar hij op aansluit (vooruit of
+dalend), anders bij het langst ongebruikte; zo leest de merge van SQLite's
+sorter (tot zestien PMA's door elkaar, elke lezer 4 KiB per keer) per PMA
+aaneengesloten. `Stats::snapshot` telt callbacks en calls; `apps/sqlite-bench`
+drukt het verschil per stap af, met `cpm` (rondes per MiB; 256 is één per
+pagina).
 Timeout, transportfout of protocolfout maakt die eigenaar onbruikbaar.
 `AsyncStorage::invalidate` en de bridge doen hetzelfde bij annulering.
 De C-progresscallback laat ook CPU-SQL periodiek parkeren; annuleren geeft

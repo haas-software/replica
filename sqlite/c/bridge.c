@@ -21,6 +21,9 @@ typedef struct {
 static ReplicaStorage backend;
 static sqlite3 *connection;
 static int active;
+/* De paginacache in pagina's: de pool uit replica_sqlite_init, en de
+ * cache_size waarmee elke verbinding opent. */
+static int cache_pages;
 
 static int file_close(sqlite3_file *file) {
  ReplicaFile *f=(ReplicaFile *)file;
@@ -135,23 +138,43 @@ int sqlite3_os_end(void){return SQLITE_OK;}
 
 int replica_sqlite_init(void *heap,int bytes,const ReplicaStorage *storage) {
  if(active || bytes<65536 || !heap || !storage)return SQLITE_MISUSE;
- int rc=sqlite3_config(SQLITE_CONFIG_HEAP,heap,bytes,64);
+ /* De paginacache uit een eigen pool: in memsys5 (machten van twee) kost een
+  * pagina van 4 KiB plus kop 8 KiB, in de pool precies wat hij is. Drie
+  * achtste van de heap; de rest is memsys5 voor de sorter, statements en
+  * schema. Elke verbinding opent met cache_size op de pool (open_with), dus
+  * een app hoeft niets te zetten. GEMETEN 04-10: 24 MiB cache_size liet in
+  * een heap van 64 MiB maar een paar MiB voor de sorter over, die daardoor
+  * PMA's van enkele MiB schreef en in meer lagen moest mergen. */
+ int hdr=0,rc=sqlite3_config(SQLITE_CONFIG_PCACHE_HDRSZ,&hdr);
+ if(rc!=SQLITE_OK)return rc;
+ int page=(4096+hdr+7)&~7;
+ /* De cache zestien pagina's kleiner dan de pool: pcache1 meldt "druk" zodra
+  * er minder dan tien slots vrij zijn, en dan spilt de pager bij elke nieuwe
+  * pagina één vuile pagina los (willekeurige volgorde, dus losse writes) in
+  * plaats van alles op volgorde bij de commit. GEMETEN 04-10 op QEMU
+  * (512 MiB): DELETE 253 naar 7.249 schrijfrondes met cache_size op de pool. */
+ int slots=bytes/8*3/page;
+ cache_pages=slots-16;
+ int pool=slots*page;
+ if(rc==SQLITE_OK)rc=sqlite3_config(SQLITE_CONFIG_PAGECACHE,heap,page,slots);
+ /* De kleinste toewijzing 32 bytes: een sorterrecord van 20 bytes kostte met
+  * 64 het drievoudige. De beheerbytes van memsys5 zijn dan 1/32 van de heap. */
+ if(rc==SQLITE_OK)rc=sqlite3_config(SQLITE_CONFIG_HEAP,(char *)heap+pool,bytes-pool,32);
  /* Geen grote blokken: de sorter laat anders één buffer verdubbelen tot
-  * cache_size, en in memsys5 (machten van twee, de paginacache in de grootste
-  * blokken) is er dan geen aaneengesloten blok meer (NOMEM bij CREATE INDEX
-  * op 320.000 rijen, 04-10). Per record alloceren past wel. */
+  * cache_size, en in memsys5 (de grootste blokken) is er dan geen
+  * aaneengesloten blok meer (NOMEM bij CREATE INDEX op 320.000 rijen, 04-10).
+  * Per record alloceren past wel. */
  if(rc==SQLITE_OK)rc=sqlite3_config(SQLITE_CONFIG_SMALL_MALLOC,1);
  if(rc!=SQLITE_OK)return rc;
  backend=*storage;
  rc=sqlite3_initialize();
  if(rc==SQLITE_OK)rc=sqlite3_vfs_register(&vfs,1);
  if(rc!=SQLITE_OK){sqlite3_shutdown();memset(&backend,0,sizeof(backend));return rc;}
- /* memsys5 rondt een pagina van 4 KiB plus kop af op 8 KiB, dus een cache_size
-  * past twee keer zo slecht als hij lijkt. Zonder deze grens geeft een volle
-  * heap NOMEM midden in een transactie (gemeten 04-10: 160.000 rijen in een
-  * heap van 64 MiB met cache_size=-40960); met de grens spilt de paginacache
-  * naar het bestand en gaat de transactie door. */
- sqlite3_soft_heap_limit64(bytes-bytes/16);
+ /* Zonder deze grens geeft een volle heap NOMEM midden in een transactie
+  * (gemeten 04-10: 160.000 rijen in een heap van 64 MiB); met de grens spilt
+  * de sorter naar zijn tempbestand en geeft de paginacache pagina's terug
+  * boven de pool, en gaat de transactie door. */
+ sqlite3_soft_heap_limit64((bytes-pool)-(bytes-pool)/16);
  active=1;
  return SQLITE_OK;
 }
@@ -189,6 +212,13 @@ static int open_with(const char *path,sqlite3 **db,int readonly) {
   * uit. HopFS bewaart naamverwijdering pas na een bevestigde
   * directorybarrière; EXTRA vraagt die bij het sluiten nog steeds. */
  rc=sqlite3_exec(*db,"PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA",0,0,0);
+ /* De paginacache zo groot als de pool (replica_sqlite_init); ook de PMA-maat
+  * van de sorter volgt cache_size. */
+ if(rc==SQLITE_OK){
+  char sql[48];
+  sqlite3_snprintf(sizeof sql,sql,"PRAGMA cache_size=%d",cache_pages);
+  rc=sqlite3_exec(*db,sql,0,0,0);
+ }
  /* Een lezer: ook SQL die zou schrijven faalt, vóór de VFS het weigert. */
  if(rc==SQLITE_OK && readonly)rc=sqlite3_exec(*db,"PRAGMA query_only=1",0,0,0);
  if(rc!=SQLITE_OK){replica_sqlite_close(*db);*db=0;}

@@ -8,9 +8,15 @@
 //! lees, truncate, stat en close (duurzaamheid blijft die van SQLite: niets
 //! is beloofd vóór xSync), en één leesvenster dat bij een sequentiële lees
 //! (aansluitend op de vorige) vooruitleest, van 64 KiB verdubbelend tot
-//! 1 MiB, zoals Linux' readahead-venster. Eén eigenaar schrijft dit domein,
-//! dus het venster is altijd actueel: een write erin wordt erin gezet.
-//! GEMETEN 04-10 op QEMU (64 MiB): zie apps/sqlite-bench.
+//! 512 KiB, zoals Linux' readahead-venster. Linux houdt die staat per open
+//! bestand; SQLite's sorter leest tot zestien PMA's door elkaar uit één
+//! tempbestand (`SORTER_MAX_MERGE_COUNT`, elke lezer 4 KiB per keer op
+//! volgorde), dus hier is de staat per stroom: zestien vensters, een lees
+//! hoort bij het venster waar hij op aansluit, anders bij het langst
+//! ongebruikte. Eén eigenaar schrijft dit domein, dus een venster is altijd
+//! actueel: een write erin wordt erin gezet. GEMETEN 04-10 op QEMU: zie
+//! apps/sqlite-bench; op de M4 deed de merge van CREATE INDEX met één
+//! venster één ronde per pagina.
 use alloc::vec::Vec;
 use applib::{appnet::SystemClient, stacktask::Suspender, sys};
 use core::{
@@ -40,10 +46,13 @@ impl Suspend for Wait<'_> {
 /// zijn pagina's op volgorde, dus aaneengesloten runs tot deze maat gaan in
 /// één call (256 KiB is 64 pagina's; de kern neemt tot 1 MiB per call).
 const WRITE_BUF: usize = 256 << 10;
-/// Het leesvenster begint hier bij de eerste sequentiële miss.
+/// Een leesvenster begint hier bij de eerste sequentiële miss.
 const AHEAD_MIN: usize = 64 << 10;
-/// En verdubbelt tot de maat van één call.
-const AHEAD_MAX: usize = sys::MAX_CHUNK;
+/// En verdubbelt tot hier: 128 pagina's per ronde; zestien vensters zijn dan
+/// hoogstens 8 MiB.
+const AHEAD_MAX: usize = 512 << 10;
+/// Zoveel stromen tegelijk: de merge-breedte van SQLite's sorter.
+const WINDOWS: usize = 16;
 
 /// Nog niet weggeschreven bytes van één bestand: één aaneengesloten run.
 struct WriteBuf {
@@ -66,12 +75,12 @@ impl WriteBuf {
     }
 }
 
-/// Het leesvenster: de laatst vooruitgelezen run van één bestand, en los
-/// daarvan de vorige lees (de stroomdetectie). Een lees ertussendoor (een
-/// interne B-tree-pagina in een scan) laat het venster staan; de scan gaat
-/// daarna gewoon verder uit het venster. Een dalende scan (SQLite's
-/// integrity_check loopt de cellen van achter naar voren, een ORDER BY DESC
-/// over een index ook) krijgt een venster dat op de lees eindigt.
+/// Eén stroom: de laatst vooruitgelezen run van één bestand, en los daarvan
+/// de vorige lees (de stroomdetectie). Een lees ertussendoor (een interne
+/// B-tree-pagina in een scan) hoort bij een andere stroom en laat deze staan.
+/// Een dalende scan (SQLite's integrity_check loopt de cellen van achter naar
+/// voren, een ORDER BY DESC over een index ook) krijgt een venster dat op de
+/// lees eindigt.
 struct Window {
     file: u32,
     data: Vec<u8>,
@@ -81,6 +90,8 @@ struct Window {
     last: (u32, u64, u64),
     /// De maat van het volgende venster; groeit per sequentiële miss.
     ahead: usize,
+    /// Wanneer deze stroom voor het laatst las (de klok van `Files`).
+    used: u64,
 }
 impl Window {
     const EMPTY: Self = Self {
@@ -90,19 +101,24 @@ impl Window {
         len: 0,
         last: (0, 0, 0),
         ahead: 0,
+        used: 0,
     };
-    /// Een lees uit het venster, als hij er helemaal in ligt.
-    fn take(&mut self, id: FileId, off: u64, dst: &mut [u8]) -> bool {
-        if self.file != id.0
-            || off < self.start
-            || off + dst.len() as u64 > self.start + self.len as u64
-        {
-            return false;
+    /// Ligt de lees in het venster?
+    fn covers(&self, id: FileId, off: u64, n: usize) -> bool {
+        self.file == id.0 && off >= self.start && off + n as u64 <= self.start + self.len as u64
+    }
+    /// Sluit de lees aan op de vorige van deze stroom: erna (precies, of een
+    /// paar pagina's verder: wat ertussen zat had SQLite in zijn cache), of
+    /// ervoor (dalend)?
+    fn next_to(&self, id: FileId, off: u64, end: u64) -> (bool, bool) {
+        let gap = AHEAD_MIN as u64;
+        if self.last.0 != id.0 {
+            return (false, false);
         }
-        let at = (off - self.start) as usize;
-        dst.copy_from_slice(&self.data[at..at + dst.len()]);
-        self.last = (id.0, off, off + dst.len() as u64);
-        true
+        (
+            (self.last.2..self.last.2 + gap).contains(&off),
+            (self.last.1.saturating_sub(gap)..=self.last.1).contains(&end),
+        )
     }
     /// Een write: in het venster als hij erin past, anders het venster weg.
     fn patch(&mut self, id: FileId, off: u64, src: &[u8]) {
@@ -120,6 +136,7 @@ impl Window {
     fn drop_file(&mut self, id: FileId) {
         if self.file == id.0 {
             self.len = 0;
+            self.last = (0, 0, 0);
         }
     }
 }
@@ -244,7 +261,9 @@ pub struct Files<'a, E> {
     env: E,
     files: [File; 16],
     bufs: [WriteBuf; 16],
-    window: Window,
+    windows: [Window; WINDOWS],
+    /// Telt de lezingen: de klok voor de langst ongebruikte stroom.
+    clock: u64,
     poisoned: bool,
 }
 impl<'a, E: Environment> Files<'a, E> {
@@ -264,7 +283,8 @@ impl<'a, E: Environment> Files<'a, E> {
             env,
             files: [File::EMPTY; 16],
             bufs: [const { WriteBuf::EMPTY }; 16],
-            window: Window::EMPTY,
+            windows: [const { Window::EMPTY }; WINDOWS],
+            clock: 0,
             poisoned: false,
         })
     }
@@ -424,7 +444,9 @@ impl<E: Environment> AsyncStorage for Files<'_, E> {
         let i = (id.0 & 255) as usize;
         self.flush(i).await?;
         self.bufs[i].data = Vec::new();
-        self.window.drop_file(id);
+        for w in &mut self.windows {
+            w.drop_file(id);
+        }
         self.files[i].open = false;
         Ok(())
     }
@@ -432,63 +454,78 @@ impl<E: Environment> AsyncStorage for Files<'_, E> {
         let path = self.file_path(id, false)?;
         count(READS, 1);
         count(READ_BYTES, dst.len() as u64);
-        if self.window.take(id, offset, dst) {
+        self.clock += 1;
+        let end = offset + dst.len() as u64;
+        if let Some(w) = self
+            .windows
+            .iter_mut()
+            .find(|w| w.covers(id, offset, dst.len()))
+        {
+            let at = (offset - w.start) as usize;
+            dst.copy_from_slice(&w.data[at..at + dst.len()]);
+            (w.last, w.used) = ((id.0, offset, end), self.clock);
             return Ok(dst.len());
         }
+        // De stroom waar deze lees op aansluit; anders de langst ongebruikte,
+        // en dan is dit een losse lees: alleen zichzelf, geen venster.
+        let found = self
+            .windows
+            .iter()
+            .position(|w| w.next_to(id, offset, end) != (false, false));
+        let k = found.unwrap_or_else(|| {
+            self.windows
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, w)| w.used)
+                .map_or(0, |(k, _)| k)
+        });
+        let (forward, _) = self.windows[k].next_to(id, offset, end);
         let i = (id.0 & 255) as usize;
-        // Ligt de lees vlak na de vorige (precies aansluitend, of een paar
-        // pagina's verder: wat ertussen zat had SQLite al in zijn cache) of
-        // vlak ervoor, dan is dit een scan: een venster vooruit (of achteruit)
-        // lezen, bij elke volgende miss een groter. Een losse lees haalt alleen
-        // zichzelf en laat het venster staan.
-        let w = &mut self.window;
-        let end = offset + dst.len() as u64;
-        let gap = AHEAD_MIN as u64;
-        let forward = w.last.0 == id.0 && (w.last.2..w.last.2 + gap).contains(&offset);
-        let backward = w.last.0 == id.0 && (w.last.1.saturating_sub(gap)..=w.last.1).contains(&end);
-        if !forward && !backward {
+        if found.is_none() {
+            let w = &mut self.windows[k];
+            (w.len, w.ahead, w.used) = (0, 0, self.clock);
             if self.bufs[i].overlaps(offset, dst.len()) {
                 self.flush(i).await?;
             }
             let n = self.read_direct(&path, offset, dst).await?;
-            self.window.last = (id.0, offset, offset + n as u64);
+            self.windows[k].last = (id.0, offset, offset + n as u64);
             return Ok(n);
         }
+        // Een scan: een venster vooruit (of achteruit) lezen, bij elke
+        // volgende miss een groter.
+        let w = &mut self.windows[k];
         w.ahead = (w.ahead * 2).clamp(AHEAD_MIN, AHEAD_MAX);
-        if w.data.is_empty() {
-            let mut v = Vec::new();
-            if v.try_reserve_exact(AHEAD_MAX).is_ok() {
-                v.resize(AHEAD_MAX, 0);
-            }
-            w.data = v;
+        if w.data.len() < w.ahead && w.data.try_reserve_exact(w.ahead - w.data.len()).is_ok() {
+            w.data.resize(w.ahead, 0);
         }
-        let want = w.ahead.max(dst.len()).min(w.data.len()).max(dst.len());
+        let want = w.ahead.min(w.data.len()).max(dst.len());
         // Vooruit begint het venster bij deze lees, achteruit eindigt het erop.
         let from = if forward {
             offset
         } else {
             end.saturating_sub(want as u64)
         };
+        (w.len, w.used) = (0, self.clock);
         if self.bufs[i].overlaps(from, want) {
             self.flush(i).await?;
         }
         if want <= dst.len() {
             // Geen geheugen voor een venster: alleen deze lees.
             let n = self.read_direct(&path, offset, dst).await?;
-            self.window.last = (id.0, offset, offset + n as u64);
+            self.windows[k].last = (id.0, offset, offset + n as u64);
             return Ok(n);
         }
-        let mut data = core::mem::take(&mut self.window.data);
+        let mut data = core::mem::take(&mut self.windows[k].data);
         let r = self.read_direct(&path, from, &mut data[..want]).await;
-        self.window.data = data;
+        self.windows[k].data = data;
         let n = r?;
         let at = (offset - from) as usize;
         let got = n.saturating_sub(at).min(dst.len());
-        dst[..got].copy_from_slice(&self.window.data[at..at + got]);
+        let w = &mut self.windows[k];
+        dst[..got].copy_from_slice(&w.data[at..at + got]);
         if got < dst.len() {
             dst[got..].fill(0);
         }
-        let w = &mut self.window;
         (w.file, w.start, w.len) = (id.0, from, n);
         w.last = (id.0, offset, offset + got as u64);
         Ok(got)
@@ -497,7 +534,9 @@ impl<E: Environment> AsyncStorage for Files<'_, E> {
         let path = self.file_path(id, true)?;
         count(WRITES, 1);
         count(WRITE_BYTES, src.len() as u64);
-        self.window.patch(id, offset, src);
+        for w in &mut self.windows {
+            w.patch(id, offset, src);
+        }
         let i = (id.0 & 255) as usize;
         if self.bufs[i].data.is_empty() {
             let mut v = Vec::new();
@@ -548,7 +587,9 @@ impl<E: Environment> AsyncStorage for Files<'_, E> {
     async fn truncate(&mut self, id: FileId, size: u64) -> Result {
         let p = self.file_path(id, true)?;
         self.flush((id.0 & 255) as usize).await?;
-        self.window.drop_file(id);
+        for w in &mut self.windows {
+            w.drop_file(id);
+        }
         count(CALL_OTHER, 1);
         self.sys
             .truncate(p.text()?, size)

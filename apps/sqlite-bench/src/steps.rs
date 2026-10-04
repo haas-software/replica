@@ -15,8 +15,8 @@ const COMMITS: u64 = 200;
 const POINTS: u64 = 2000;
 /// Rangequeries over de index.
 const RANGES: u64 = 100;
-/// De sortering: zoveel rijen door een temp-B-tree, als de tabel ze heeft.
-const SORT_ROWS: u64 = 200_000;
+/// Rijen per rangequery: elk een rowid-opzoeking in de tabel.
+const RANGE_ROWS: u64 = 500;
 /// Soorten gebeurtenissen; `kind` kiest een achtste voor de join en de delete.
 const KINDS: u64 = 8;
 /// Groepen; de index (grp, ts) deelt de tabel erin op.
@@ -165,7 +165,8 @@ fn points<B: Storage>(db: &mut Connection<'_, '_, B>, rows: u64, rng: &mut Rng) 
 fn ranges<B: Storage>(db: &mut Connection<'_, '_, B>, rows: u64, rng: &mut Rng) -> Result<u64> {
     let mut s =
         db.prepare(c"SELECT count(*),sum(amount) FROM item WHERE grp=?1 AND ts BETWEEN ?2 AND ?3")?;
-    let span = (rows * 7 / 8) as i64;
+    // Binnen een groep liggen de rijen GROUPS uit elkaar en ts is 7 per rij.
+    let span = (RANGE_ROWS * GROUPS * 7) as i64;
     for _ in 0..RANGES {
         let from = (rng.next() % (rows * 7)) as i64;
         s.bind(1, Value::Integer((rng.next() % GROUPS) as i64))?;
@@ -177,17 +178,16 @@ fn ranges<B: Storage>(db: &mut Connection<'_, '_, B>, rows: u64, rng: &mut Rng) 
     Ok(RANGES)
 }
 
-/// Een sortering zonder index: alle rijen door de sorter in het geheugen.
+/// Een sortering zonder index over de hele tabel: boven cache_size spilt
+/// de sorter PMA's naar een tempbestand en merget ze (tot zestien tegelijk).
 fn sort<B: Storage>(db: &mut Connection<'_, '_, B>, rows: u64) -> Result<u64> {
-    let n = rows.min(SORT_ROWS);
-    let mut s = db.prepare(c"SELECT amount FROM item WHERE id BETWEEN 1 AND ?1 ORDER BY amount")?;
-    s.bind(1, Value::Integer(n as i64))?;
+    let mut s = db.prepare(c"SELECT amount FROM item ORDER BY amount")?;
     let mut got = 0;
     while s.step()? {
         got += 1;
     }
-    require(got == n)?;
-    Ok(n)
+    require(got == rows)?;
+    Ok(rows)
 }
 
 /// De stappen, op een geopende engine; de verbinding wordt vóór de koude
@@ -201,11 +201,9 @@ pub(crate) fn run<B: Storage, R: Bench>(
     let rows = mib.max(1) * ROWS_PER_MIB;
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let mut db = engine.open(path)?;
-    // De paginacache: 24 MiB, in memsys5 48 MiB aan blokken van 8 KiB (een pagina
-    // plus kop rondt af naar boven); de rest van de 64 MiB voor sorter en statements.
+    // De paginacache en de PMA-maat van de sorter zet de bridge: drie achtste van de heap.
     db.execute(
-        c"PRAGMA cache_size=-24576;\
-          CREATE TABLE item(id INTEGER PRIMARY KEY,grp INTEGER,ts INTEGER,amount REAL,label TEXT,payload BLOB);\
+        c"CREATE TABLE item(id INTEGER PRIMARY KEY,grp INTEGER,ts INTEGER,amount REAL,label TEXT,payload BLOB);\
           CREATE TABLE event(id INTEGER PRIMARY KEY,item INTEGER,kind INTEGER,note TEXT)",
     )?;
     step(r, "LOAD", || load(&mut db, rows, &mut rng))?;
@@ -217,7 +215,6 @@ pub(crate) fn run<B: Storage, R: Bench>(
     step(r, "COMMITS", || commits(&mut db, rows, rows / 4 + 1))?;
     drop(db);
     let mut db = engine.open(path)?;
-    db.execute(c"PRAGMA cache_size=-24576")?;
     step(r, "POINT", || points(&mut db, rows, &mut rng))?;
     step(r, "SCAN", || {
         // De kale tabelscan: alle pagina's op volgorde, zonder index.
@@ -229,10 +226,14 @@ pub(crate) fn run<B: Storage, R: Bench>(
         Ok(rows)
     })?;
     step(r, "GROUP", || {
-        // De planner neemt hier de index (grp, ts) en zoekt per rij de tabelrij op.
+        // Een scan met de sorter voor GROUP BY. Zonder NOT INDEXED neemt de
+        // planner de index (grp, ts) en zoekt per rij de tabelrij op: tien
+        // miljoen losse pagina's door een cache van tientallen MiB, één
+        // ronde en één NVMe-opdracht per rij (de M4 op 04-10: 7.000 per
+        // seconde, 24 minuten); POINT meet die prijs al.
         let groups = count(
             &mut db,
-            c"SELECT count(*) FROM (SELECT grp,count(*),sum(amount) FROM item GROUP BY grp)",
+            c"SELECT count(*) FROM (SELECT grp,count(*),sum(amount) FROM item NOT INDEXED GROUP BY grp)",
         )?;
         require(groups as u64 == GROUPS.min(rows))?;
         Ok(rows)
@@ -247,7 +248,13 @@ pub(crate) fn run<B: Storage, R: Bench>(
         Ok(n as u64)
     })?;
     step(r, "UPDATE", || {
-        db.execute(c"UPDATE item SET amount=amount+1 WHERE grp<256")?;
+        // Een kwart van de tabel op rowid-volgorde: pagina's en journal
+        // aaneengesloten. Via de index (grp<256) zijn het dezelfde rijen in
+        // willekeurige volgorde, zie GROUP.
+        let mut s = db.prepare(c"UPDATE item SET amount=amount+1 WHERE id BETWEEN 1 AND ?1")?;
+        s.bind(1, Value::Integer((rows / 4) as i64))?;
+        require(!s.step()?)?;
+        drop(s);
         Ok(db.changes() as u64)
     })?;
     step(r, "DELETE", || {

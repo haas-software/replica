@@ -13,7 +13,6 @@
 #define COMMITS 200
 #define POINTS 2000
 #define RANGES 100
-#define SORT_ROWS 200000
 #define KINDS 8
 #define GROUPS 1024
 
@@ -58,7 +57,8 @@ static void report(const char *name, long long start, unsigned long long n) {
 }
 static void open_db(const char *path) {
  if (sqlite3_open(path, &db) != SQLITE_OK) fail("open");
- exec("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-24576");
+ /* Dezelfde cache als de bridge: drie achtste van 64 MiB. */
+ exec("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; PRAGMA cache_size=-24576");
 }
 
 int main(int argc, char **argv) {
@@ -141,12 +141,12 @@ int main(int argc, char **argv) {
  scalar("SELECT count(*) FROM item WHERE amount>=0 AND length(label)>0");
  report("SCAN", t, rows);
  t = now_us();
- scalar("SELECT count(*) FROM (SELECT grp,count(*),sum(amount) FROM item GROUP BY grp)");
+ scalar("SELECT count(*) FROM (SELECT grp,count(*),sum(amount) FROM item NOT INDEXED GROUP BY grp)");
  report("GROUP", t, rows);
  t = now_us();
  {
   sqlite3_stmt *s = prep("SELECT count(*),sum(amount) FROM item WHERE grp=?1 AND ts BETWEEN ?2 AND ?3");
-  long long span = (long long)(rows * 7 / 8);
+  long long span = 500LL * GROUPS * 7;
   for (int i = 0; i < RANGES; i++) {
    long long from = (long long)(next() % (rows * 7));
    sqlite3_bind_int64(s, 1, (sqlite3_int64)(next() % GROUPS));
@@ -160,18 +160,24 @@ int main(int argc, char **argv) {
  report("RANGE", t, RANGES);
  t = now_us();
  {
-  unsigned long long want = rows < SORT_ROWS ? rows : SORT_ROWS, got = 0;
-  sqlite3_stmt *s = prep("SELECT amount FROM item WHERE id BETWEEN 1 AND ?1 ORDER BY amount");
-  sqlite3_bind_int64(s, 1, (sqlite3_int64)want);
+  unsigned long long got = 0;
+  sqlite3_stmt *s = prep("SELECT amount FROM item ORDER BY amount");
   while (sqlite3_step(s) == SQLITE_ROW) got++;
   sqlite3_finalize(s);
-  if (got != want) fail("sort");
-  report("SORT", t, want);
+  if (got != rows) fail("sort");
+  report("SORT", t, rows);
  }
  t = now_us();
  n = (unsigned long long)scalar("SELECT count(*) FROM event e JOIN item i ON i.id=e.item WHERE e.kind=3");
  report("JOIN", t, n);
- t = now_us(); exec("UPDATE item SET amount=amount+1 WHERE grp<256"); report("UPDATE", t, (unsigned long long)sqlite3_changes64(db));
+ t = now_us();
+ {
+  sqlite3_stmt *s = prep("UPDATE item SET amount=amount+1 WHERE id BETWEEN 1 AND ?1");
+  sqlite3_bind_int64(s, 1, (sqlite3_int64)(rows / 4));
+  done(s);
+  sqlite3_finalize(s);
+ }
+ report("UPDATE", t, (unsigned long long)sqlite3_changes64(db));
  t = now_us(); exec("DELETE FROM event WHERE kind=0"); report("DELETE", t, (unsigned long long)sqlite3_changes64(db));
  t = now_us();
  {

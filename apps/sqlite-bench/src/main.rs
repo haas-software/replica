@@ -16,7 +16,7 @@ use replica_hopos::{Environment, Files, Stats, Wait};
 #[cfg(target_os = "none")]
 use replica_sqlite::{Engine, Error, Result, asynchronous::Bridge};
 
-/// De heap van SQLite: 64 MiB, waarvan 24 MiB paginacache (steps.rs).
+/// De heap van SQLite: 64 MiB; de bridge neemt er drie achtste van als paginacache.
 const HEAP_WORDS: usize = 8 << 20;
 /// De datamaat als de job niets zegt.
 const DEFAULT_MIB: u64 = 64;
@@ -57,10 +57,12 @@ impl steps::Bench for Report {
         self.0 = now;
         let secs = us.max(1) as f64 / 1e6;
         let mib = (d.call_read_bytes + d.call_write_bytes) as f64 / 1048576.0;
+        // cpm: rondes door de OS-core per MiB verkeer; 256 is één per pagina.
         log!(
-            "REPLICA_BENCH_{name} us={us} n={n} per_s={:.0} mib={mib:.1} mibps={:.1} vfs_r={} vfs_w={} vfs_s={} calls={} c_r={} c_w={} c_s={} c_o={} r_mib={:.1} w_mib={:.1}",
+            "REPLICA_BENCH_{name} us={us} n={n} per_s={:.0} mib={mib:.1} mibps={:.1} cpm={:.0} vfs_r={} vfs_w={} vfs_s={} calls={} c_r={} c_w={} c_s={} c_o={} r_mib={:.1} w_mib={:.1}",
             n as f64 / secs,
             mib / secs,
+            d.calls() as f64 / mib.max(0.001),
             d.reads,
             d.writes,
             d.syncs,
@@ -187,11 +189,17 @@ fn main() {
     let result = unsafe { replica_sqlite::Engine::initialize(&mut heap, &mut memory) }
         .and_then(|mut engine| steps::run(&mut engine, c"bench.db", mib, &mut report));
     match result {
-        Ok(rows) => println!(
-            "REPLICA_BENCH_DONE us={} rows={rows} db_mib={:.1}",
-            report.now_us(),
-            memory.contents(c"bench.db").map_or(0, <[u8]>::len) as f64 / 1048576.0
-        ),
+        Ok(rows) => {
+            let st = memory.stats();
+            println!(
+                "REPLICA_BENCH_DONE us={} rows={rows} db_mib={:.1} vfs_r={} vfs_w={} vfs_s={}",
+                report.now_us(),
+                memory.contents(c"bench.db").map_or(0, <[u8]>::len) as f64 / 1048576.0,
+                st.reads,
+                st.writes,
+                st.syncs
+            )
+        }
         Err(e) => {
             println!("REPLICA_BENCH_FAIL {e}");
             std::process::exit(1);
