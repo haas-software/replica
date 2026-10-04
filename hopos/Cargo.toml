@@ -6,6 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 [dependencies]
 replica-sqlite = { path = "../sqlite" }
-applib = { git = "https://github.com/xinix00/HopOS.git", tag = "v3.0.0-alpha.16" }
+applib = { git = "https://github.com/xinix00/HopOS.git", tag = "v3.0.9" }
 [lints]
 workspace = true

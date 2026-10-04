@@ -296,3 +296,64 @@ fn gc_preserves_current_unknown_recent_and_complete_within_retention() {
     ));
     assert_eq!(bucket.deleted.len(), count);
 }
+
+#[test]
+fn interrupted_generation_batches_finish_metadata_before_deleting_data() {
+    for after in [false, true] {
+        for fail in [1, 2, 127, 128, 129, 131, 132, 400] {
+            let mut bucket = Bucket::default();
+            bucket
+                .data
+                .insert(format!("{NS}/current"), GEN.as_bytes().to_vec());
+            let keep = old_objects(&mut bucket, GEN, true);
+            let id = "20260801T000000Z-old";
+            old_objects(&mut bucket, id, true);
+            let prefix = replication::generation_prefix(NS, id).unwrap();
+            for n in 0..129 {
+                bucket
+                    .data
+                    .insert(format!("{prefix}L0/extra{n:04}"), vec![1]);
+            }
+            for n in 0..300 {
+                bucket.data.insert(format!("{prefix}data/{n:04}"), vec![1]);
+            }
+            bucket.fail_delete = Some(fail);
+            bucket.fail_after_delete = after;
+            let mut failed = false;
+            let mut done = false;
+            for _ in 0..16 {
+                let result = maintenance::generations(&mut bucket, NS, GEN, at(0), 86400);
+                assert!(keep.iter().all(|key| bucket.data.contains_key(key)));
+                if bucket
+                    .data
+                    .keys()
+                    .any(|key| key.starts_with(&format!("{prefix}L")))
+                {
+                    assert_eq!(
+                        bucket
+                            .data
+                            .keys()
+                            .filter(|key| key.starts_with(&format!("{prefix}data/")))
+                            .count(),
+                        301
+                    );
+                }
+                match result {
+                    Ok(0) => {
+                        done = true;
+                        break;
+                    }
+                    Ok(count) => assert!(count <= 128),
+                    Err(Error::Object(object::StoreError::Transport)) => {
+                        assert!(!failed);
+                        failed = true;
+                        bucket.fail_delete = None;
+                    }
+                    Err(error) => panic!("unexpected GC error: {error:?}"),
+                }
+            }
+            assert!(failed && done);
+            assert!(!bucket.data.keys().any(|key| key.starts_with(&prefix)));
+        }
+    }
+}

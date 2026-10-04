@@ -149,3 +149,38 @@ fn discovery_omits_a_point_behind_a_sequence_gap() {
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].at, at(1));
 }
+
+#[test]
+fn catalog_uses_generation_prefixes_instead_of_listing_all_data_objects() {
+    use replica_core::object::{Object, Store};
+    struct Inventory(Bucket);
+    impl Store for Inventory {
+        fn put(&mut self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
+            self.0.put(key, bytes)
+        }
+        fn get(&mut self, key: &str, limit: usize) -> Result<Vec<u8>, StoreError> {
+            self.0.get(key, limit)
+        }
+        fn delete(&mut self, key: &str) -> Result<(), StoreError> {
+            self.0.delete(key)
+        }
+        fn list(&mut self, prefix: &str, limit: usize) -> Result<Vec<Object>, StoreError> {
+            if prefix == format!("{NS}/generations/") {
+                return Err(StoreError::Limit);
+            }
+            self.0.list(prefix, limit)
+        }
+        fn directories(&mut self, prefix: &str, _: usize) -> Result<Vec<String>, StoreError> {
+            Ok(vec![format!("{prefix}{GEN}/")])
+        }
+    }
+    let (store, marker) = fixture();
+    let mut store = Inventory(store);
+    let points = archive::points(&mut store, NS, &marker, 10).unwrap();
+    assert_eq!(points.len(), 3);
+    assert!(
+        points
+            .iter()
+            .all(|point| point.current && point.generation == GEN)
+    );
+}

@@ -10,6 +10,7 @@ pub(crate) struct Bucket {
     pub fail_before_put: bool,
     pub deleted: Vec<String>,
     pub fail_delete: Option<usize>,
+    pub fail_after_delete: bool,
     pub get_error: Option<StoreError>,
 }
 impl Store for Bucket {
@@ -41,11 +42,16 @@ impl Store for Bucket {
     }
     fn delete(&mut self, key: &str) -> core::result::Result<(), StoreError> {
         self.deleted.push(key.into());
-        if self.fail_delete == Some(self.deleted.len()) {
+        let fail = self.fail_delete == Some(self.deleted.len());
+        if fail && !self.fail_after_delete {
             return Err(StoreError::Transport);
         }
         self.data.remove(key);
-        Ok(())
+        if fail {
+            Err(StoreError::Transport)
+        } else {
+            Ok(())
+        }
     }
     fn list(
         &mut self,

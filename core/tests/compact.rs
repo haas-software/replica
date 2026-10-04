@@ -114,6 +114,66 @@ fn gap_or_unpublished_replacement_never_removes_raw_history() {
     assert!(store.data.contains_key(&key2) && store.data.contains_key(&key3));
     assert_eq!(marker.value.sealed_at, at(10));
 }
+
+#[test]
+fn pruning_accepts_large_old_and_replacement_manifests() {
+    for (large_old, large_replacement) in [(true, false), (false, true), (true, true)] {
+        let (mut fs, mut store, mut marker, mut old, m3, key, _) = fixture();
+        let mut replacement =
+            compact::merge(&mut fs, &mut store, NS, &mut marker, window(), &[&old, &m3]).unwrap();
+        let prefix = replication::generation_prefix(NS, GENERATION).unwrap();
+        for (large, manifest) in [(large_old, &mut old), (large_replacement, &mut replacement)] {
+            if large {
+                let original = manifest.parts.pop().unwrap();
+                let bytes = store.data[&original.key].clone();
+                for index in 0..4113 {
+                    let key = format!("{}/{}/{index}", original.key, "p".repeat(200));
+                    store.data.insert(key.clone(), bytes.clone());
+                    manifest.parts.push(Part {
+                        key,
+                        size: original.size,
+                        hash: original.hash,
+                    });
+                }
+                assert!(manifest.encode(&prefix).unwrap().len() > hop_types::json::MAX_INPUT);
+            }
+        }
+        let replacement_key = compact::window_key(
+            &prefix,
+            replacement.level,
+            replacement.start,
+            replacement.end,
+        )
+        .unwrap();
+        store.data.insert(key.clone(), old.encode(&prefix).unwrap());
+        store.data.insert(
+            replacement_key.clone(),
+            replacement.encode(&prefix).unwrap(),
+        );
+        compact::prune(&mut store, &key, &old, &replacement, &[&replacement, &m3]).unwrap();
+        assert!(!store.data.contains_key(&key));
+        assert!(store.data.contains_key(&replacement_key));
+        let layout = object::layout(&mut store, &prefix).unwrap();
+        let mut restored = Fs::default();
+        restore::stage(
+            &mut restored,
+            &mut store,
+            &layout,
+            None,
+            Name::new("copy").unwrap(),
+            100,
+        )
+        .unwrap()
+        .verify(&mut restored, |_, _| Ok(()))
+        .unwrap()
+        .publish(&mut restored, GENERATION)
+        .unwrap();
+        assert_eq!(
+            restored.cold().data("copy").unwrap(),
+            [&[9; 512][..], &[0; 512][..], &[7; 512][..]].concat()
+        );
+    }
+}
 #[test]
 fn failed_delete_always_restores_through_confirmed_window() {
     for fail in 1..=4 {

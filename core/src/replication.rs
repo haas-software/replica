@@ -335,10 +335,7 @@ pub fn resolve<B: Storage, S: Store>(
     };
     let landed = key.is_some();
     if let Some(key) = key {
-        let manifest = Manifest::decode(
-            &object::committed(store, &key, hop_types::json::MAX_INPUT)?,
-            &prefix,
-        )?;
+        let manifest = object::read_manifest(store, &key, &prefix)?;
         if manifest.level != 0 || manifest.first != seq || manifest.sequence != seq {
             return Err(Error::Corrupt);
         }

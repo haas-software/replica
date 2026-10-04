@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 [dependencies]
 replica-sqlite = { path = "../sqlite" }
-hop-types = { package = "types", git = "https://github.com/xinix00/hop.git", tag = "v3.0.0-alpha.10" }
-hop-auth = { package = "auth", git = "https://github.com/xinix00/hop.git", tag = "v3.0.0-alpha.10" }
+hop-types = { package = "types", git = "https://github.com/xinix00/hop.git", tag = "v3.0.9" }
+hop-auth = { package = "auth", git = "https://github.com/xinix00/hop.git", tag = "v3.0.9" }
 [lints]
 workspace = true

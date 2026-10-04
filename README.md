@@ -48,7 +48,7 @@ python3 tools/qemu-persist.py
 
 De gewone poort controleert de meegeleverde SQLite-bronhashes, formatting,
 strikte clippy, hosttests en volledige ARM64- en RISC-V-builds. Met `QEMU=1`
-start hij de RAM-probe tweemaal onder de **gepinde SDK alpha.16**. Beide apps
+start hij de RAM-probe tweemaal onder de **gepinde SDK v3.0.9**. Beide apps
 bouwen ook voor RISC-V; uitvoering is alleen onder ARM64 QEMU getoetst.
 
 De laatste opdracht is de persist-proef, zonder kopie of patch: de app bouwt

@@ -45,6 +45,42 @@ impl<T: Transport, W: Suspend> S3<T, W> {
         }
         Ok(())
     }
+    fn objects(
+        &mut self,
+        prefix: &str,
+        limit: usize,
+        complete: bool,
+    ) -> Result<Vec<Object>, StoreError> {
+        self.ready()?;
+        if limit == 0 || limit > replica_core::manifest::MAX_COMMITS {
+            return Err(StoreError::Limit);
+        }
+        let (keys, truncated) =
+            match self
+                .wait
+                .wait(self.client.list(&mut self.transport, prefix, limit))
+            {
+                Ok(result) => result.map_err(map)?,
+                Err(_) => {
+                    self.poisoned = true;
+                    return Err(StoreError::Cancelled);
+                }
+            };
+        if complete && truncated {
+            return Err(StoreError::Limit);
+        }
+        let mut out = Vec::new();
+        out.try_reserve_exact(keys.len())
+            .map_err(|_| StoreError::Limit)?;
+        for key in keys {
+            // De XML-parser begrenst de sleutellengte; hier bewaken we de namespace.
+            if !key.starts_with(prefix) {
+                return Err(StoreError::Transport);
+            }
+            out.push(Object { key, size: None });
+        }
+        Ok(out)
+    }
 }
 fn map(e: leans3::Error) -> StoreError {
     match e {
@@ -64,6 +100,41 @@ fn map(e: leans3::Error) -> StoreError {
     }
 }
 impl<T: Transport, W: Suspend> Store for S3<T, W> {
+    fn directories(
+        &mut self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<alloc::string::String>, StoreError> {
+        self.ready()?;
+        if limit == 0 || limit > replica_core::manifest::MAX_COMMITS {
+            return Err(StoreError::Limit);
+        }
+        match self.wait.wait(
+            self.client
+                .list_directories(&mut self.transport, prefix, limit),
+        ) {
+            Ok(Ok((keys, false))) => {
+                if keys.iter().any(|key| {
+                    key.len() <= prefix.len()
+                        || !key.starts_with(prefix)
+                        || !key.ends_with('/')
+                        || key[prefix.len()..key.len() - 1].contains('/')
+                }) {
+                    return Err(StoreError::Transport);
+                }
+                Ok(keys)
+            }
+            Ok(Ok((_, true))) => Err(StoreError::Limit),
+            Ok(Err(e)) => Err(map(e)),
+            Err(_) => {
+                self.poisoned = true;
+                Err(StoreError::Cancelled)
+            }
+        }
+    }
+    fn list_batch(&mut self, prefix: &str, limit: usize) -> Result<Vec<Object>, StoreError> {
+        self.objects(prefix, limit, false)
+    }
     fn put(&mut self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
         self.ready()?;
         if bytes.len() > replica_core::segment::MAX_BYTES {
@@ -124,34 +195,7 @@ impl<T: Transport, W: Suspend> Store for S3<T, W> {
         }
     }
     fn list(&mut self, prefix: &str, limit: usize) -> Result<Vec<Object>, StoreError> {
-        self.ready()?;
-        if limit == 0 || limit > replica_core::manifest::MAX_COMMITS {
-            return Err(StoreError::Limit);
-        }
-        let (keys, truncated) =
-            match self
-                .wait
-                .wait(self.client.list(&mut self.transport, prefix, limit))
-            {
-                Ok(result) => result.map_err(map)?,
-                Err(_) => {
-                    self.poisoned = true;
-                    return Err(StoreError::Cancelled);
-                }
-            };
-        if truncated {
-            return Err(StoreError::Limit);
-        }
-        let mut out = Vec::new();
-        out.try_reserve_exact(keys.len())
-            .map_err(|_| StoreError::Limit)?;
-        for key in keys {
-            if key.len() > 1024 || !key.starts_with(prefix) {
-                return Err(StoreError::Transport);
-            }
-            out.push(Object { key, size: None });
-        }
-        Ok(out)
+        self.objects(prefix, limit, true)
     }
 }
 struct Sink {

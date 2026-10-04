@@ -29,22 +29,22 @@ fn ids<S: Store>(store: &mut S, namespace: &str) -> Result<Vec<String>> {
         return Err(Error::State);
     }
     let prefix = object::key(namespace, "/generations/")?;
-    let mut listing = store.list(&prefix, MAX_COMMITS)?;
+    let mut listing = store.directories(&prefix, MAX_COMMITS)?;
     if listing.len() > MAX_COMMITS {
         return Err(Error::Limit);
     }
-    for o in &listing {
-        if !o.key.starts_with(&prefix) || o.key.len() > 1024 {
+    listing.sort_unstable();
+    listing.dedup();
+    let mut ids = Vec::new();
+    for directory in &listing {
+        let id = directory
+            .strip_prefix(&prefix)
+            .and_then(|s| s.strip_suffix('/'))
+            .ok_or(Error::Corrupt)?;
+        if directory.len() > 1024 || id.is_empty() || id.contains('/') {
             return Err(Error::Corrupt);
         }
-    }
-    listing.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-    let mut ids = Vec::new();
-    for o in &listing {
-        let Some((id, _)) = o.key[prefix.len()..].split_once('/') else {
-            continue;
-        };
-        if marker::generation_time(id).is_err() || ids.last().is_some_and(|old| old == id) {
+        if marker::generation_time(id).is_err() {
             continue;
         }
         grow(&mut ids, 1, MAX_COMMITS)?;

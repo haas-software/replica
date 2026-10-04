@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "abi"
-version = "3.0.0"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.0-alpha.16#6ccd79cae6596897b3a74056e884ce2ab8a44820"
+version = "3.0.9"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.9#2e316e48c4b278c9162cafc4f8349fad08f8d229"
 dependencies = [
  "bounded",
  "dev",
@@ -13,13 +13,14 @@ dependencies = [
 
 [[package]]
 name = "applib"
-version = "3.0.0"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.0-alpha.16#6ccd79cae6596897b3a74056e884ce2ab8a44820"
+version = "3.0.9"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.9#2e316e48c4b278c9162cafc4f8349fad08f8d229"
 dependencies = [
  "abi",
  "bounded",
  "dev",
  "executor",
+ "heap",
  "leannet",
  "netdev",
  "sync",
@@ -27,42 +28,47 @@ dependencies = [
 
 [[package]]
 name = "auth"
-version = "3.0.0"
-source = "git+https://github.com/xinix00/hop.git?tag=v3.0.0-alpha.10#998ebdc571a59ce62ea0e444cd33872e54f99732"
+version = "3.0.9"
+source = "git+https://github.com/xinix00/hop.git?tag=v3.0.9#a0130f207b58415e7c541a1b23fca63f7d809214"
 
 [[package]]
 name = "bounded"
-version = "3.0.0"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.0-alpha.16#6ccd79cae6596897b3a74056e884ce2ab8a44820"
+version = "3.0.9"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.9#2e316e48c4b278c9162cafc4f8349fad08f8d229"
 
 [[package]]
 name = "dev"
-version = "3.0.0"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.0-alpha.16#6ccd79cae6596897b3a74056e884ce2ab8a44820"
+version = "3.0.9"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.9#2e316e48c4b278c9162cafc4f8349fad08f8d229"
 
 [[package]]
 name = "executor"
-version = "3.0.0"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.0-alpha.16#6ccd79cae6596897b3a74056e884ce2ab8a44820"
+version = "3.0.9"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.9#2e316e48c4b278c9162cafc4f8349fad08f8d229"
 dependencies = [
  "dev",
  "sync",
 ]
 
 [[package]]
+name = "heap"
+version = "3.0.9"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.9#2e316e48c4b278c9162cafc4f8349fad08f8d229"
+
+[[package]]
 name = "leannet"
-version = "3.0.0"
-source = "git+https://github.com/xinix00/lean.git?tag=v3.0.0#a7e089448c903fe199b604d246401cbd88640de3"
+version = "3.1.9"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.1.9#c406246d84b4a9e96a3e731f6ef5acf2413c4c90"
 
 [[package]]
 name = "leans3"
-version = "3.1.1"
-source = "git+https://github.com/xinix00/lean.git?tag=v3.1.1#db6724745a2c579382c54a68c73c18d643d40038"
+version = "3.1.10"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.1.10#2c7588a5076496a28d586aadb991c718adba9082"
 
 [[package]]
 name = "netdev"
-version = "3.0.0"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.0-alpha.16#6ccd79cae6596897b3a74056e884ce2ab8a44820"
+version = "3.0.9"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.9#2e316e48c4b278c9162cafc4f8349fad08f8d229"
 dependencies = [
  "sync",
 ]
@@ -117,10 +123,10 @@ dependencies = [
 
 [[package]]
 name = "sync"
-version = "3.0.0"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.0-alpha.16#6ccd79cae6596897b3a74056e884ce2ab8a44820"
+version = "3.0.9"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.9#2e316e48c4b278c9162cafc4f8349fad08f8d229"
 
 [[package]]
 name = "types"
-version = "3.0.0"
-source = "git+https://github.com/xinix00/hop.git?tag=v3.0.0-alpha.10#998ebdc571a59ce62ea0e444cd33872e54f99732"
+version = "3.0.9"
+source = "git+https://github.com/xinix00/hop.git?tag=v3.0.9#a0130f207b58415e7c541a1b23fca63f7d809214"

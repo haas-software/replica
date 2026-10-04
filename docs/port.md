@@ -9,7 +9,11 @@ repo-grenzen. De kern van Replica verbiedt unsafe.
 ## SQLite op HopOS: één async opslagpad
 
 Er ontbraken twee HopOS-functies, geen SQLite-formaat. Beide zitten sinds SDK
-`v3.0.0-alpha.16` in de gewone Git-tag; alle manifests pinnen die tag.
+`v3.0.0-alpha.16` in de gewone Git-tag; alle manifests pinnen nu `v3.0.9`.
+
+Replica gebruikt Hop `v3.0.9` voor het expliciete JSON-bytebudget en Lean
+`v3.1.10` voor delimiterlistings van generatieprefixen. Deze functies staan in
+de gepubliceerde libraries; een afnemer hoeft alleen Replica te includen.
 
 - De C-stack moet kunnen wachten op async system-I/O terwijl de app-executor
   het netwerk blijft pompen. `applib::stacktask::Task` bewaart die stack;

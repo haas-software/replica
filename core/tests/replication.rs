@@ -4,10 +4,11 @@ mod support;
 use replica_core::{
     Error,
     local::Name,
+    manifest::{Manifest, Part},
     marker::{self, LocalMarker, Marker},
     object::{self, StoreError},
     replication::{self, Batch},
-    restore,
+    restore, segment,
     time::Time,
     tracking::Tracking,
 };
@@ -51,6 +52,71 @@ fn resolving_an_unknown_snapshot_requires_nonempty_ownership_proof() {
             assert_eq!(local.value, before);
             assert_eq!(fs.stable, files);
         }
+    }
+}
+
+#[test]
+fn unknown_large_snapshot_and_increment_commits_can_be_resolved() {
+    for snapshot in [false, true] {
+        let mut fs = Fs::default();
+        let mut store = Bucket::default();
+        let mut local = marker();
+        replication::renew(&mut fs, &mut local, now(0)).unwrap();
+        let prefix = replication::generation_prefix(NS, &local.value.generation).unwrap();
+        let bytes = segment::encode(512, 512, &[(1, &[7; 512])]).unwrap();
+        let mut parts = Vec::new();
+        for index in 0..4113 {
+            let key = format!("{prefix}data/{}/{index}", "p".repeat(200));
+            store.data.insert(key.clone(), bytes.clone());
+            parts.push(Part {
+                key,
+                size: bytes.len() as u64,
+                hash: hop_auth::sha256(&bytes),
+            });
+        }
+        let sequence = if snapshot { 1 } else { 2 };
+        let manifest = Manifest {
+            min_size: 512,
+            first: sequence,
+            sequence,
+            at: now(1),
+            level: 0,
+            start: Time::ZERO,
+            end: Time::ZERO,
+            parts,
+        };
+        let key = if snapshot {
+            format!("{prefix}snapshot")
+        } else {
+            replication::raw_key(&prefix, sequence, manifest.at).unwrap()
+        };
+        let encoded = manifest.encode(&prefix).unwrap();
+        assert!(encoded.len() > hop_types::json::MAX_INPUT);
+        store.data.insert(key, encoded);
+        store.data.insert(
+            format!("{NS}/current"),
+            local.value.generation.as_bytes().to_vec(),
+        );
+        local.value.complete = !snapshot;
+        local.value.sequence = sequence - 1;
+        if !snapshot {
+            local.value.page_size = 512;
+            local.value.size = 512;
+            local.value.at = now(0);
+        }
+        local.value.uncertain = sequence;
+        local.save(&mut fs).unwrap();
+        assert!(replication::resolve(&mut fs, &mut store, NS, &mut local).unwrap());
+        assert!(local.value.complete);
+        assert_eq!(local.value.sequence, sequence);
+        assert_eq!(local.value.uncertain, 0);
+        assert_eq!(
+            LocalMarker::load(&mut fs.cold(), Name::new("db").unwrap())
+                .unwrap()
+                .value
+                .sequence,
+            sequence
+        );
     }
 }
 #[test]

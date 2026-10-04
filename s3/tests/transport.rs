@@ -165,3 +165,65 @@ fn cancellation_after_request_disables_owner_and_invalid_clock_sends_nothing() {
     ));
     assert_eq!(world.borrow().calls.len(), 1);
 }
+
+#[test]
+fn directory_pages_skip_data_and_batches_allow_explicit_truncation() {
+    let world = Rc::new(RefCell::new(World::default()));
+    let mut s = replica_s3::S3::new(client(), Net(world.clone()), Wait { cancel: false }).unwrap();
+    reply(&world, 200, b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>two</NextContinuationToken><Contents><Key>gen/marker</Key></Contents></ListBucketResult>".to_vec(), None);
+    reply(&world, 200, b"<ListBucketResult><IsTruncated>false</IsTruncated><CommonPrefixes><Prefix>gen/one/</Prefix></CommonPrefixes></ListBucketResult>".to_vec(), None);
+    assert_eq!(s.directories("gen/", 10).unwrap(), ["gen/one/"]);
+    assert!(world.borrow().calls[0].contains("?delimiter=%2F&list-type=2&prefix=gen%2F"));
+    assert!(world.borrow().calls[1].contains("?continuation-token=two&delimiter=%2F&list-type=2"));
+    reply(&world, 200, b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>later</NextContinuationToken><Contents><Key>gen/one/data/1</Key></Contents><Contents><Key>gen/one/data/2</Key></Contents></ListBucketResult>".to_vec(), None);
+    let batch = s.list_batch("gen/one/data/", 1).unwrap();
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].key, "gen/one/data/1");
+    for prefix in ["gen/", "gen/one/nested/", "foreign/one/"] {
+        reply(&world, 200, format!("<ListBucketResult><CommonPrefixes><Prefix>{prefix}</Prefix></CommonPrefixes></ListBucketResult>").into_bytes(), None);
+        assert!(matches!(
+            s.directories("gen/", 10),
+            Err(StoreError::Transport)
+        ));
+    }
+    reply(&world, 200, b"<ListBucketResult><CommonPrefixes><Prefix>gen/one/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>gen/two/</Prefix></CommonPrefixes></ListBucketResult>".to_vec(), None);
+    assert!(matches!(s.directories("gen/", 1), Err(StoreError::Limit)));
+    reply(
+        &world,
+        200,
+        b"<ListBucketResult><Contents><Key>foreign/data/1</Key></Contents></ListBucketResult>"
+            .to_vec(),
+        None,
+    );
+    assert!(matches!(
+        s.list_batch("gen/", 1),
+        Err(StoreError::Transport)
+    ));
+}
+
+#[test]
+fn cancellation_of_directory_or_batch_listing_poison_the_store() {
+    for directories in [false, true] {
+        let world = Rc::new(RefCell::new(World {
+            pause: true,
+            ..World::default()
+        }));
+        let mut s =
+            replica_s3::S3::new(client(), Net(world.clone()), Wait { cancel: true }).unwrap();
+        let error = if directories {
+            s.directories("gen/", 10).unwrap_err()
+        } else {
+            s.list_batch("gen/", 10).err().unwrap()
+        };
+        assert_eq!(error, StoreError::Cancelled);
+        assert!(matches!(
+            s.list_batch("gen/", 10),
+            Err(StoreError::Cancelled)
+        ));
+        assert!(matches!(
+            s.directories("gen/", 10),
+            Err(StoreError::Cancelled)
+        ));
+        assert_eq!(world.borrow().calls.len(), 1);
+    }
+}

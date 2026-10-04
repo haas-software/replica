@@ -3,7 +3,9 @@ use crate::{Error, Result, hash, reserve, segment::Segment, string, time::Time};
 use alloc::{string::String, vec::Vec};
 use hop_types::json::{self, Object, Value};
 /// Bovenlimiet voor onderdelen per manifest.
-pub const MAX_PARTS: usize = 4096;
+pub const MAX_PARTS: usize = 32768;
+/// Bytebudget voor grote snapshotmanifesten, los van de HTTP-JSON-limiet.
+pub const MAX_MANIFEST_BYTES: usize = 16 << 20;
 /// Bovenlimiet voor manifesten in één geladen generatie.
 pub const MAX_COMMITS: usize = 65536;
 /// Een object is pas vertrouwd na zowel deze hash als de interne segmenthash.
@@ -145,7 +147,7 @@ impl Manifest {
     }
     /// Leest het Go-formaat; onbekende velden mogen mee, dubbele sleutels niet.
     pub fn decode(bytes: &[u8], prefix: &str) -> Result<Self> {
-        let value = json::parse(bytes).map_err(json_error)?;
+        let value = json::parse_with_limit(bytes, MAX_MANIFEST_BYTES).map_err(json_error)?;
         let o = value.as_object().ok_or(Error::Corrupt)?;
         if uint(o, "version")? != 2 {
             return Err(Error::Legacy);
@@ -215,7 +217,7 @@ impl Manifest {
         }
         o.push("parts", Value::Array(parts)).map_err(json_error)?;
         let text = json::to_string(&Value::Object(o)).map_err(json_error)?;
-        if text.len() > json::MAX_INPUT {
+        if text.len() > MAX_MANIFEST_BYTES {
             return Err(Error::Limit);
         }
         Ok(text.into_bytes())

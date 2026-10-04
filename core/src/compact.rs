@@ -275,17 +275,11 @@ pub fn prune<S: Store>(
     if key == replacement_key || !key.starts_with(&prefix) {
         return Err(Error::State);
     }
-    let actual_old = Manifest::decode(
-        &object::committed(store, key, hop_types::json::MAX_INPUT)?,
-        &prefix,
-    )?;
+    let actual_old = object::read_manifest(store, key, &prefix)?;
     if actual_old != *old {
         return Err(Error::Corrupt);
     }
-    let actual = Manifest::decode(
-        &object::committed(store, &replacement_key, hop_types::json::MAX_INPUT)?,
-        &prefix,
-    )?;
+    let actual = object::read_manifest(store, &replacement_key, &prefix)?;
     if actual != *replacement {
         return Err(Error::Corrupt);
     }

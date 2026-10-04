@@ -48,6 +48,45 @@ pub trait Store {
     /// Alle pagina's onder deze prefix, maximaal `limit` objecten; nooit stil afkappen.
     fn list(&mut self, prefix: &str, limit: usize)
     -> core::result::Result<Vec<Object>, StoreError>;
+    /// Directe kindprefixen; remote stores gebruiken een delimiterlisting.
+    fn directories(
+        &mut self,
+        prefix: &str,
+        limit: usize,
+    ) -> core::result::Result<Vec<String>, StoreError> {
+        let objects = self.list(prefix, MAX_COMMITS)?;
+        let mut out = Vec::new();
+        for object in objects {
+            let rest = object
+                .key
+                .strip_prefix(prefix)
+                .ok_or(StoreError::Transport)?;
+            let Some(end) = rest.find('/') else { continue };
+            let child = &object.key[..prefix.len() + end + 1];
+            if out.iter().any(|s: &String| s == child) {
+                continue;
+            }
+            if out.len() == limit {
+                return Err(StoreError::Limit);
+            }
+            out.try_reserve(1).map_err(|_| StoreError::Limit)?;
+            out.push(string(child).map_err(|_| StoreError::Limit)?);
+        }
+        Ok(out)
+    }
+    /// Eerste begrensde batch; afkappen is hier bedoeld voor hervatbare opruiming.
+    fn list_batch(
+        &mut self,
+        prefix: &str,
+        limit: usize,
+    ) -> core::result::Result<Vec<Object>, StoreError> {
+        if limit == 0 {
+            return Err(StoreError::Limit);
+        }
+        let mut objects = self.list(prefix, MAX_COMMITS)?;
+        objects.truncate(limit);
+        Ok(objects)
+    }
 }
 /// Begrensd samenvoegen, zodat sleutels niet tijdens publicatie onbegrensd groeien.
 pub fn key(prefix: &str, suffix: &str) -> Result<String> {
@@ -109,8 +148,11 @@ pub fn committed<S: Store>(store: &mut S, key: &str, limit: usize) -> Result<Vec
     }
     Ok(bytes)
 }
-fn read_manifest<S: Store>(store: &mut S, key: &str, prefix: &str) -> Result<Manifest> {
-    Manifest::decode(&committed(store, key, hop_types::json::MAX_INPUT)?, prefix)
+pub(crate) fn read_manifest<S: Store>(store: &mut S, key: &str, prefix: &str) -> Result<Manifest> {
+    Manifest::decode(
+        &committed(store, key, crate::manifest::MAX_MANIFEST_BYTES)?,
+        prefix,
+    )
 }
 /// Publiceert het manifest nadat de aanroeper alle onderdelen heeft bevestigd.
 /// Verloren PUT-antwoorden worden alleen met exact gelijk teruggelezen bytes opgelost.
