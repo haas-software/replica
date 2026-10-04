@@ -303,11 +303,12 @@ pub fn resolve<B: Storage, S: Store>(
                 let current = core::str::from_utf8(&bytes)
                     .map_err(|_| Error::Corrupt)?
                     .trim();
-                if local
-                    .value
-                    .previous
-                    .first()
-                    .is_some_and(|p| p.generation == current)
+                if (!local.value.repair_from.is_empty() && local.value.repair_from == current)
+                    || local
+                        .value
+                        .previous
+                        .first()
+                        .is_some_and(|p| p.generation == current)
                 {
                     None
                 } else {

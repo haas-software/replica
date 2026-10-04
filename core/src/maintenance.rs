@@ -2,7 +2,7 @@
 use crate::{
     Error, Result,
     compact::{self, Window},
-    manifest::{Layout, MAX_COMMITS, Manifest},
+    manifest::{Layout, Manifest},
     marker::{self, LocalMarker, Marker},
     object::{self, Store},
     replication, reserve,
@@ -182,6 +182,9 @@ pub fn run<B: Storage, S: Store>(
     }
     let prefix = replication::generation_prefix(namespace, &local.value.generation)?;
     let mut layout = object::layout(store, &prefix)?;
+    if layout.plan(None)?.last().map(|m| m.sequence) != Some(local.value.sequence) {
+        return Err(Error::Gap);
+    }
     let mut report = Report::default();
     for level in 1..=schedule.levels.len() as u32 {
         for (start, end) in schedule.elapsed(&layout, level, now)? {
@@ -272,7 +275,7 @@ pub fn generations<S: Store>(
         return Err(Error::State);
     }
     marker::generation_time(keep)?;
-    let current = store.get(&object::key(namespace, "/current")?, 255)?;
+    let current = object::committed(store, &object::key(namespace, "/current")?, 255)?;
     if core::str::from_utf8(&current)
         .map_err(|_| Error::Corrupt)?
         .trim()
@@ -281,63 +284,67 @@ pub fn generations<S: Store>(
         return Err(Error::Unproven);
     }
     let prefix = object::key(namespace, "/generations/")?;
-    let mut objects = store.list(&prefix, MAX_COMMITS)?;
-    if objects.len() > MAX_COMMITS {
+    // Data segments can number in the millions; only generation prefixes belong
+    // in this inventory. Deletion resumes in bounded batches on later ticks.
+    const DELETE_BUDGET: usize = 128;
+    let mut generations = store.directories(&prefix, 4096)?;
+    if generations.len() > 4096 {
         return Err(Error::Limit);
     }
-    for object in &objects {
-        if object.key.len() > 1024 || !object.key.starts_with(&prefix) {
+    generations.sort_unstable();
+    generations.dedup();
+    let mut removed = 0;
+    for generation in generations {
+        let id = generation
+            .strip_prefix(&prefix)
+            .and_then(|s| s.strip_suffix('/'))
+            .ok_or(Error::Corrupt)?;
+        if id.is_empty() || id.contains('/') || generation.len() > 1024 {
             return Err(Error::Corrupt);
         }
-    }
-    objects.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-    let mut removed = 0;
-    let mut first = 0;
-    while first < objects.len() {
-        let rest = objects[first]
-            .key
-            .strip_prefix(&prefix)
-            .ok_or(Error::Corrupt)?;
-        let Some((id, _)) = rest.split_once('/') else {
-            first += 1;
-            continue;
-        };
-        let generation = object::key(&prefix, &object::key(id, "/")?)?;
-        let mut end = first + 1;
-        while end < objects.len() && objects[end].key.starts_with(&generation) {
-            end += 1;
-        }
-        let group = &objects[first..end];
-        first = end;
         if id == keep {
             continue;
         }
         let Ok(created) = marker::generation_time(id) else {
             continue;
         };
-        let complete = group
-            .iter()
-            .any(|o| o.key.strip_prefix(&generation) == Some("snapshot"));
-        let expired = now.seconds().saturating_sub(created.seconds()) > retention_seconds as i64;
-        let abandoned = !complete && now.seconds().saturating_sub(created.seconds()) > 86400;
-        if !expired && !abandoned {
+        let age = now.seconds().saturating_sub(created.seconds());
+        if age <= 86400 && age <= retention_seconds as i64 {
             continue;
         }
-        // Drie passes sparen een tweede grote objectlijst uit.
-        for rank in 0..3 {
-            for o in group {
-                let Some(rest) = o.key.strip_prefix(&generation) else {
-                    continue;
-                };
-                let r = if rest == "snapshot" {
-                    0
-                } else if rest.starts_with("data/") {
-                    2
-                } else {
-                    1
-                };
-                if r == rank {
-                    store.delete(&o.key)?;
+        let snapshot = object::key(&generation, "snapshot")?;
+        let complete = match store.get(&snapshot, crate::manifest::MAX_MANIFEST_BYTES) {
+            Ok(_) => true,
+            Err(object::StoreError::Missing) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if age <= retention_seconds as i64 && (complete || age <= 86400) {
+            continue;
+        }
+        // Remove the restoration entry point first, then manifests, then data.
+        // Failed metadata deletion must never remove its dependencies.
+        if complete {
+            store.delete(&snapshot)?;
+            removed += 1;
+        }
+        for suffix in ["L", ""] {
+            let batch_prefix = object::key(&generation, suffix)?;
+            loop {
+                if removed == DELETE_BUDGET {
+                    return Ok(removed);
+                }
+                let batch = store.list_batch(&batch_prefix, DELETE_BUDGET - removed)?;
+                if batch.is_empty() {
+                    break;
+                }
+                if batch.len() > DELETE_BUDGET - removed {
+                    return Err(Error::Limit);
+                }
+                for entry in batch {
+                    if entry.key.len() > 1024 || !entry.key.starts_with(&batch_prefix) {
+                        return Err(Error::Corrupt);
+                    }
+                    store.delete(&entry.key)?;
                     removed += 1;
                 }
             }

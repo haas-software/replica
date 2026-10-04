@@ -78,6 +78,41 @@ fn dirty_header_and_append_match_go_and_choose_conservatively() {
     assert!(dirty::select(Some(DIRTY), Some(&broken), GEN, 7).is_err());
     assert!(dirty::select(None, None, GEN, 7).is_err());
 }
+
+#[test]
+fn equal_sequence_logs_require_a_proven_append_superset() {
+    let mut short = dirty::header(GEN, 7).unwrap();
+    short.extend_from_slice(&dirty::record(2));
+    let mut long = short.clone();
+    long.extend_from_slice(&dirty::record(3));
+    for (a, b) in [(&short, &long), (&long, &short)] {
+        assert_eq!(
+            dirty::select(Some(a), Some(b), GEN, 7)
+                .unwrap()
+                .pages()
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+    }
+    // Een afgebroken laatste append telt niet als een complete dirty pagina.
+    let mut partial = short.clone();
+    partial.extend_from_slice(&dirty::record(3)[..4]);
+    assert_eq!(
+        dirty::select(Some(&partial), Some(&long), GEN, 7)
+            .unwrap()
+            .pages()
+            .collect::<Vec<_>>(),
+        [2, 3]
+    );
+    let mut conflicting = dirty::header(GEN, 7).unwrap();
+    conflicting.extend_from_slice(&dirty::record(4));
+    for (a, b) in [(&short, &conflicting), (&conflicting, &short)] {
+        assert!(matches!(
+            dirty::select(Some(a), Some(b), GEN, 7),
+            Err(Error::Corrupt)
+        ));
+    }
+}
 #[test]
 fn go_manifests_exact_and_parts_not_visible_without_valid_commit() {
     for fixture in [MAN, WIN] {
@@ -198,4 +233,42 @@ fn timestamps_calendar_offsets_and_nanos() {
     ] {
         assert!(Time::parse(s).is_err(), "{s}");
     }
+}
+
+#[test]
+fn large_production_snapshot_manifest_keeps_http_json_limit_separate() {
+    use replica_core::manifest::{MAX_MANIFEST_BYTES, MAX_PARTS, Part};
+    let mut m = Manifest::decode(MAN, PREFIX).unwrap();
+    let part = m.parts.pop().unwrap();
+    for index in 0..4113 {
+        m.parts.push(Part {
+            key: format!("{PREFIX}data/{}/{index}", "p".repeat(200)),
+            size: part.size,
+            hash: part.hash,
+        });
+    }
+    let encoded = m.encode(PREFIX).unwrap();
+    assert!(encoded.len() > hop_types::json::MAX_INPUT);
+    assert!(hop_types::json::parse(&encoded).is_err());
+    assert_eq!(Manifest::decode(&encoded, PREFIX).unwrap(), m);
+    assert!(Manifest::decode(&vec![b' '; MAX_MANIFEST_BYTES + 1], PREFIX).is_err());
+    while m.parts.len() <= MAX_PARTS {
+        let index = m.parts.len();
+        m.parts.push(Part {
+            key: format!("{PREFIX}data/extra/{index}"),
+            size: part.size,
+            hash: part.hash,
+        });
+    }
+    assert!(m.encode(PREFIX).is_err());
+}
+
+#[test]
+fn production_database_pages_are_bounded_by_owner_not_old_four_gib_limit() {
+    let page = 17_229_090_816_u64 / 4096;
+    assert!(Pages::new(1 << 20).add(page as u32).is_err());
+    let mut pages = Pages::new(1 << 24);
+    pages.add(page as u32).unwrap();
+    assert!(pages.contains(page as u32));
+    assert!(pages.add((1 << 24) + 1).is_err());
 }

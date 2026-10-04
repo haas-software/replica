@@ -54,7 +54,7 @@ bijwerken.
 | `tracking` | Marker ongeldig vóór write; dirty-logrecords duurzaam vóór DB-sync; twee slots, header als laatste; foutinjectie op iedere rewritefase |
 | `marker`, `replication` | Previous/repair_from/uncertain, onderdelen vóór manifest, exacte readback na onbekende PUT, geen sequencehergebruik vóór resolve |
 | `capture` | Consistente lokale spool, per-segment snapshotpaginabereik, gebundelde reads; detectie van externe wijzigingen en ongedekte groei |
-| `prepare` | Lineage vóór open, bootstrappen alleen bij bewijs, remote-ahead herstel, beschadiging onderscheiden van transportproblemen |
+| `prepare` | Lineage vóór open, bootstrappen alleen bij bewijs, volledige snapshot als de remote sequence voorloopt, beschadiging onderscheiden van transportproblemen |
 | `restore` | Scratch + verplichte verificatie, duurzame intent, oud journal weg, kopie/barrière, intent weg; koude foutinjectie vóór/na publicatiefasen |
 | `compact` | Vensters `(start,end]`, contiguous sequences, Go-gelijke shrink/grow-uitvoer en veilige verwijdervolgorde |
 | `maintenance` | Go-bewaarschema en jaar-0001-tijdanker, multilevel samenvoegen; alle twaalf afgebroken verwijderstappen blijven herstelbaar |
@@ -97,7 +97,9 @@ De host waarborgt ook hier exclusiviteit tegenover onderhoud.
 
 Performanceverschillen zijn expliciet: één exclusieve lokale kopie in plaats
 van meerdere korte leestransacties; sequentiële uploads/downloads; conservatieve
-retransmissie van de dirty superset bij writes na capture. De snapshotlijst en
+retransmissie van de dirty superset bij writes na capture; een volledige snapshot
+als een manifest is gecommit maar de lokale marker na een crash achterloopt.
+De snapshotlijst en
 herstelplanner zijn wel begrensd en vermijden de eerdere volledige
 paginanummervector respectievelijk een volledige metadatascan per commit.
 Meet doorvoer en SQL-latency op een representatieve database voordat de Go-host

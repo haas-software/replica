@@ -58,6 +58,9 @@ pub(super) unsafe fn run<B: Storage>(b: &mut B, heap: &mut [u64], restored: bool
         Ok(())
     })
     .map_err(error)?;
+    // De vluchtige bucket is bij reboot leeg. Prepare herkent dat nu al aan
+    // het ontbrekende current naast de bewezen lokale marker.
+    let repairing = restored && replica.status().reason == Reason::Repair;
     {
         let mut vfs = replica.vfs(b).map_err(error)?;
         // SAFETY: Prepare is klaar; geen engine leeft tussen twee van deze scopes.
@@ -66,21 +69,12 @@ pub(super) unsafe fn run<B: Storage>(b: &mut B, heap: &mut [u64], restored: bool
         db.execute(c"CREATE TABLE IF NOT EXISTS replica_probe(v INTEGER);INSERT INTO replica_probe VALUES(7)")?;
         check(&mut db)?;
     }
-    let sync = match replica.sync(b, &mut bucket, now) {
-        // De testbucket verliest zijn bytes bij reboot; de echte lokale marker
-        // blijft. Dit bewijst de automatische repair vanuit die lokale bron.
-        Err(replica_core::Error::Corrupt)
-            if restored && replica.status().reason == Reason::Repair =>
-        {
-            let later = Time::unix(now.seconds() + 15, 0).map_err(error)?;
-            let report = replica.sync(b, &mut bucket, later).map_err(error)?;
-            applib::log!("REPLICA_PIPELINE_REPAIR_OK");
-            report
-        }
-        result => result.map_err(error)?,
-    };
+    let sync = replica.sync(b, &mut bucket, now).map_err(error)?;
     if !sync.published {
         return Err(Error::MISUSE);
+    }
+    if repairing {
+        applib::log!("REPLICA_PIPELINE_REPAIR_OK");
     }
     let points =
         archive::points(&mut bucket, "replica/qemu", replica.marker(), 32).map_err(error)?;
