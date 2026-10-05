@@ -24,7 +24,7 @@ fn manifest(
     let part = Part {
         key: key.clone(),
         size: bytes.len() as u64,
-        hash: hop_auth::sha256(&bytes),
+        hash: leancrypto::sha256::Sha256::digest(&bytes),
     };
     bucket.data.insert(key, bytes);
     Manifest {

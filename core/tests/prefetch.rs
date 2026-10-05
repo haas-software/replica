@@ -97,6 +97,28 @@ fn parallel_restore_is_identical_and_stays_within_its_budget() {
         let bytes: usize = round.iter().map(|(_, size)| size).sum();
         assert!(round.len() == 1 || bytes <= 200_000, "{round:?}");
     }
+    // Een segment dat halverwege breekt (transport), haalt de restore
+    // opnieuw op: twee keer kapot is nog gewoon een herstel.
+    let (flaky, _) = segments[segments.len() / 3];
+    let mut cut = bucket.clone();
+    cut.parallel = parallel.parallel;
+    cut.get_flaky = Some((flaky.clone(), 2));
+    assert_eq!(database(&restore(&mut cut).unwrap()), original);
+    // Ook het laatste deel, dat Prepare als eerste leest om de tip te toetsen.
+    let (last, _) = segments[segments.len() - 1];
+    let mut tip = bucket.clone();
+    tip.get_flaky = Some((last.clone(), 2));
+    assert_eq!(database(&restore(&mut tip).unwrap()), original);
+    // Vaker dan de herkansingen: een transportfout, geen schade.
+    let mut dead = bucket.clone();
+    dead.parallel = parallel.parallel;
+    dead.get_flaky = Some((flaky.clone(), 100));
+    assert_eq!(
+        restore(&mut dead).err(),
+        Some(replica_core::Error::Object(
+            replica_core::object::StoreError::Transport
+        ))
+    );
     // Een ontbrekend deel midden in het plan blijft bewezen schade.
     let mut damaged = bucket.clone();
     damaged.parallel = parallel.parallel;

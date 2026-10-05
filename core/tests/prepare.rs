@@ -54,7 +54,7 @@ fn remote(store: &mut Bucket, generation: &str, seq: u64, value: u8) {
     let part = Part {
         key: key.clone(),
         size: bytes.len() as u64,
-        hash: hop_auth::sha256(&bytes),
+        hash: leancrypto::sha256::Sha256::digest(&bytes),
     };
     store.data.insert(key, bytes);
     let manifest = Manifest {

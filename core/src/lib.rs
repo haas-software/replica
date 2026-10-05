@@ -81,5 +81,5 @@ pub(crate) fn string(s: &str) -> Result<String> {
     Ok(out)
 }
 pub(crate) fn hash(data: &[u8]) -> [u8; 32] {
-    hop_auth::sha256(data)
+    leancrypto::sha256::Sha256::digest(data)
 }

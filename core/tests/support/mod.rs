@@ -16,6 +16,9 @@ pub(crate) struct Bucket {
     pub fail_delete: Option<usize>,
     pub fail_after_delete: bool,
     pub get_error: Option<StoreError>,
+    /// Een sleuteldeel en hoe vaak een GET daarop nog met transport faalt,
+    /// zoals een gestroomde body die halverwege breekt.
+    pub get_flaky: Option<(String, usize)>,
     /// Zonder waarde haalt de bucket na elkaar op, zoals een gewone store.
     pub parallel: Option<Parallel>,
     /// Iedere ronde van `get_all`: de sleutels en hun grenzen.
@@ -53,6 +56,13 @@ impl Store for Bucket {
     fn get(&mut self, key: &str, limit: usize) -> core::result::Result<Vec<u8>, StoreError> {
         if let Some(e) = self.get_error {
             return Err(e);
+        }
+        if let Some((part, left)) = self.get_flaky.as_mut()
+            && key.contains(part.as_str())
+            && *left > 0
+        {
+            *left -= 1;
+            return Err(StoreError::Transport);
         }
         let b = self.data.get(key).ok_or(StoreError::Missing)?;
         if b.len() > limit {

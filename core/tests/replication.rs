@@ -71,7 +71,7 @@ fn unknown_large_snapshot_and_increment_commits_can_be_resolved() {
             parts.push(Part {
                 key,
                 size: bytes.len() as u64,
-                hash: hop_auth::sha256(&bytes),
+                hash: leancrypto::sha256::Sha256::digest(&bytes),
             });
         }
         let sequence = if snapshot { 1 } else { 2 };

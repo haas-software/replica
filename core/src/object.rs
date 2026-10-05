@@ -164,18 +164,32 @@ pub fn layout<S: Store>(store: &mut S, prefix: &str) -> Result<Layout> {
     Layout::new(snapshot, commits, prefix)
 }
 /// Een onvindbaar gecommit object is beschadiging, een transportfout blijft transport.
+/// Een transportfout krijgt [`SEGMENT_RETRIES`] herkansingen: een committed object
+/// verandert niet, dus opnieuw lezen is veilig.
 pub fn committed<S: Store>(store: &mut S, key: &str, limit: usize) -> Result<Vec<u8>> {
-    let bytes = store.get(key, limit).map_err(|e| {
-        if e == StoreError::Missing {
-            Error::Corrupt
-        } else {
-            e.into()
+    let reply = store.get(key, limit);
+    settle(store, key, limit, reply)
+}
+/// Het oordeel over één antwoord op een committed object, met herkansingen na
+/// een transportfout: een gestroomde body die halverwege breekt, komt zo terug.
+fn settle<S: Store>(
+    store: &mut S,
+    key: &str,
+    limit: usize,
+    mut reply: core::result::Result<Vec<u8>, StoreError>,
+) -> Result<Vec<u8>> {
+    for _ in 0..SEGMENT_RETRIES {
+        if reply != Err(StoreError::Transport) {
+            break;
         }
-    })?;
-    if bytes.len() > limit {
-        return Err(Error::Limit);
+        reply = store.get(key, limit);
     }
-    Ok(bytes)
+    match reply {
+        Ok(bytes) if bytes.len() > limit => Err(Error::Limit),
+        Ok(bytes) => Ok(bytes),
+        Err(StoreError::Missing) => Err(Error::Corrupt),
+        Err(e) => Err(e.into()),
+    }
 }
 /// Haalt de committed delen van een herstel- of compactieplan vooruit op, in
 /// rondes binnen [`Store::parallel`], en geeft ze in planvolgorde terug.
@@ -184,8 +198,13 @@ pub fn committed<S: Store>(store: &mut S, key: &str, limit: usize) -> Result<Vec
 pub(crate) struct Prefetch<'a> {
     parts: &'a [&'a Part],
     next: usize,
-    ready: VecDeque<core::result::Result<Vec<u8>, StoreError>>,
+    ready: VecDeque<(usize, core::result::Result<Vec<u8>, StoreError>)>,
 }
+/// Zo vaak wordt een committed object opnieuw gelezen na een transportfout.
+/// Een gestroomde body die halverwege breekt, komt als transportfout terug;
+/// een committed segment is idempotent en wordt op zijn hash getoetst, dus
+/// opnieuw ophalen is veilig en scheelt een heel herstel.
+pub(crate) const SEGMENT_RETRIES: usize = 3;
 impl<'a> Prefetch<'a> {
     pub(crate) fn new(parts: &'a [&'a Part]) -> Self {
         Self {
@@ -199,11 +218,10 @@ impl<'a> Prefetch<'a> {
         if self.ready.is_empty() {
             self.fill(store)?;
         }
-        match self.ready.pop_front().ok_or(Error::State)? {
-            Ok(bytes) => Ok(bytes),
-            Err(StoreError::Missing) => Err(Error::Corrupt),
-            Err(e) => Err(e.into()),
-        }
+        let (index, reply) = self.ready.pop_front().ok_or(Error::State)?;
+        let part = self.parts.get(index).ok_or(Error::State)?;
+        let limit = usize::try_from(part.size).map_err(|_| Error::Limit)?;
+        settle(store, &part.key, limit, reply)
     }
     fn fill<S: Store>(&mut self, store: &mut S) -> Result {
         let parallel = store.parallel();
@@ -230,14 +248,8 @@ impl<'a> Prefetch<'a> {
         self.ready
             .try_reserve(replies.len())
             .map_err(|_| Error::Memory)?;
-        for (reply, &(_, limit)) in replies.into_iter().zip(&keys) {
-            self.ready.push_back(reply.and_then(|bytes| {
-                if bytes.len() > limit {
-                    Err(StoreError::Limit)
-                } else {
-                    Ok(bytes)
-                }
-            }));
+        for (offset, reply) in replies.into_iter().enumerate() {
+            self.ready.push_back((self.next + offset, reply));
         }
         self.next += keys.len();
         Ok(())

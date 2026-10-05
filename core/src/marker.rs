@@ -263,7 +263,7 @@ pub fn new_generation<B: Storage>(b: &mut B, now: Time) -> Result<String> {
 }
 /// De bestemmingsidentiteit voorkomt dat een clean marker voor een andere bucket geldt.
 pub fn destination(endpoint: &str, bucket: &str, prefix: &str, domain: &str) -> Result<String> {
-    let mut hash = hop_auth::Sha256::new();
+    let mut hash = leancrypto::sha256::Sha256::new();
     for (i, s) in [endpoint, bucket, prefix, domain].into_iter().enumerate() {
         if i != 0 {
             hash.update(&[0]);

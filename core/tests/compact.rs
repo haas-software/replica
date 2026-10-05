@@ -21,7 +21,7 @@ fn part(store: &mut Bucket, prefix: &str, seq: u64, size: u64, pages: &[(u32, &[
     let p = Part {
         key: key.clone(),
         size: bytes.len() as u64,
-        hash: hop_auth::sha256(&bytes),
+        hash: leancrypto::sha256::Sha256::digest(&bytes),
     };
     store.data.insert(key, bytes);
     Manifest {
