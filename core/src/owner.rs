@@ -36,6 +36,10 @@ pub struct Config {
     pub schedule: Schedule,
     /// Expliciete toestemming voor lokale adoptie zonder bestaande marker.
     pub adopt_local: bool,
+    /// Het onderhoud (compactie, uitdunnen, verlopen generaties) niet binnen
+    /// `begin`/`finish` op de eigenaar, maar als losse taak via
+    /// [`Replica::maintenance_begin`]: dan legt geen venster de database stil.
+    pub background_maintenance: bool,
 }
 impl Config {
     /// Defaults zoals Go, met expliciet databasebudget en bestemming.
@@ -51,6 +55,7 @@ impl Config {
             retention: 28 * 86400,
             schedule: Schedule::defaults()?,
             adopt_local: false,
+            background_maintenance: false,
         };
         out.validate()?;
         Ok(out)
@@ -113,6 +118,53 @@ pub struct Replica {
     maintenance_at: Option<Time>,
     closed: bool,
     pending: bool,
+    maintaining: bool,
+}
+/// Een onderhoudsbeurt als losse taak: alleen de store (en willekeur voor
+/// poging-id's), nooit SQLite, marker of tracking. De frontier is bij
+/// [`Replica::maintenance_begin`] al duurzaam vastgelegd; commits die
+/// intussen landen, vallen erbuiten.
+pub struct Maintenance {
+    namespace: String,
+    generation: String,
+    sequence: u64,
+    sealed_at: Time,
+    now: Time,
+    levels: alloc::vec::Vec<crate::maintenance::Level>,
+    budget: (u32, usize),
+    retention: u64,
+}
+impl Maintenance {
+    /// Compactie, uitdunnen en verlopen generaties; mag lang duren.
+    pub fn run<B: Storage, S: Store>(&self, b: &mut B, store: &mut S) -> Result<Synced> {
+        let schedule = Schedule::new(&self.levels)?;
+        let maintenance = maintenance::run_sealed(
+            b,
+            store,
+            &self.namespace,
+            &self.generation,
+            self.sequence,
+            self.sealed_at,
+            &schedule,
+            self.now,
+            Budget {
+                pages: self.budget.0,
+                segment_bytes: self.budget.1,
+            },
+        )?;
+        let expired_objects = maintenance::generations(
+            store,
+            &self.namespace,
+            &self.generation,
+            self.now,
+            self.retention,
+        )?;
+        Ok(Synced {
+            published: false,
+            maintenance,
+            expired_objects,
+        })
+    }
 }
 /// Een capture waarvan de delen buiten de eigenaar worden geüpload, tussen
 /// [`Replica::begin`] en [`Replica::finish`].
@@ -171,6 +223,7 @@ impl Replica {
             maintenance_at: None,
             closed: false,
             pending: false,
+            maintaining: false,
         })
     }
     /// De getrackte VFS. De lening sluit gelijktijdig synchroniseren of sluiten uit.
@@ -264,7 +317,7 @@ impl Replica {
         now: Time,
     ) -> Result<Synced> {
         self.clock(now)?;
-        if self.pending {
+        if self.pending || self.maintaining {
             return Err(Error::State);
         }
         self.status.attempted = Some(now);
@@ -292,7 +345,8 @@ impl Replica {
         if self.pending {
             return Err(Error::State);
         }
-        if !self.due(now) {
+        // Een onderhoudstaak loopt: de volgende beurt wacht tot die klaar is.
+        if self.maintaining || !self.due(now) {
             return Ok(None);
         }
         self.status.attempted = Some(now);
@@ -300,6 +354,9 @@ impl Replica {
             Ok(Some(pending)) => {
                 self.pending = true;
                 Ok(Some(pending))
+            }
+            Ok(None) if self.config.background_maintenance => {
+                self.settle(Ok(Synced::default()), now).map(|_| None)
             }
             Ok(None) => {
                 let result = self.maintain(b, store, now);
@@ -323,6 +380,66 @@ impl Replica {
         self.clock(now)?;
         let result = uploaded.and_then(|uploaded| self.complete(b, store, pending, uploaded, now));
         self.settle(result, now)
+    }
+    /// Het onderhoud als losse taak (met [`Config::background_maintenance`]):
+    /// hoogstens eens per minuut, nooit naast een andere taak. Legt de
+    /// frontier op `now` duurzaam vast, zodat elk venster dat de taak
+    /// samenvoegt binnen de frontier valt en nieuwe commits erbuiten.
+    pub fn maintenance_begin<B: Storage>(
+        &mut self,
+        b: &mut B,
+        now: Time,
+    ) -> Result<Option<Maintenance>> {
+        self.clock(now)?;
+        if self.maintaining
+            || self.pending
+            || !self.prepared.marker.value.complete
+            || self.prepared.marker.value.uncertain != 0
+            || self
+                .maintenance_at
+                .is_some_and(|last| now.seconds() - last.seconds() < 60)
+        {
+            return Ok(None);
+        }
+        self.maintenance_at = Some(now);
+        let sealed = Time::unix(now.seconds(), 0)?;
+        if sealed > self.prepared.marker.value.sealed_at {
+            self.fence(b)?;
+            self.prepared.marker.value.sealed_at = sealed;
+            self.prepared.marker.save(b)?;
+        }
+        let mut levels = alloc::vec::Vec::new();
+        crate::reserve(&mut levels, self.config.schedule.levels().len())?;
+        levels.extend_from_slice(self.config.schedule.levels());
+        self.maintaining = true;
+        Ok(Some(Maintenance {
+            namespace: string(&self.config.namespace)?,
+            generation: string(&self.prepared.marker.value.generation)?,
+            sequence: self.prepared.marker.value.sequence,
+            sealed_at: self.prepared.marker.value.sealed_at,
+            now,
+            levels,
+            budget: (self.config.pages, self.config.segment_bytes),
+            retention: self.config.retention,
+        }))
+    }
+    /// Rondt een [`Maintenance::run`] af. Bewezen archiefschade plant, net als
+    /// het inline onderhoud, een nieuwe snapshot; een transportfout is alleen
+    /// de fout van deze beurt.
+    pub fn maintenance_finish<B: Storage>(
+        &mut self,
+        b: &mut B,
+        result: Result<Synced>,
+    ) -> Result<Synced> {
+        self.maintaining = false;
+        match result {
+            Ok(synced) => Ok(synced),
+            Err(e) => {
+                let e = self.archive_error(b, e);
+                self.status.error = Some(e);
+                Err(e)
+            }
+        }
     }
     fn settle(&mut self, result: Result<Synced>, now: Time) -> Result<Synced> {
         self.status.error = result.as_ref().err().copied();
@@ -441,7 +558,11 @@ impl Replica {
         ) {
             return Err(self.archive_error(b, e));
         }
-        let mut result = self.maintain(b, store, now)?;
+        let mut result = if self.config.background_maintenance {
+            Synced::default()
+        } else {
+            self.maintain(b, store, now)?
+        };
         result.published = true;
         Ok(result)
     }

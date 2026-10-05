@@ -5,7 +5,7 @@ use crate::{
     marker::{self, LocalMarker},
     object::{self, Store},
     replication::generation_prefix,
-    reserve, segment,
+    reserve, segment, string,
     time::Time,
 };
 use alloc::{string::String, vec::Vec};
@@ -35,6 +35,37 @@ pub fn merge<B: Storage, S: Store>(
     window: Window,
     inputs: &[&Manifest],
 ) -> Result<Manifest> {
+    if !local.value.complete || local.value.uncertain != 0 {
+        return Err(Error::State);
+    }
+    // Frontier vóór remote publicatie: na een crash landen nieuwe commits erbuiten.
+    if window.end > local.value.sealed_at {
+        local.value.sealed_at = window.end;
+        local.save(b)?;
+    }
+    let generation = string(&local.value.generation)?;
+    merge_sealed(
+        b,
+        store,
+        namespace,
+        &generation,
+        local.value.sealed_at,
+        window,
+        inputs,
+    )
+}
+/// Zoals [`merge`], voor een venster dat al binnen de duurzame frontier
+/// `sealed_at` valt: raakt de marker niet, alleen de store (en `b` voor de
+/// willekeur van een poging-id). Zo kan het naast de eigenaar draaien.
+pub fn merge_sealed<B: Storage, S: Store>(
+    b: &mut B,
+    store: &mut S,
+    namespace: &str,
+    generation: &str,
+    sealed_at: Time,
+    window: Window,
+    inputs: &[&Manifest],
+) -> Result<Manifest> {
     let Window {
         level,
         start,
@@ -42,8 +73,7 @@ pub fn merge<B: Storage, S: Store>(
         page_limit,
         segment_bytes,
     } = window;
-    if !local.value.complete
-        || local.value.uncertain != 0
+    if end > sealed_at
         || inputs.is_empty()
         || level == 0
         || level > 32
@@ -54,7 +84,7 @@ pub fn merge<B: Storage, S: Store>(
     {
         return Err(Error::State);
     }
-    let prefix = generation_prefix(namespace, &local.value.generation)?;
+    let prefix = generation_prefix(namespace, generation)?;
     let mut refs = Vec::new();
     let mut seq = inputs[0].first.checked_sub(1).ok_or(Error::Corrupt)?;
     if seq == 0 {
@@ -80,11 +110,6 @@ pub fn merge<B: Storage, S: Store>(
         reserve(&mut refs, m.parts.len())?;
         refs.extend(m.parts.iter());
         seq = m.sequence;
-    }
-    // Frontier vóór remote publicatie: na een crash landen nieuwe commits erbuiten.
-    if end > local.value.sealed_at {
-        local.value.sealed_at = end;
-        local.save(b)?;
     }
     let attempt = marker::new_generation(b, end)?;
     let data_prefix = object::key(

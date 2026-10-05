@@ -180,9 +180,72 @@ pub fn run<B: Storage, S: Store>(
     if now.seconds() < 1_577_836_800 {
         return Err(Error::State);
     }
-    let prefix = replication::generation_prefix(namespace, &local.value.generation)?;
+    let generation = crate::string(&local.value.generation)?;
+    let sequence = local.value.sequence;
+    run_with(
+        b,
+        store,
+        namespace,
+        &generation,
+        |last| last == sequence,
+        schedule,
+        now,
+        budget,
+        |b, store, window, inputs| compact::merge(b, store, namespace, local, window, inputs),
+    )
+}
+/// Zoals [`run`], als taak naast de eigenaar: de frontier `sealed_at` is al
+/// duurzaam vastgelegd (en ligt op of na `now`), de marker wordt niet geraakt,
+/// en commits die intussen landen horen erbij (`sequence` is een ondergrens).
+#[allow(clippy::too_many_arguments)]
+pub fn run_sealed<B: Storage, S: Store>(
+    b: &mut B,
+    store: &mut S,
+    namespace: &str,
+    generation: &str,
+    sequence: u64,
+    sealed_at: Time,
+    schedule: &Schedule,
+    now: Time,
+    budget: Budget,
+) -> Result<Report> {
+    // Elk verstreken venster eindigt op een hele seconde, uiterlijk `now`.
+    if now.seconds() < 1_577_836_800 || sealed_at.seconds() < now.seconds() {
+        return Err(Error::State);
+    }
+    run_with(
+        b,
+        store,
+        namespace,
+        generation,
+        |last| last >= sequence,
+        schedule,
+        now,
+        budget,
+        |b, store, window, inputs| {
+            compact::merge_sealed(b, store, namespace, generation, sealed_at, window, inputs)
+        },
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn run_with<B: Storage, S: Store>(
+    b: &mut B,
+    store: &mut S,
+    namespace: &str,
+    generation: &str,
+    sequence: impl Fn(u64) -> bool,
+    schedule: &Schedule,
+    now: Time,
+    budget: Budget,
+    mut merge: impl FnMut(&mut B, &mut S, Window, &[&Manifest]) -> Result<Manifest>,
+) -> Result<Report> {
+    let prefix = replication::generation_prefix(namespace, generation)?;
     let mut layout = object::layout(store, &prefix)?;
-    if layout.plan(None)?.last().map(|m| m.sequence) != Some(local.value.sequence) {
+    if !layout
+        .plan(None)?
+        .last()
+        .is_some_and(|m| sequence(m.sequence))
+    {
         return Err(Error::Gap);
     }
     let mut report = Report::default();
@@ -201,11 +264,9 @@ pub fn run<B: Storage, S: Store>(
             if inputs.is_empty() {
                 continue;
             }
-            let manifest = compact::merge(
+            let manifest = merge(
                 b,
                 store,
-                namespace,
-                local,
                 Window {
                     level,
                     start,
