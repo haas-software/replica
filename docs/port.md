@@ -12,7 +12,7 @@ Er ontbraken twee HopOS-functies, geen SQLite-formaat. Beide zitten sinds SDK
 `v3.0.0-alpha.16` in de gewone Git-tag; de apps pinnen nu HopOS `v3.0.10`.
 
 Replica gebruikt Hop `v3.0.9` voor het expliciete JSON-bytebudget en Lean
-`v3.1.10` voor delimiterlistings van generatieprefixen. Deze functies staan in
+`v3.1.11` voor delimiterlistings van generatieprefixen. Deze functies staan in
 de gepubliceerde libraries; een afnemer hoeft alleen Replica te includen.
 
 - De C-stack moet kunnen wachten op async system-I/O terwijl de app-executor

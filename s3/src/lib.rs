@@ -4,7 +4,6 @@
 extern crate alloc;
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::{
-    future::{Future, poll_fn},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -15,12 +14,22 @@ use replica_core::writer::{
     discovery::{self, wire},
 };
 use replica_sqlite::asynchronous::Suspend;
-/// Eén client, transport en wachtbrug; annulering maakt deze eigenaar onbruikbaar.
-/// Extra transports laten segment-GETs tegelijk lopen ([`S3::with_transports`]).
+/// Gelijktijdige segment-GETs van een herstel of compactie. Bunny Storage
+/// haalt ongeveer 10 MB/s per stroom; gemeten 05-10 vanaf het LAN met delen
+/// van 4 MiB: 1 stroom 10,6, 8 stromen 53 en 16 stromen 69 MB/s, daarboven
+/// niet sneller.
+pub const STREAMS: usize = 16;
+/// Segmentbytes die één ronde hoogstens vasthoudt: 16 delen van 4 MiB.
+pub const STREAM_BYTES: u64 = 64 << 20;
+/// Eén client en wachtbrug met hun eigen verbindingen; annulering maakt deze
+/// eigenaar onbruikbaar. Een herstel of compactie haalt tot [`STREAMS`]
+/// segmenten tegelijk op, ieder over een eigen verbinding.
 pub struct S3<T, W> {
     client: Client,
     transport: T,
     extra: Vec<T>,
+    open: Box<dyn FnMut() -> T>,
+    streams: usize,
     budget: u64,
     wait: W,
     poisoned: bool,
@@ -28,14 +37,22 @@ pub struct S3<T, W> {
     ghost: Option<(String, String, u64)>,
 }
 impl<T: Transport, W: Suspend> S3<T, W> {
-    /// Leent geen globale sockets; transport verzorgt TLS, DNS en totale deadlines.
-    /// Bijvoorbeeld Hop's `SlotTransport`, of de hostadapter voor integratietoetsen.
-    pub fn new(client: Client, transport: T, wait: W) -> Result<Self, StoreError> {
+    /// `open` maakt één verbinding, bijvoorbeeld `leans3http::Http` over
+    /// Lean's `WebDial`; TLS, DNS en termijnen zijn van dat transport. De
+    /// eerste gaat meteen open, de rest pas als een herstel of compactie
+    /// tegelijk ophaalt: [`STREAMS`] stromen, samen [`STREAM_BYTES`].
+    pub fn new(
+        client: Client,
+        mut open: impl FnMut() -> T + 'static,
+        wait: W,
+    ) -> Result<Self, StoreError> {
         let out = Self {
             client,
-            transport,
+            transport: open(),
             extra: Vec::new(),
-            budget: 0,
+            open: Box::new(open),
+            streams: STREAMS,
+            budget: STREAM_BYTES,
             wait,
             poisoned: false,
             ghost: None,
@@ -43,12 +60,11 @@ impl<T: Transport, W: Suspend> S3<T, W> {
         out.ready()?;
         Ok(out)
     }
-    /// Extra transports voor gelijktijdige segment-GETs: met `n` erbij haalt
-    /// een restore of compactie `n + 1` delen tegelijk op, samen hoogstens
-    /// `bytes`. Bunny Storage doet ongeveer 10 MB/s per download; 8 transports
-    /// van 4 MiB-segmenten vragen tot 32 MiB geheugen per ronde.
-    pub fn with_transports(mut self, extra: Vec<T>, bytes: u64) -> Self {
-        self.extra = extra;
+    /// Een andere grens dan [`STREAMS`] en [`STREAM_BYTES`]; één stroom haalt
+    /// na elkaar op.
+    #[must_use]
+    pub fn streams(mut self, streams: usize, bytes: u64) -> Self {
+        self.streams = streams.max(1);
         self.budget = bytes;
         self
     }
@@ -330,15 +346,17 @@ impl<T: Transport, W: Suspend> Store for S3<T, W> {
     }
     fn parallel(&self) -> Parallel {
         Parallel {
-            requests: 1 + self.extra.len(),
+            requests: self.streams,
             bytes: self.budget,
         }
     }
-    /// Eén GET per transport, samen in één wachtbeurt; ieder met zijn eigen
-    /// begrensde sink. Annulering vergiftigt de hele eigenaar, zoals bij `get`.
+    /// Eén GET per verbinding, samen in één wachtbeurt (`leans3`'s
+    /// `get_to_all`); ieder met zijn eigen begrensde sink. Ontbrekende
+    /// verbindingen gaan nu pas open. Annulering vergiftigt de hele eigenaar,
+    /// zoals bij `get`.
     fn get_all(&mut self, keys: &[(&str, usize)]) -> Result<Replies, StoreError> {
         self.ready()?;
-        if keys.len() > 1 + self.extra.len()
+        if keys.len() > self.streams
             || keys
                 .iter()
                 .any(|&(_, limit)| limit > replica_core::segment::MAX_BYTES)
@@ -352,15 +370,17 @@ impl<T: Transport, W: Suspend> Store for S3<T, W> {
             out.push(self.get(key, *limit));
             return Ok(out);
         }
+        let more = keys.len() - 1;
+        if self.extra.len() < more {
+            self.extra
+                .try_reserve_exact(more - self.extra.len())
+                .map_err(|_| StoreError::Limit)?;
+            while self.extra.len() < more {
+                self.extra.push((self.open)());
+            }
+        }
         let mut sinks = Vec::new();
-        let mut done = Vec::new();
-        let mut futures = Vec::new();
         sinks
-            .try_reserve_exact(keys.len())
-            .map_err(|_| StoreError::Limit)?;
-        done.try_reserve_exact(keys.len())
-            .map_err(|_| StoreError::Limit)?;
-        futures
             .try_reserve_exact(keys.len())
             .map_err(|_| StoreError::Limit)?;
         for &(_, limit) in keys {
@@ -369,39 +389,24 @@ impl<T: Transport, W: Suspend> Store for S3<T, W> {
                 limit,
                 limited: false,
             });
-            done.push(None);
         }
         let transports = core::iter::once(&mut self.transport).chain(self.extra.iter_mut());
-        for ((transport, sink), &(key, _)) in transports.zip(sinks.iter_mut()).zip(keys) {
-            futures.push(Box::pin(self.client.get_to(transport, key, sink)));
-        }
-        let finished = self.wait.wait(poll_fn(|cx| {
-            let mut pending = false;
-            for (future, slot) in futures.iter_mut().zip(done.iter_mut()) {
-                if slot.is_none() {
-                    match future.as_mut().poll(cx) {
-                        Poll::Ready(result) => *slot = Some(result),
-                        Poll::Pending => pending = true,
-                    }
-                }
+        let gets = transports
+            .zip(sinks.iter_mut())
+            .zip(keys)
+            .map(|((transport, sink), &(key, _))| (transport, key, sink));
+        let replies = match self.wait.wait(self.client.get_to_all(gets)) {
+            Ok(replies) => replies.map_err(map)?,
+            Err(_) => {
+                self.poisoned = true;
+                return Err(StoreError::Cancelled);
             }
-            if pending {
-                Poll::Pending
-            } else {
-                Poll::Ready(())
-            }
-        }));
-        drop(futures);
-        if finished.is_err() {
-            self.poisoned = true;
-            return Err(StoreError::Cancelled);
-        }
-        for (sink, result) in sinks.into_iter().zip(done) {
-            out.push(match result {
+        };
+        for (sink, reply) in sinks.into_iter().zip(replies) {
+            out.push(match reply {
                 _ if sink.limited => Err(StoreError::Limit),
-                Some(Ok(_)) => Ok(sink.bytes),
-                Some(Err(e)) => Err(map(e)),
-                None => Err(StoreError::Transport),
+                Ok(_) => Ok(sink.bytes),
+                Err(e) => Err(map(e)),
             });
         }
         Ok(out)

@@ -160,9 +160,11 @@ Een restore heeft daarnaast ruimte voor een complete scratchdatabase nodig.
 
 De huidige capture houdt de bron tijdens de volledige lokale kopie exclusief.
 Restore en compactie halen segmenten in rondes tegelijk op, binnen
-`Store::parallel` (aantal en bytes); `S3::with_transports` geeft de S3-store
-extra verbindingen, bijvoorbeeld 8 tegen Bunny's ongeveer 10 MB/s per download.
-Toepassen blijft in planvolgorde. Uploads zijn opeenvolgend; de
+`Store::parallel` (aantal en bytes). `S3::new` krijgt een functie die één
+verbinding opent (bijvoorbeeld `leans3http::Http` over Lean's `WebDial`) en
+opent er zelf tot 16, pas als een ronde ze nodig heeft; tegen Bunny's
+ongeveer 10 MB/s per stroom haalt dat 40 tot 69 MB/s. `S3::streams` stelt een
+andere grens in. Toepassen blijft in planvolgorde. Uploads zijn opeenvolgend; de
 Go-optimalisaties met korte leestransacties en twee gelijktijdige uploads zijn
 nog niet aangesloten. Writes na capture bewaren conservatief de hele dirty superset.
 Daarom is hiermee geen gelijkwaardige grote-databaseprestatie gemeten.

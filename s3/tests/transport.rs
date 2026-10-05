@@ -172,7 +172,15 @@ fn tagged(world: &Rc<RefCell<World>>, status: u16, bytes: &[u8], etag: &str) {
 fn lease_is_a_conditional_put_and_412_means_held() {
     use replica_core::writer::{Backend, LeaseState, discovery::Error};
     let world = Rc::new(RefCell::new(World::default()));
-    let mut s = replica_s3::S3::new(client(), Net(world.clone()), Wait { cancel: false }).unwrap();
+    let mut s = replica_s3::S3::new(
+        client(),
+        {
+            let w = world.clone();
+            move || Net(w.clone())
+        },
+        Wait { cancel: false },
+    )
+    .unwrap();
     let mut lease = s.lease("replica/test/lease", 30_000);
     let state = LeaseState {
         generation: 1,
@@ -236,7 +244,15 @@ fn lease_is_a_conditional_put_and_412_means_held() {
 #[test]
 fn large_segment_streams_with_budget_and_checks_truncation() {
     let world = Rc::new(RefCell::new(World::default()));
-    let mut s = replica_s3::S3::new(client(), Net(world.clone()), Wait { cancel: false }).unwrap();
+    let mut s = replica_s3::S3::new(
+        client(),
+        {
+            let w = world.clone();
+            move || Net(w.clone())
+        },
+        Wait { cancel: false },
+    )
+    .unwrap();
     let data = vec![37; 5 << 20];
     reply(&world, 200, data.clone(), Some(data.len() as u64));
     assert_eq!(s.get("generation/data/one", data.len()).unwrap(), data);
@@ -258,7 +274,15 @@ fn large_segment_streams_with_budget_and_checks_truncation() {
 #[test]
 fn complete_list_only_and_delete_absent_is_success() {
     let world = Rc::new(RefCell::new(World::default()));
-    let mut s = replica_s3::S3::new(client(), Net(world.clone()), Wait { cancel: false }).unwrap();
+    let mut s = replica_s3::S3::new(
+        client(),
+        {
+            let w = world.clone();
+            move || Net(w.clone())
+        },
+        Wait { cancel: false },
+    )
+    .unwrap();
     let body=b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken><Contents><Key>gen/L0/one.json</Key></Contents></ListBucketResult>".to_vec();
     reply(&world, 200, body, None);
     assert!(matches!(s.list("gen/L", 1), Err(StoreError::Limit)));
@@ -276,14 +300,29 @@ fn cancellation_after_request_disables_owner_and_invalid_clock_sends_nothing() {
         pause: true,
         ..World::default()
     }));
-    let mut s = replica_s3::S3::new(client(), Net(world.clone()), Wait { cancel: true }).unwrap();
+    let mut s = replica_s3::S3::new(
+        client(),
+        {
+            let w = world.clone();
+            move || Net(w.clone())
+        },
+        Wait { cancel: true },
+    )
+    .unwrap();
     assert_eq!(s.put("commit", b"manifest"), Err(StoreError::Cancelled));
     assert!(matches!(s.get("commit", 100), Err(StoreError::Cancelled)));
     assert_eq!(world.borrow().calls.len(), 1);
     let mut c = client();
     c.now = Some(|| 1);
     assert!(matches!(
-        replica_s3::S3::new(c, Net(world.clone()), Wait { cancel: false }),
+        replica_s3::S3::new(
+            c,
+            {
+                let w = world.clone();
+                move || Net(w.clone())
+            },
+            Wait { cancel: false }
+        ),
         Err(StoreError::Configuration)
     ));
     assert_eq!(world.borrow().calls.len(), 1);
@@ -292,7 +331,15 @@ fn cancellation_after_request_disables_owner_and_invalid_clock_sends_nothing() {
 #[test]
 fn directory_pages_skip_data_and_batches_allow_explicit_truncation() {
     let world = Rc::new(RefCell::new(World::default()));
-    let mut s = replica_s3::S3::new(client(), Net(world.clone()), Wait { cancel: false }).unwrap();
+    let mut s = replica_s3::S3::new(
+        client(),
+        {
+            let w = world.clone();
+            move || Net(w.clone())
+        },
+        Wait { cancel: false },
+    )
+    .unwrap();
     reply(&world, 200, b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>two</NextContinuationToken><Contents><Key>gen/marker</Key></Contents></ListBucketResult>".to_vec(), None);
     reply(&world, 200, b"<ListBucketResult><IsTruncated>false</IsTruncated><CommonPrefixes><Prefix>gen/one/</Prefix></CommonPrefixes></ListBucketResult>".to_vec(), None);
     assert_eq!(s.directories("gen/", 10).unwrap(), ["gen/one/"]);
@@ -331,8 +378,15 @@ fn cancellation_of_directory_or_batch_listing_poison_the_store() {
             pause: true,
             ..World::default()
         }));
-        let mut s =
-            replica_s3::S3::new(client(), Net(world.clone()), Wait { cancel: true }).unwrap();
+        let mut s = replica_s3::S3::new(
+            client(),
+            {
+                let w = world.clone();
+                move || Net(w.clone())
+            },
+            Wait { cancel: true },
+        )
+        .unwrap();
         let error = if directories {
             s.directories("gen/", 10).unwrap_err()
         } else {
@@ -358,7 +412,15 @@ fn lease_ghost_is_taken_over_only_after_a_ttl_unchanged() {
     let world = Rc::new(RefCell::new(World::default()));
     let mut c = client();
     c.now = Some(|| CLOCK.load(Ordering::Relaxed));
-    let mut s = replica_s3::S3::new(c, Net(world.clone()), Wait { cancel: false }).unwrap();
+    let mut s = replica_s3::S3::new(
+        c,
+        {
+            let w = world.clone();
+            move || Net(w.clone())
+        },
+        Wait { cancel: false },
+    )
+    .unwrap();
     let state = LeaseState {
         generation: 1,
         expires_at: 1_790_765_356_000,
@@ -392,11 +454,24 @@ fn segment_gets_overlap_across_transports_and_keep_their_order() {
         slow: true,
         ..World::default()
     }));
-    let net = || Net(world.clone());
-    let mut s = replica_s3::S3::new(client(), net(), Spin)
-        .unwrap()
-        .with_transports(vec![net(), net()], 1 << 20);
+    let opened = Rc::new(std::cell::Cell::new(0));
+    let s = replica_s3::S3::new(
+        client(),
+        {
+            let (w, opened) = (world.clone(), opened.clone());
+            move || {
+                opened.set(opened.get() + 1);
+                Net(w.clone())
+            }
+        },
+        Spin,
+    )
+    .unwrap();
+    assert_eq!(s.parallel().requests, replica_s3::STREAMS);
+    let mut s = s.streams(3, 1 << 20);
     assert_eq!(s.parallel().requests, 3);
+    // Eén verbinding bij het maken; de andere twee pas voor de ronde.
+    assert_eq!(opened.get(), 1);
     reply(&world, 200, vec![1; 10], Some(10));
     reply(&world, 404, Vec::new(), Some(0));
     reply(&world, 200, vec![3; 30], Some(30));
@@ -404,6 +479,7 @@ fn segment_gets_overlap_across_transports_and_keep_their_order() {
     assert_eq!(replies[0], Ok(vec![1; 10]));
     assert_eq!(replies[1], Err(StoreError::Missing));
     assert_eq!(replies[2], Err(StoreError::Limit));
+    assert_eq!(opened.get(), 3);
     // Alle drie gestart vóór het eerste antwoord: echt tegelijk.
     let calls = world.borrow().calls.clone();
     assert_eq!(calls.len(), 6);
@@ -425,9 +501,16 @@ fn cancelled_parallel_round_poisons_the_store() {
         pause: true,
         ..World::default()
     }));
-    let mut s = replica_s3::S3::new(client(), Net(world.clone()), Wait { cancel: true })
-        .unwrap()
-        .with_transports(vec![Net(world.clone())], 1 << 20);
+    let mut s = replica_s3::S3::new(
+        client(),
+        {
+            let w = world.clone();
+            move || Net(w.clone())
+        },
+        Wait { cancel: true },
+    )
+    .unwrap()
+    .streams(2, 1 << 20);
     assert!(matches!(
         s.get_all(&[("g/a", 10), ("g/b", 10)]),
         Err(StoreError::Cancelled)

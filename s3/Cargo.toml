@@ -7,6 +7,6 @@ license.workspace = true
 [dependencies]
 replica-core = { path = "../core" }
 replica-sqlite = { path = "../sqlite" }
-leans3 = { git = "https://github.com/xinix00/lean.git", tag = "v3.1.10" }
+leans3 = { git = "https://github.com/xinix00/lean.git", tag = "v3.1.11" }
 [lints]
 workspace = true

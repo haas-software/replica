@@ -70,8 +70,8 @@ source = "git+https://github.com/xinix00/lean.git?tag=v3.1.9#c406246d84b4a9e96a3
 
 [[package]]
 name = "leans3"
-version = "3.1.10"
-source = "git+https://github.com/xinix00/lean.git?tag=v3.1.10#2c7588a5076496a28d586aadb991c718adba9082"
+version = "3.1.11"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.1.11#42c771f935c47d7819d157e956d94796d4fb44a1"
 
 [[package]]
 name = "netdev"

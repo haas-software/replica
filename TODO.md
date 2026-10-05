@@ -20,7 +20,7 @@ weegt niet op tegen uren downtime.
 
 ## Segmenten parallel uploaden
 
-Downloads gaan nu in rondes tegelijk (`Store::get_all`, `S3::with_transports`).
+Downloads gaan nu in rondes tegelijk (`Store::get_all`, standaard 16 stromen in `S3`).
 Uploads van een capture nog na elkaar; de Go-versie deed er twee tegelijk.
 
 ## Restjes via de buren (na het bovenstaande)
