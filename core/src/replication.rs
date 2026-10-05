@@ -54,6 +54,10 @@ pub fn renew<B: Storage>(b: &mut B, local: &mut LocalMarker, now: Time) -> Resul
     local.save(b)
 }
 impl Batch {
+    /// Hoeveel pagina's deze batch meeneemt.
+    pub fn page_count(&self) -> u64 {
+        self.capture.page_count()
+    }
     /// Capture vóór netwerk-I/O; None wanneer broncontrole geen wijzigingen vindt.
     pub fn capture<B: Storage>(
         b: &mut B,
@@ -223,13 +227,7 @@ impl Batch {
         if self.capture.witness.is_some() {
             tracking.witness = self.capture.witness;
         }
-        let clean = tracking.acknowledge(
-            b,
-            &self.generation,
-            seq,
-            self.capture.revision,
-            self.capture.snapshot,
-        )?;
+        let clean = tracking.acknowledge_capture(b, &self.generation, seq, &self.capture)?;
         local.value.clean = clean;
         local.save(b)
     }

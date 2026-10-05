@@ -121,6 +121,10 @@ pub struct Pending {
     staged: Staged,
 }
 impl Pending {
+    /// Hoeveel pagina's deze capture meeneemt.
+    pub fn pages(&self) -> u64 {
+        self.batch.page_count()
+    }
     /// Uploadt de delen; raakt alleen de spool en de store, nooit SQLite,
     /// marker of tracking, dus dit mag op een eigen stack naast de eigenaar.
     pub fn upload<B: Storage, S: Store>(&self, b: &mut B, store: &mut S) -> Result<Uploaded> {
@@ -399,7 +403,12 @@ impl Replica {
             &self.prepared.marker,
             self.config.segment_bytes,
         ) {
-            Ok(Some(batch)) => batch,
+            Ok(Some(batch)) => {
+                // De bron was tijdens de capture exclusief: wat nu nog
+                // geschreven wordt, is ná deze capture geschreven.
+                self.prepared.tracking.captured();
+                batch
+            }
             Ok(None) => return Ok(None),
             Err(e @ (Error::ForeignWrite | Error::Gap | Error::State)) => {
                 self.invalidate(b, false)?;

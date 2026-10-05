@@ -149,6 +149,9 @@ pub struct Tracking {
     path: Name,
     journal: Journal,
     dirty: Pages,
+    /// Pagina's die ná de laatste capture opnieuw geschreven zijn: die blijven
+    /// bij de bevestiging van die capture dirty, de rest van de capture niet.
+    rewritten: Pages,
     page_size: u32,
     revision: u64,
     clean: bool,
@@ -186,6 +189,7 @@ impl Tracking {
             path,
             journal: Journal::new(path, page_limit)?,
             dirty: Pages::new(page_limit),
+            rewritten: Pages::new(page_limit),
             page_size: 0,
             revision: 0,
             clean: true,
@@ -231,6 +235,43 @@ impl Tracking {
             self.dirty.clear();
         }
         self.committed(b, generation, sequence, revision, full)
+    }
+    /// De eigenaar heeft zojuist een capture gemaakt (de bron was exclusief):
+    /// wat vanaf nu geschreven wordt, telt als na die capture geschreven.
+    pub fn captured(&mut self) {
+        self.rewritten.clear();
+    }
+    /// Bevestigt een gepubliceerde capture. Zonder writes erna wordt de hele
+    /// dirty set leeg; met writes erna vallen alleen de meegenomen pagina's weg
+    /// die sindsdien niet opnieuw geschreven zijn (en pagina's voorbij de
+    /// gecapturede grootte, die het manifest al afkapt). Zo groeit de set niet
+    /// uit tot alles wat ooit vuil werd, terwijl elke nieuwe write dirty blijft.
+    pub fn acknowledge_capture<B: Storage>(
+        &mut self,
+        b: &mut B,
+        generation: &str,
+        sequence: u64,
+        capture: &crate::capture::Capture,
+    ) -> Result<bool> {
+        if capture.revision > self.revision || (self.needs_snapshot() && !capture.snapshot) {
+            return Err(Error::State);
+        }
+        if capture.revision == self.revision {
+            self.dirty.clear();
+        } else {
+            let count = capture.size / u64::from(capture.page_size.max(1));
+            let mut kept = Pages::new(self.dirty.limit());
+            for page in self.dirty.numbers()? {
+                let covered = capture.snapshot
+                    || u64::from(page) > count
+                    || capture.pages.binary_search(&page).is_ok();
+                if !covered || self.rewritten.contains(page) {
+                    kept.add(page)?;
+                }
+            }
+            self.dirty = kept;
+        }
+        self.committed(b, generation, sequence, capture.revision, capture.snapshot)
     }
     /// Niet toe te wijzen writes vereisen een volledig snapshot.
     pub const fn needs_snapshot(&self) -> bool {
@@ -366,6 +407,7 @@ impl Tracking {
         }
         for page in first..=last {
             self.dirty.add(page as u32)?;
+            self.rewritten.add(page as u32)?;
             self.journal.note(page as u32)?;
         }
         Ok(())
@@ -471,6 +513,7 @@ impl<B: Storage, M: CleanMarker<B>> Storage for Tracked<'_, B, M> {
         if self.main == Some(file) {
             self.unclean().map_err(sqlite_error)?;
             self.tracking.dirty.add(1).map_err(sqlite_error)?;
+            self.tracking.rewritten.add(1).map_err(sqlite_error)?;
             self.tracking.journal.note(1).map_err(sqlite_error)?;
         }
         self.storage.truncate(file, size)

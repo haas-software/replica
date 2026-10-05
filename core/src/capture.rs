@@ -31,8 +31,19 @@ pub struct Capture {
     pub snapshot: bool,
     pub(crate) counter: u32,
     pub(crate) witness: Option<(u32, [u8; 32])>,
+    /// De meegenomen pagina's van een increment, oplopend; leeg bij een snapshot
+    /// (dat neemt alles mee). De bevestiging laat alleen díe pagina's los.
+    pub(crate) pages: Vec<u32>,
 }
 impl Capture {
+    /// Hoeveel pagina's dit beeld meeneemt.
+    pub fn page_count(&self) -> u64 {
+        if self.snapshot {
+            self.size / u64::from(self.page_size.max(1))
+        } else {
+            self.pages.len() as u64
+        }
+    }
     /// SQLite moet gesloten zijn of de eigenaar moet een echte leestransactie
     /// vasthouden. Alle writes gaan via Tracking; deze exclusieve opslaglening
     /// mag niet naast een verborgen schrijver of padalias bestaan.
@@ -121,6 +132,7 @@ impl Capture {
                 snapshot,
                 counter,
                 witness: None,
+                pages: Vec::new(),
             });
         }
         let per_segment = segment_bytes / page_size as usize;
@@ -206,6 +218,7 @@ impl Capture {
             snapshot,
             counter,
             witness,
+            pages,
         })
     }
     pub(crate) fn is_empty(&self) -> bool {
