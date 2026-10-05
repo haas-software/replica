@@ -9,7 +9,7 @@ repo-grenzen. De kern van Replica verbiedt unsafe.
 ## SQLite op HopOS: één async opslagpad
 
 Er ontbraken twee HopOS-functies, geen SQLite-formaat. Beide zitten sinds SDK
-`v3.0.0-alpha.16` in de gewone Git-tag; de apps pinnen nu HopOS `v3.0.10`.
+`v3.0.0-alpha.16` in de gewone Git-tag; de apps pinnen nu HopOS `v3.0.12`.
 
 Replica gebruikt Hop `v3.0.9` voor het expliciete JSON-bytebudget en Lean
 `v3.1.11` voor delimiterlistings van generatieprefixen. Deze functies staan in

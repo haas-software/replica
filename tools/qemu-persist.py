@@ -30,6 +30,9 @@ def main():
                     if p['name'] == 'applib')).parent.parent
     # qemu-run.sh zoekt Hop naast zijn eigen repo; de cargo-checkout heeft die buur niet.
     os.environ.setdefault('HOP_DIR', str(ROOT.parent / 'hop/hop'))
+    # Sinds HopOS 3.0.11 vergeet een koude boot standaard alles
+    # (hopos.storage=stateless); deze proef gaat juist over een herstart.
+    os.environ['BOOTARGS'] = (os.environ.get('BOOTARGS', '') + ' hopos.storage=stateful').strip()
     spec = importlib.util.spec_from_file_location('hopos_sync_probe', sdk / 'tools/qemu-test-sync.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
