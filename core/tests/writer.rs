@@ -103,10 +103,13 @@ fn renews_on_age_and_stops_itself_a_third_before_expiry() {
     lease.down = false;
     assert_eq!(w.renew(&mut lease, at(25_000)), Err(Error::LeaseLost));
     assert_eq!(w.renew(&mut lease, at(25_001)), Err(Error::LeaseLost));
-    // Een klok die terugspringt is ook geen bewijs.
+    // Een klok die iets terugspringt is geen verlies: de eigenaar meet `now` aan
+    // het begin van een beurt en een vernieuwing in een capture meet later.
+    // Meer dan een zesde TTL terug is wel een klok die terugspringt.
     let mut lease = MemBackend::new();
     let mut w = writer(claim(&mut fs, &mut lease, "a", TTL, at(0)).unwrap());
-    assert_eq!(w.renew(&mut lease, at(-1)), Err(Error::LeaseLost));
+    w.renew(&mut lease, at(-1)).unwrap();
+    assert_eq!(w.renew(&mut lease, at(-5_001)), Err(Error::LeaseLost));
 }
 #[test]
 fn lost_renew_reply_is_adopted_but_a_foreign_write_is_not() {
