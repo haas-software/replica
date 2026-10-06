@@ -321,7 +321,7 @@ impl Replica {
             return Err(Error::State);
         }
         self.status.attempted = Some(now);
-        let result = match self.capture(b, store, now) {
+        let result = match self.capture(b, store, now, &mut |_| Ok(())) {
             Ok(Some(pending)) => pending
                 .upload(b, store)
                 .and_then(|uploaded| self.complete(b, store, pending, uploaded, now)),
@@ -341,6 +341,19 @@ impl Replica {
         store: &mut S,
         now: Time,
     ) -> Result<Option<Pending>> {
+        self.begin_with(b, store, now, &mut |_| Ok(()))
+    }
+    /// Als [`Replica::begin`], met `renew` vóór elk segment van de capture. Een
+    /// snapshot van een grote database duurt langer dan de leasedeadline; wie
+    /// hier [`Writer::renew`] aanroept, houdt de lease tijdens de capture vast.
+    /// Een fout uit `renew` (de lease is weg) breekt de capture af.
+    pub fn begin_with<B: Storage, S: Store>(
+        &mut self,
+        b: &mut B,
+        store: &mut S,
+        now: Time,
+        renew: &mut dyn FnMut(&mut Writer) -> Result,
+    ) -> Result<Option<Pending>> {
         self.clock(now)?;
         if self.pending {
             return Err(Error::State);
@@ -350,7 +363,7 @@ impl Replica {
             return Ok(None);
         }
         self.status.attempted = Some(now);
-        match self.capture(b, store, now) {
+        match self.capture(b, store, now, renew) {
             Ok(Some(pending)) => {
                 self.pending = true;
                 Ok(Some(pending))
@@ -492,6 +505,7 @@ impl Replica {
         b: &mut B,
         store: &mut S,
         now: Time,
+        renew_lease: &mut dyn FnMut(&mut Writer) -> Result,
     ) -> Result<Option<Pending>> {
         if self.prepared.marker.value.uncertain != 0
             && let Err(e) =
@@ -513,12 +527,15 @@ impl Replica {
             replication::renew(b, &mut self.prepared.marker, now)?;
             self.maintenance_at = None;
         }
-        let batch = match Batch::capture(
+        let writer = &mut self.writer;
+        let mut tick = || renew_lease(writer);
+        let batch = match Batch::capture_with(
             b,
             self.config.path,
             &self.prepared.tracking,
             &self.prepared.marker,
             self.config.segment_bytes,
+            &mut tick,
         ) {
             Ok(Some(batch)) => {
                 // De bron was tijdens de capture exclusief: wat nu nog

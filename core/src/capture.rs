@@ -55,6 +55,28 @@ impl Capture {
         previous_size: u64,
         segment_bytes: usize,
     ) -> Result<Self> {
+        Self::read_with(
+            b,
+            path,
+            tracking,
+            snapshot,
+            previous_size,
+            segment_bytes,
+            &mut || Ok(()),
+        )
+    }
+    /// Als [`Capture::read`], met `tick` vóór elk segment: een snapshot van een
+    /// grote database duurt minuten, en wie de lease vasthoudt vernieuwt hem
+    /// daar (anders verloopt hij halverwege). Een fout uit `tick` breekt af.
+    pub fn read_with<B: replica_sqlite::Storage>(
+        b: &mut B,
+        path: Name,
+        tracking: &Tracking,
+        snapshot: bool,
+        previous_size: u64,
+        segment_bytes: usize,
+        tick: &mut dyn FnMut() -> Result,
+    ) -> Result<Self> {
         if !(65536..=16 << 20).contains(&segment_bytes) {
             return Err(Error::Limit);
         }
@@ -159,6 +181,7 @@ impl Capture {
         }
         // Ook een groottewijziging zonder pagina's krijgt een leeg segment.
         for index in 0..chunk_count {
+            tick()?;
             let from = (index * per_segment).min(page_count);
             let through = (from + per_segment).min(page_count);
             let numbers = if snapshot {

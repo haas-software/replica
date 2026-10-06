@@ -66,6 +66,17 @@ impl Batch {
         local: &LocalMarker,
         segment_bytes: usize,
     ) -> Result<Option<Self>> {
+        Self::capture_with(b, path, tracking, local, segment_bytes, &mut || Ok(()))
+    }
+    /// Als [`Batch::capture`], met `tick` vóór elk segment (zie [`Capture::read_with`]).
+    pub fn capture_with<B: Storage>(
+        b: &mut B,
+        path: Name,
+        tracking: &Tracking,
+        local: &LocalMarker,
+        segment_bytes: usize,
+        tick: &mut dyn FnMut() -> Result,
+    ) -> Result<Option<Self>> {
         if local.value.generation.is_empty() || local.value.uncertain != 0 {
             return Err(Error::State);
         }
@@ -73,13 +84,14 @@ impl Batch {
             return Err(Error::State);
         }
         let generation = string(&local.value.generation)?;
-        let capture = Capture::read(
+        let capture = Capture::read_with(
             b,
             path,
             tracking,
             !local.value.complete,
             local.value.size,
             segment_bytes,
+            tick,
         )?;
         if capture.is_empty() {
             return Ok(None);
