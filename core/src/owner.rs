@@ -1,7 +1,8 @@
 //! De expliciete Replica-levensloop van één app-eigenaar; geen verborgen threads.
 use crate::{
     Error, Result,
-    local::Name,
+    capture::Plan,
+    local::{self, Name},
     maintenance::{self, Budget, Report, Schedule},
     marker::{LocalMarker, Marker},
     object::Store,
@@ -194,6 +195,42 @@ impl Pending {
         self.batch.upload(b, store, &self.staged)
     }
 }
+/// Wat [`Replica::begin_capture`] teruggeeft: een beeld om te lezen, of een
+/// onderbroken snapshot waarvan alleen de upload nog moet.
+#[allow(clippy::large_enum_variant)]
+pub enum Begun {
+    /// Een nieuw beeld: lees het met [`Capturing::run`], upload dan.
+    Capture(Capturing),
+    /// Een hervatte snapshot: alleen [`Pending::upload`] nog.
+    Upload(Pending),
+}
+/// Een capture die buiten de eigenaar leest: alleen de database, de spool en
+/// de schaduw, nooit SQLite, marker of tracking.
+pub struct Capturing {
+    plan: Plan,
+    namespace: String,
+    generation: String,
+    previous_sequence: u64,
+    path: Name,
+    now: Time,
+}
+impl Capturing {
+    /// Eén segment; `false` als alles gelezen is. Voor wie tussen de segmenten
+    /// door iets anders wil doen; [`Capturing::run`] doet ze achter elkaar.
+    pub fn step<B: Storage>(&mut self, b: &mut B) -> Result<bool> {
+        self.plan.step(b)
+    }
+    /// Leest het beeld naar de spool en zet de upload klaar (prefix en het
+    /// hervattingsrecord), zodat [`Pending::upload`] meteen kan volgen.
+    pub fn run<B: Storage>(mut self, b: &mut B) -> Result<Pending> {
+        while self.step(b)? {}
+        let capture = self.plan.finish(b)?;
+        let batch = Batch::new(b, capture, &self.generation, self.previous_sequence)?;
+        let staged = batch.stage_at(b, &self.namespace, self.now)?;
+        batch.save_pending(b, self.path, &staged)?;
+        Ok(Pending { batch, staged })
+    }
+}
 impl Replica {
     /// Prepare vóór SQLite openen, inclusief geverifieerde restore waar nodig.
     /// De [`Writer`] uit [`crate::writer::claim`] is het bewijs van de lease.
@@ -363,10 +400,16 @@ impl Replica {
             return Err(Error::State);
         }
         self.status.attempted = Some(now);
-        let result = match self.capture(b, store, now) {
-            Ok(Some(pending)) => pending
-                .upload(b, store)
-                .and_then(|uploaded| self.complete(b, store, pending, uploaded, now)),
+        let result = match self.plan(b, store, now) {
+            Ok(Some(capturing)) => match capturing.run(b) {
+                Ok(pending) => {
+                    self.disarm(b);
+                    pending
+                        .upload(b, store)
+                        .and_then(|uploaded| self.complete(b, store, pending, uploaded, now))
+                }
+                Err(e) => return self.abandon(b, e, now),
+            },
             Ok(None) => self.maintain(b, store, now),
             Err(e) => Err(e),
         };
@@ -383,6 +426,26 @@ impl Replica {
         store: &mut S,
         now: Time,
     ) -> Result<Option<Pending>> {
+        match self.begin_capture(b, store, now)? {
+            None => Ok(None),
+            Some(Begun::Upload(pending)) => Ok(Some(pending)),
+            Some(Begun::Capture(capturing)) => match capturing.run(b) {
+                Ok(pending) => Ok(Some(pending)),
+                Err(e) => self.abandon(b, e, now).map(|_| None),
+            },
+        }
+    }
+    /// Als [`Replica::begin`], maar het lezen van de pagina's gebeurt buiten
+    /// de eigenaar: [`Capturing::run`] mag op een andere stack draaien terwijl
+    /// SQL hier via [`Replica::vfs`] doorschrijft; de schaduw houdt het beeld
+    /// op dit moment. De uitkomst gaat naar [`Replica::finish`] (na de
+    /// upload) of [`Replica::abandon`] (een mislukte capture).
+    pub fn begin_capture<B: Storage, S: Store>(
+        &mut self,
+        b: &mut B,
+        store: &mut S,
+        now: Time,
+    ) -> Result<Option<Begun>> {
         self.clock(now)?;
         if self.pending {
             return Err(Error::State);
@@ -395,16 +458,16 @@ impl Replica {
         if let Some(pending) = self.resumable.take() {
             self.status.attempted = Some(now);
             self.pending = true;
-            return Ok(Some(pending));
+            return Ok(Some(Begun::Upload(pending)));
         }
         if !self.due(now) {
             return Ok(None);
         }
         self.status.attempted = Some(now);
-        match self.capture(b, store, now) {
-            Ok(Some(pending)) => {
+        match self.plan(b, store, now) {
+            Ok(Some(capturing)) => {
                 self.pending = true;
-                Ok(Some(pending))
+                Ok(Some(Begun::Capture(capturing)))
             }
             Ok(None) if self.config.background_maintenance => {
                 self.settle(Ok(Synced::default()), now).map(|_| None)
@@ -414,6 +477,23 @@ impl Replica {
                 self.settle(result, now).map(|_| None)
             }
             Err(e) => self.settle(Err(e), now).map(|_| None),
+        }
+    }
+    /// Een [`Capturing::run`] die mislukte: de schaduw gaat weg, een beeld dat
+    /// niet meer te maken was plant een nieuwe snapshot, en dit is de fout van
+    /// deze beurt.
+    pub fn abandon<B: Storage>(&mut self, b: &mut B, error: Error, now: Time) -> Result<Synced> {
+        self.pending = false;
+        self.disarm(b);
+        if matches!(error, Error::ForeignWrite | Error::Gap | Error::State) {
+            self.invalidate(b, false)?;
+        }
+        self.settle(Err(error), now)
+    }
+    fn disarm<B: Storage>(&mut self, b: &mut B) {
+        self.prepared.tracking.disarm();
+        if let Ok(name) = self.config.path.suffix(".replica-shadow") {
+            let _ = local::write(b, &name, b"");
         }
     }
     /// Rondt een [`Replica::begin`] af met het resultaat van [`Pending::upload`]:
@@ -428,6 +508,7 @@ impl Replica {
         now: Time,
     ) -> Result<Synced> {
         self.pending = false;
+        self.disarm(b);
         self.clock(now)?;
         let result = uploaded.and_then(|uploaded| self.complete(b, store, pending, uploaded, now));
         self.settle(result, now)
@@ -537,13 +618,13 @@ impl Replica {
         error
     }
     /// Onzekere commits oplossen, de generatie alleen op leeftijd vernieuwen,
-    /// en de capture met zijn objectsleutels; nog geen upload.
-    fn capture<B: Storage, S: Store>(
+    /// en het plan van de capture met de schaduw gewapend; nog geen pagina's.
+    fn plan<B: Storage, S: Store>(
         &mut self,
         b: &mut B,
         store: &mut S,
         now: Time,
-    ) -> Result<Option<Pending>> {
+    ) -> Result<Option<Capturing>> {
         if self.prepared.marker.value.uncertain != 0
             && let Err(e) =
                 replication::resolve(b, store, &self.config.namespace, &mut self.prepared.marker)
@@ -564,19 +645,22 @@ impl Replica {
             replication::renew(b, &mut self.prepared.marker, now)?;
             self.maintenance_at = None;
         }
-        let batch = match Batch::capture(
+        let local = &self.prepared.marker.value;
+        if local.generation.is_empty()
+            || local.uncertain != 0
+            || (!local.complete && local.sequence != 0)
+        {
+            return Err(Error::State);
+        }
+        let plan = match Plan::new(
             b,
             self.config.path,
             &self.prepared.tracking,
-            &self.prepared.marker,
+            !local.complete,
+            local.size,
             self.config.segment_bytes,
         ) {
-            Ok(Some(batch)) => {
-                // De bron was tijdens de capture exclusief: wat nu nog
-                // geschreven wordt, is ná deze capture geschreven.
-                self.prepared.tracking.captured();
-                batch
-            }
+            Ok(Some(plan)) => plan,
             Ok(None) => return Ok(None),
             Err(e @ (Error::ForeignWrite | Error::Gap | Error::State)) => {
                 self.invalidate(b, false)?;
@@ -584,9 +668,18 @@ impl Replica {
             }
             Err(e) => return Err(e),
         };
-        let staged = batch.stage(b, &self.config.namespace, &self.prepared.marker, now)?;
-        batch.save_pending(b, self.config.path, &staged)?;
-        Ok(Some(Pending { batch, staged }))
+        // Het beeld is dat van nu: wat vanaf hier geschreven wordt, is ná deze
+        // capture geschreven en gaat eerst oud de schaduw in.
+        self.prepared.tracking.captured();
+        self.prepared.tracking.arm(plan.shadow());
+        Ok(Some(Capturing {
+            plan,
+            namespace: string(&self.config.namespace)?,
+            generation: string(&self.prepared.marker.value.generation)?,
+            previous_sequence: self.prepared.marker.value.sequence,
+            path: self.config.path,
+            now,
+        }))
     }
     /// Manifest en marker na de upload, daarna het onderhoud.
     fn complete<B: Storage, S: Store>(

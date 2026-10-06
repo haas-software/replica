@@ -81,7 +81,6 @@ impl Batch {
         if !local.value.complete && local.value.sequence != 0 {
             return Err(Error::State);
         }
-        let generation = string(&local.value.generation)?;
         let capture = Capture::read(
             b,
             path,
@@ -93,16 +92,25 @@ impl Batch {
         if capture.is_empty() {
             return Ok(None);
         }
-        // Een retry kan dezelfde generatie en voorganger hebben. Eigen entropie
-        // bindt staged/uploaded ook dan aan precies deze capture.
+        Self::new(b, capture, &local.value.generation, local.value.sequence).map(Some)
+    }
+    /// Een batch om een gelezen beeld heen. Een retry kan dezelfde generatie
+    /// en voorganger hebben: eigen entropie bindt staged/uploaded ook dan aan
+    /// precies deze capture.
+    pub fn new<B: Storage>(
+        b: &mut B,
+        capture: Capture,
+        generation: &str,
+        previous_sequence: u64,
+    ) -> Result<Self> {
         let mut id = [0u8; 16];
         b.random(&mut id)?;
-        Ok(Some(Self {
+        Ok(Self {
             capture,
             id,
-            generation,
-            previous_sequence: local.value.sequence,
-        }))
+            generation: string(generation)?,
+            previous_sequence,
+        })
     }
     /// Legt een snapshot-capture met zijn poging-prefix duurzaam naast de spool,
     /// zodat een herstart de upload hervat waar hij ophield. Een increment is
@@ -235,6 +243,11 @@ impl Batch {
         now: Time,
     ) -> Result<Staged> {
         self.check(local)?;
+        self.stage_at(b, namespace, now)
+    }
+    /// Als [`Batch::stage`], buiten de eigenaar: de marker is bij het begin van
+    /// de capture gecontroleerd en verandert niet zolang die loopt.
+    pub fn stage_at<B: Storage>(&self, b: &mut B, namespace: &str, now: Time) -> Result<Staged> {
         let prefix = generation_prefix(namespace, &self.generation)?;
         let attempt = marker::new_generation(b, now)?;
         let data_prefix = object::key(

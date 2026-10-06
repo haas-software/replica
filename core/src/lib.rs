@@ -18,6 +18,7 @@ pub mod prepare;
 pub mod replication;
 pub mod restore;
 pub mod segment;
+pub mod shadow;
 pub mod time;
 pub mod tracking;
 pub mod writer;

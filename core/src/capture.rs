@@ -6,7 +6,9 @@ use crate::{
     local::{File, Name},
     manifest::{MAX_PARTS, Part, field, hex, json_error, uint, unhex},
     object::{self, Store},
-    reserve, segment, string,
+    reserve, segment,
+    shadow::{Shadow, Shared},
+    string,
     tracking::Tracking,
 };
 use alloc::vec::Vec;
@@ -74,183 +76,23 @@ impl Capture {
         previous_size: u64,
         segment_bytes: usize,
     ) -> Result<Self> {
-        if !(65536..=16 << 20).contains(&segment_bytes) {
-            return Err(Error::Limit);
+        match Plan::new(b, path, tracking, snapshot, previous_size, segment_bytes)? {
+            Some(plan) => plan.run(b),
+            None => Ok(Self::empty(path, tracking)?),
         }
-        if tracking.needs_snapshot() && !snapshot {
-            return Err(Error::State);
-        }
-        let mut file = File::open(b, &path, false)?;
-        let size = file.size()?;
-        let mut header = [0u8; 100];
-        file.read(0, &mut header)?;
-        file.close()?;
-        if &header[..16] != b"SQLite format 3\0" {
-            return Err(Error::Corrupt);
-        }
-        let raw = u16::from_be_bytes([header[16], header[17]]);
-        let page_size = if raw == 1 { 65536 } else { u32::from(raw) };
-        if !segment::valid_page_size(page_size) || !size.is_multiple_of(u64::from(page_size)) {
-            return Err(Error::Corrupt);
-        }
-        let count = size / u64::from(page_size);
-        if count > u64::from(tracking.page_limit()) {
-            return Err(Error::Limit);
-        }
-        if !snapshot && tracking.page_size() != 0 && tracking.page_size() != page_size {
-            return Err(Error::State);
-        }
-        let counter = u32::from_be_bytes([header[24], header[25], header[26], header[27]]);
-        if !snapshot {
-            if tracking.source_counter.is_some_and(|old| old != counter)
-                && tracking.pending()?.is_empty()
-            {
-                return Err(Error::ForeignWrite);
-            }
-            if let Some((page, expected)) = tracking.witness
-                && !tracking.is_dirty(page)
-                && u64::from(page) <= count
-            {
-                let mut bytes = Vec::new();
-                reserve(&mut bytes, page_size as usize)?;
-                bytes.resize(page_size as usize, 0);
-                let mut source = File::open(b, &path, false)?;
-                source.read(u64::from(page - 1) * u64::from(page_size), &mut bytes)?;
-                source.close()?;
-                if hash(&bytes) != expected {
-                    return Err(Error::ForeignWrite);
-                }
-            }
-        }
-        // Een snapshot is een bereik, geen paginanummervector ter grootte van de DB.
-        let mut pages = if snapshot {
-            Vec::new()
-        } else {
-            tracking.pending()?
-        };
-        pages.retain(|&page| u64::from(page) <= count);
-        if !snapshot
-            && growth_gap(
-                previous_size,
-                size,
-                page_size,
-                &pages,
-                tracking.page_limit(),
-            )?
-            .is_some()
-        {
-            return Err(Error::Gap);
-        }
-        if !snapshot && pages.is_empty() && size == previous_size {
-            return Ok(Self {
-                spool: path.suffix(".replica-capture")?,
-                chunks: Vec::new(),
-                size,
-                page_size,
-                revision: tracking.revision(),
-                snapshot,
-                counter,
-                witness: None,
-                pages: Vec::new(),
-                stats: Stats::default(),
-            });
-        }
-        let per_segment = segment_bytes / page_size as usize;
-        let page_count = if snapshot {
-            count as usize
-        } else {
-            pages.len()
-        };
-        let chunk_count = page_count.div_ceil(per_segment).max(1);
-        if chunk_count > MAX_PARTS {
-            return Err(Error::Limit);
-        }
-        let spool = path.suffix(".replica-capture")?;
-        let mut output = File::open(b, &spool, true)?;
-        output.truncate(0)?;
-        output.close()?;
-        let mut chunks = Vec::new();
-        reserve(&mut chunks, chunk_count)?;
-        let mut offset = 0;
-        let mut witness = None;
-        let mut snapshot_pages = Vec::new();
-        if snapshot {
-            reserve(&mut snapshot_pages, per_segment.min(page_count))?;
-        }
-        let mut stats = Stats::default();
-        // Ook een groottewijziging zonder pagina's krijgt een leeg segment.
-        for index in 0..chunk_count {
-            let from = (index * per_segment).min(page_count);
-            let through = (from + per_segment).min(page_count);
-            let numbers = if snapshot {
-                snapshot_pages.clear();
-                snapshot_pages.extend((from as u32 + 1)..=through as u32);
-                snapshot_pages.as_slice()
-            } else {
-                &pages[from..through]
-            };
-            let mut data = Vec::new();
-            reserve(&mut data, numbers.len() * page_size as usize)?;
-            data.resize(numbers.len() * page_size as usize, 0);
-            let t0 = millis(b);
-            let mut source = File::open(b, &path, false)?;
-            let mut start = 0;
-            while start < numbers.len() {
-                let mut end = start + 1;
-                while end < numbers.len() && numbers[end] == numbers[end - 1] + 1 {
-                    end += 1;
-                }
-                source.read(
-                    u64::from(numbers[start] - 1) * u64::from(page_size),
-                    &mut data[start * page_size as usize..end * page_size as usize],
-                )?;
-                start = end;
-            }
-            source.close()?;
-            let t1 = millis(b);
-            if let Some(&last) = numbers.last() {
-                witness = Some((last, hash(&data[data.len() - page_size as usize..])));
-            }
-            let mut records = Vec::new();
-            reserve(&mut records, numbers.len())?;
-            for (&page, bytes) in numbers.iter().zip(data.chunks_exact(page_size as usize)) {
-                records.push((page, bytes));
-            }
-            let encoded = segment::encode(page_size, size, &records)?;
-            let checksum = hash(&encoded);
-            let len = encoded.len();
-            let t2 = millis(b);
-            let mut output = File::open(b, &spool, false)?;
-            output.write(offset, &encoded)?;
-            output.close()?;
-            let t3 = millis(b);
-            stats.read_ms = stats.read_ms.saturating_add(t1.saturating_sub(t0));
-            stats.hash_ms = stats.hash_ms.saturating_add(t2.saturating_sub(t1));
-            stats.write_ms = stats.write_ms.saturating_add(t3.saturating_sub(t2));
-            stats.bytes = stats.bytes.saturating_add(len as u64);
-            chunks.push(Chunk {
-                offset,
-                len,
-                hash: checksum,
-            });
-            offset = offset.checked_add(len as u64).ok_or(Error::Limit)?;
-        }
-        let t4 = millis(b);
-        let mut output = File::open(b, &spool, false)?;
-        output.sync()?;
-        output.close()?;
-        stats.write_ms = stats.write_ms.saturating_add(millis(b).saturating_sub(t4));
+    }
+    fn empty(path: Name, tracking: &Tracking) -> Result<Self> {
         Ok(Self {
-            spool,
-            chunks,
-            size,
-            page_size,
+            spool: path.suffix(".replica-capture")?,
+            chunks: Vec::new(),
+            size: 0,
+            page_size: 0,
             revision: tracking.revision(),
-            snapshot,
-            counter,
-            witness,
-            pages,
-            stats,
+            snapshot: false,
+            counter: 0,
+            witness: None,
+            pages: Vec::new(),
+            stats: Stats::default(),
         })
     }
     pub(crate) fn is_empty(&self) -> bool {
@@ -396,6 +238,271 @@ impl Capture {
             });
         }
         Ok(parts)
+    }
+}
+/// Een capture in stappen: de kop, de broncontrole en de paginalijst op de
+/// eigenaar (SQLite dicht), het lezen van de segmenten waar dan ook, met de
+/// [`Shadow`] als beeld van het begin. Eén segment per [`Plan::step`].
+pub struct Plan {
+    path: Name,
+    spool: Name,
+    size: u64,
+    page_size: u32,
+    revision: u64,
+    snapshot: bool,
+    counter: u32,
+    per_segment: usize,
+    chunk_count: usize,
+    index: usize,
+    offset: u64,
+    witness: Option<(u32, [u8; 32])>,
+    chunks: Vec<Chunk>,
+    stats: Stats,
+    shadow: Shared,
+}
+impl Plan {
+    /// `None`: niets veranderde en de grootte bleef gelijk; er is geen capture.
+    pub fn new<B: replica_sqlite::Storage>(
+        b: &mut B,
+        path: Name,
+        tracking: &Tracking,
+        snapshot: bool,
+        previous_size: u64,
+        segment_bytes: usize,
+    ) -> Result<Option<Self>> {
+        if !(65536..=16 << 20).contains(&segment_bytes) {
+            return Err(Error::Limit);
+        }
+        if tracking.needs_snapshot() && !snapshot {
+            return Err(Error::State);
+        }
+        let mut file = File::open(b, &path, false)?;
+        let size = file.size()?;
+        let mut header = [0u8; 100];
+        file.read(0, &mut header)?;
+        file.close()?;
+        if &header[..16] != b"SQLite format 3\0" {
+            return Err(Error::Corrupt);
+        }
+        let raw = u16::from_be_bytes([header[16], header[17]]);
+        let page_size = if raw == 1 { 65536 } else { u32::from(raw) };
+        if !segment::valid_page_size(page_size) || !size.is_multiple_of(u64::from(page_size)) {
+            return Err(Error::Corrupt);
+        }
+        let count = size / u64::from(page_size);
+        if count > u64::from(tracking.page_limit()) {
+            return Err(Error::Limit);
+        }
+        if !snapshot && tracking.page_size() != 0 && tracking.page_size() != page_size {
+            return Err(Error::State);
+        }
+        let counter = u32::from_be_bytes([header[24], header[25], header[26], header[27]]);
+        if !snapshot {
+            if tracking.source_counter.is_some_and(|old| old != counter)
+                && tracking.pending()?.is_empty()
+            {
+                return Err(Error::ForeignWrite);
+            }
+            if let Some((page, expected)) = tracking.witness
+                && !tracking.is_dirty(page)
+                && u64::from(page) <= count
+            {
+                let mut bytes = Vec::new();
+                reserve(&mut bytes, page_size as usize)?;
+                bytes.resize(page_size as usize, 0);
+                let mut source = File::open(b, &path, false)?;
+                source.read(u64::from(page - 1) * u64::from(page_size), &mut bytes)?;
+                source.close()?;
+                if hash(&bytes) != expected {
+                    return Err(Error::ForeignWrite);
+                }
+            }
+        }
+        // Een snapshot is een bereik, geen paginanummervector ter grootte van de DB.
+        let mut pages = if snapshot {
+            Vec::new()
+        } else {
+            tracking.pending()?
+        };
+        pages.retain(|&page| u64::from(page) <= count);
+        if !snapshot
+            && growth_gap(
+                previous_size,
+                size,
+                page_size,
+                &pages,
+                tracking.page_limit(),
+            )?
+            .is_some()
+        {
+            return Err(Error::Gap);
+        }
+        if !snapshot && pages.is_empty() && size == previous_size {
+            return Ok(None);
+        }
+        let per_segment = segment_bytes / page_size as usize;
+        let page_count = if snapshot {
+            count as usize
+        } else {
+            pages.len()
+        };
+        let chunk_count = page_count.div_ceil(per_segment).max(1);
+        if chunk_count > MAX_PARTS {
+            return Err(Error::Limit);
+        }
+        let spool = path.suffix(".replica-capture")?;
+        let mut output = File::open(b, &spool, true)?;
+        output.truncate(0)?;
+        output.close()?;
+        let shadow_name = path.suffix(".replica-shadow")?;
+        let mut output = File::open(b, &shadow_name, true)?;
+        output.truncate(0)?;
+        output.close()?;
+        let mut chunks = Vec::new();
+        reserve(&mut chunks, chunk_count)?;
+        Ok(Some(Self {
+            path,
+            spool,
+            size,
+            page_size,
+            revision: tracking.revision(),
+            snapshot,
+            counter,
+            per_segment,
+            chunk_count,
+            index: 0,
+            offset: 0,
+            witness: None,
+            chunks,
+            stats: Stats::default(),
+            shadow: Shadow::new(shadow_name, page_size, count as u32, pages, snapshot),
+        }))
+    }
+    /// Het handvat dat de eigenaar in zijn tracking zet zolang dit beeld leest.
+    pub fn shadow(&self) -> Shared {
+        self.shadow.clone()
+    }
+    /// Alle segmenten achter elkaar.
+    pub fn run<B: replica_sqlite::Storage>(mut self, b: &mut B) -> Result<Capture> {
+        while self.step(b)? {}
+        self.finish(b)
+    }
+    /// Eén segment: lezen uit de database, de schaduw eroverheen, coderen,
+    /// hashen, naar de spool. `false` als alle segmenten gelezen zijn.
+    pub fn step<B: replica_sqlite::Storage>(&mut self, b: &mut B) -> Result<bool> {
+        if self.index >= self.chunk_count {
+            return Ok(false);
+        }
+        let page_size = self.page_size;
+        let numbers = {
+            let shadow = self.shadow.borrow();
+            if shadow.is_broken() {
+                return Err(Error::Gap);
+            }
+            shadow.segment(self.index, self.per_segment)
+        };
+        let mut data = Vec::new();
+        reserve(&mut data, numbers.len() * page_size as usize)?;
+        data.resize(numbers.len() * page_size as usize, 0);
+        let t0 = millis(b);
+        let mut source = File::open(b, &self.path, false)?;
+        let mut start = 0;
+        while start < numbers.len() {
+            let mut end = start + 1;
+            while end < numbers.len() && numbers[end] == numbers[end - 1] + 1 {
+                end += 1;
+            }
+            source.read(
+                u64::from(numbers[start] - 1) * u64::from(page_size),
+                &mut data[start * page_size as usize..end * page_size as usize],
+            )?;
+            start = end;
+        }
+        source.close()?;
+        // Wat de eigenaar sinds het begin overschreef, staat oud in de schaduw;
+        // ook als de write landde terwijl wij hierboven lazen.
+        let slots: Vec<(usize, u32)> = {
+            let shadow = self.shadow.borrow();
+            if shadow.is_broken() {
+                return Err(Error::Gap);
+            }
+            numbers
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &page)| shadow.slot(page).map(|slot| (i, slot)))
+                .collect()
+        };
+        if !slots.is_empty() {
+            let name = *self.shadow.borrow().file();
+            let mut file = File::open(b, &name, false)?;
+            for (i, slot) in slots {
+                file.read(
+                    u64::from(slot) * u64::from(page_size),
+                    &mut data[i * page_size as usize..(i + 1) * page_size as usize],
+                )?;
+            }
+            file.close()?;
+        }
+        if let Some(&last) = numbers.last() {
+            self.shadow.borrow_mut().advance(last);
+        }
+        let t1 = millis(b);
+        if let Some(&last) = numbers.last() {
+            self.witness = Some((last, hash(&data[data.len() - page_size as usize..])));
+        }
+        let mut records = Vec::new();
+        reserve(&mut records, numbers.len())?;
+        for (&page, bytes) in numbers.iter().zip(data.chunks_exact(page_size as usize)) {
+            records.push((page, bytes));
+        }
+        let encoded = segment::encode(page_size, self.size, &records)?;
+        let checksum = hash(&encoded);
+        let len = encoded.len();
+        let t2 = millis(b);
+        let mut output = File::open(b, &self.spool, false)?;
+        output.write(self.offset, &encoded)?;
+        output.close()?;
+        let t3 = millis(b);
+        self.stats.read_ms = self.stats.read_ms.saturating_add(t1.saturating_sub(t0));
+        self.stats.hash_ms = self.stats.hash_ms.saturating_add(t2.saturating_sub(t1));
+        self.stats.write_ms = self.stats.write_ms.saturating_add(t3.saturating_sub(t2));
+        self.stats.bytes = self.stats.bytes.saturating_add(len as u64);
+        self.chunks.push(Chunk {
+            offset: self.offset,
+            len,
+            hash: checksum,
+        });
+        self.offset = self.offset.checked_add(len as u64).ok_or(Error::Limit)?;
+        self.index += 1;
+        Ok(true)
+    }
+    /// De spool duurzaam; de schaduw hoeft niets meer te bewaren.
+    pub fn finish<B: replica_sqlite::Storage>(mut self, b: &mut B) -> Result<Capture> {
+        if self.index < self.chunk_count {
+            return Err(Error::State);
+        }
+        let t4 = millis(b);
+        let mut output = File::open(b, &self.spool, false)?;
+        output.sync()?;
+        output.close()?;
+        self.stats.write_ms = self.stats.write_ms.saturating_add(millis(b).saturating_sub(t4));
+        self.shadow.borrow_mut().finished();
+        let pages = {
+            let mut shadow = self.shadow.borrow_mut();
+            core::mem::take(&mut shadow.pages)
+        };
+        Ok(Capture {
+            spool: self.spool,
+            chunks: self.chunks,
+            size: self.size,
+            page_size: self.page_size,
+            revision: self.revision,
+            snapshot: self.snapshot,
+            counter: self.counter,
+            witness: self.witness,
+            pages,
+            stats: self.stats,
+        })
     }
 }
 fn hex_string(hash: &[u8; 32]) -> Result<alloc::string::String> {

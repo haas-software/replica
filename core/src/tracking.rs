@@ -158,8 +158,18 @@ pub struct Tracking {
     unknown: bool,
     pub(crate) source_counter: Option<u32>,
     pub(crate) witness: Option<(u32, [u8; 32])>,
+    /// Zolang een capture op een andere stack leest: de kopie-vóór-schrijven.
+    shadow: Option<crate::shadow::Shared>,
 }
 impl Tracking {
+    /// Vanaf nu bewaart elke write eerst de oude pagina voor het beeld.
+    pub fn arm(&mut self, shadow: crate::shadow::Shared) {
+        self.shadow = Some(shadow);
+    }
+    /// Het beeld is gelezen of opgegeven.
+    pub fn disarm(&mut self) {
+        self.shadow = None;
+    }
     /// Alleen na een bewezen clean marker of volledige restore: alle lokale writes
     /// zijn al remote bevestigd. Het tweede oude log mag daarna duurzaam weg.
     pub fn reset_confirmed<B: Storage>(
@@ -196,6 +206,7 @@ impl Tracking {
             unknown: false,
             source_counter: None,
             witness: None,
+            shadow: None,
         })
     }
     /// Laatst uit een SQLite-header geleerde paginamaten, nul zolang onbekend.
@@ -517,6 +528,10 @@ impl<B: Storage, M: CleanMarker<B>> Storage for Tracked<'_, B, M> {
             self.tracking
                 .mark(offset, src.len())
                 .map_err(sqlite_error)?;
+            if let Some(shadow) = self.tracking.shadow.clone() {
+                crate::shadow::copy_before_write(self.storage, &shadow, file, offset, src.len())
+                    .map_err(sqlite_error)?;
+            }
         }
         self.storage.write(file, offset, src)
     }
@@ -527,6 +542,9 @@ impl<B: Storage, M: CleanMarker<B>> Storage for Tracked<'_, B, M> {
             self.tracking.dirty.add(1).map_err(sqlite_error)?;
             self.tracking.rewritten.add(1).map_err(sqlite_error)?;
             self.tracking.journal.note(1).map_err(sqlite_error)?;
+            if let Some(shadow) = &self.tracking.shadow {
+                shadow.borrow_mut().truncated(size);
+            }
         }
         self.storage.truncate(file, size)
     }
