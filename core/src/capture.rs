@@ -16,6 +16,22 @@ struct Chunk {
     len: usize,
     hash: [u8; 32],
 }
+/// Waar de tijd van een capture heen ging, in milliseconden van de opslagklok:
+/// pagina's lezen, segmenten coderen en hashen, de spool schrijven.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Stats {
+    /// Pagina's uit de database lezen.
+    pub read_ms: u64,
+    /// Segmenten coderen en hashen.
+    pub hash_ms: u64,
+    /// De spool schrijven en synchroniseren.
+    pub write_ms: u64,
+    /// Geschreven segmentbytes.
+    pub bytes: u64,
+}
+fn millis<B: replica_sqlite::Storage>(b: &mut B) -> u64 {
+    b.unix_millis().map_or(0, |ms| u64::try_from(ms).unwrap_or(0))
+}
 /// Eén consistent databasebeeld of dirty-setbeeld, los van de actieve SQLite-engine.
 /// De eigenaar laat maximaal één capture tegelijk publiceren; een nieuwere spool
 /// kan door de hashes nooit stil als de oudere capture worden verstuurd.
@@ -35,6 +51,8 @@ pub struct Capture {
     /// De meegenomen pagina's van een increment, oplopend; leeg bij een snapshot
     /// (dat neemt alles mee). De bevestiging laat alleen díe pagina's los.
     pub(crate) pages: Vec<u32>,
+    /// Tijdsbesteding van het lezen van dit beeld.
+    pub stats: Stats,
 }
 impl Capture {
     /// Hoeveel pagina's dit beeld meeneemt.
@@ -134,6 +152,7 @@ impl Capture {
                 counter,
                 witness: None,
                 pages: Vec::new(),
+                stats: Stats::default(),
             });
         }
         let per_segment = segment_bytes / page_size as usize;
@@ -158,6 +177,7 @@ impl Capture {
         if snapshot {
             reserve(&mut snapshot_pages, per_segment.min(page_count))?;
         }
+        let mut stats = Stats::default();
         // Ook een groottewijziging zonder pagina's krijgt een leeg segment.
         for index in 0..chunk_count {
             let from = (index * per_segment).min(page_count);
@@ -172,6 +192,7 @@ impl Capture {
             let mut data = Vec::new();
             reserve(&mut data, numbers.len() * page_size as usize)?;
             data.resize(numbers.len() * page_size as usize, 0);
+            let t0 = millis(b);
             let mut source = File::open(b, &path, false)?;
             let mut start = 0;
             while start < numbers.len() {
@@ -186,6 +207,7 @@ impl Capture {
                 start = end;
             }
             source.close()?;
+            let t1 = millis(b);
             if let Some(&last) = numbers.last() {
                 witness = Some((last, hash(&data[data.len() - page_size as usize..])));
             }
@@ -197,9 +219,15 @@ impl Capture {
             let encoded = segment::encode(page_size, size, &records)?;
             let checksum = hash(&encoded);
             let len = encoded.len();
+            let t2 = millis(b);
             let mut output = File::open(b, &spool, false)?;
             output.write(offset, &encoded)?;
             output.close()?;
+            let t3 = millis(b);
+            stats.read_ms = stats.read_ms.saturating_add(t1.saturating_sub(t0));
+            stats.hash_ms = stats.hash_ms.saturating_add(t2.saturating_sub(t1));
+            stats.write_ms = stats.write_ms.saturating_add(t3.saturating_sub(t2));
+            stats.bytes = stats.bytes.saturating_add(len as u64);
             chunks.push(Chunk {
                 offset,
                 len,
@@ -207,9 +235,11 @@ impl Capture {
             });
             offset = offset.checked_add(len as u64).ok_or(Error::Limit)?;
         }
+        let t4 = millis(b);
         let mut output = File::open(b, &spool, false)?;
         output.sync()?;
         output.close()?;
+        stats.write_ms = stats.write_ms.saturating_add(millis(b).saturating_sub(t4));
         Ok(Self {
             spool,
             chunks,
@@ -220,6 +250,7 @@ impl Capture {
             counter,
             witness,
             pages,
+            stats,
         })
     }
     pub(crate) fn is_empty(&self) -> bool {
@@ -296,6 +327,7 @@ impl Capture {
             counter: u32::try_from(uint(o, "counter")?).map_err(|_| Error::Corrupt)?,
             witness,
             pages: Vec::new(),
+            stats: Stats::default(),
         })
     }
     /// Waar de spool eindigt; een hervatting eist dat het bestand zo groot is.

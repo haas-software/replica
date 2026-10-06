@@ -184,6 +184,10 @@ impl Pending {
     pub fn pages(&self) -> u64 {
         self.batch.page_count()
     }
+    /// Waar de tijd van de capture heen ging.
+    pub fn stats(&self) -> crate::capture::Stats {
+        self.batch.stats()
+    }
     /// Uploadt de delen; raakt alleen de spool en de store, nooit SQLite,
     /// marker of tracking, dus dit mag op een eigen stack naast de eigenaar.
     pub fn upload<B: Storage, S: Store>(&self, b: &mut B, store: &mut S) -> Result<Uploaded> {

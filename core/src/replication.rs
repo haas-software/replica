@@ -63,6 +63,10 @@ impl Batch {
     pub fn page_count(&self) -> u64 {
         self.capture.page_count()
     }
+    /// Waar de tijd van de capture heen ging.
+    pub fn stats(&self) -> crate::capture::Stats {
+        self.capture.stats
+    }
     /// Capture vóór netwerk-I/O; None wanneer broncontrole geen wijzigingen vindt.
     pub fn capture<B: Storage>(
         b: &mut B,

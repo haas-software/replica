@@ -7,7 +7,7 @@ use replica_core::{
     owner::{Config, Replica},
     time::Time,
     writer::{
-        Backend, LeaseState, MemBackend, ReadOnly, Role, Writer, claim,
+        Backend, LeaseState, MemBackend, ReadOnly, Renewed, Role, Writer, claim,
         discovery::{self, Error as LeaseError},
     },
 };
@@ -130,6 +130,46 @@ fn lost_renew_reply_is_adopted_but_a_foreign_write_is_not() {
     };
     lease.inner.write(&handle, &foreign).unwrap();
     assert_eq!(w.renew(&mut lease, at(15_000)), Err(Error::LeaseLost));
+}
+#[test]
+fn renewal_in_steps_keeps_the_store_io_outside_the_writer() {
+    let mut fs = Fs::default();
+    let mut lease = Faulty::default();
+    let mut w = writer(claim(&mut fs, &mut lease, "a", TTL, at(0)).unwrap());
+    assert!(w.renew_request(at(4_999)).unwrap().is_none());
+    let renewal = w.renew_request(at(5_000)).unwrap().unwrap();
+    let written = lease.write(&renewal.prev, &renewal.state);
+    assert_eq!(w.renew_commit(&renewal, written).unwrap(), Renewed::Done);
+    assert_eq!(w.deadline(), 1_790_765_296_000 + 25_000);
+    // Een verloren antwoord is transport; de PUT landde wel, dus de volgende
+    // vernieuwing krijgt 412 en herovert onze eigen lease.
+    let renewal = w.renew_request(at(10_000)).unwrap().unwrap();
+    lease.lose_reply = true;
+    let written = lease.write(&renewal.prev, &renewal.state);
+    assert!(w.renew_commit(&renewal, written).is_err());
+    let renewal = w.renew_request(at(11_000)).unwrap().unwrap();
+    let written = lease.write(&renewal.prev, &renewal.state);
+    assert_eq!(w.renew_commit(&renewal, written).unwrap(), Renewed::Reclaim);
+    let again = w.reclaim_request(lease.read(), renewal.at).unwrap().unwrap();
+    let written = lease.write(&again.prev, &again.state);
+    w.reclaim_commit(&again, written).unwrap();
+    assert_eq!(w.deadline(), 1_790_765_296_000 + 31_000);
+    // Een vreemde lease bij de herovering is blijvend verlies.
+    let renewal = w.renew_request(at(16_000)).unwrap().unwrap();
+    let (state, handle) = lease.read().unwrap();
+    let foreign = LeaseState {
+        owner: "b#x".into(),
+        generation: state.generation + 1,
+        ..state
+    };
+    lease.inner.write(&handle, &foreign).unwrap();
+    let written = lease.write(&renewal.prev, &renewal.state);
+    assert_eq!(w.renew_commit(&renewal, written).unwrap(), Renewed::Reclaim);
+    assert_eq!(
+        w.reclaim_request(lease.read(), renewal.at),
+        Err(Error::LeaseLost)
+    );
+    assert_eq!(w.check(at(16_001)), Err(Error::LeaseLost));
 }
 #[test]
 fn release_lets_a_reader_take_over_at_once() {

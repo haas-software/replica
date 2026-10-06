@@ -135,29 +135,98 @@ impl Writer {
     /// Een onbereikbare store is een transportfout; de schrijver blijft geldig
     /// tot [`Writer::deadline`]. Een andere houder is blijvend verlies.
     pub fn renew<L: Backend>(&mut self, lease: &mut L, now: Time) -> Result {
+        let Some(renewal) = self.renew_request(now)? else {
+            return Ok(());
+        };
+        let written = lease.write(&renewal.prev, &renewal.state);
+        match self.renew_commit(&renewal, written)? {
+            Renewed::Done => Ok(()),
+            Renewed::Reclaim => {
+                let read = lease.read();
+                match self.reclaim_request(read, renewal.at)? {
+                    Some(again) => {
+                        let written = lease.write(&again.prev, &again.state);
+                        self.reclaim_commit(&again, written)
+                    }
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+    /// De vernieuwing in stappen, voor een host die de store-I/O buiten een
+    /// lening op de Writer wil doen (een gedeelde Writer; een stack die in de
+    /// PUT parkeert). `None`: nog niet aan de beurt. Daarna [`Writer::renew_commit`].
+    pub fn renew_request(&mut self, now: Time) -> Result<Option<Renewal>> {
         if self.check(now).is_err() {
             self.lost = true;
             return Err(Error::LeaseLost);
         }
         let at = millis(now)?;
         if at.saturating_sub(self.confirmed) < self.ttl_ms / 6 {
-            return Ok(());
+            return Ok(None);
         }
-        let result = match self.discovery.renew_op(at) {
-            RenewOp::Write { prev, state } => {
-                let written = lease.write(&prev, &state);
-                match self.discovery.on_write(&state, written) {
-                    // Een vorige PUT kan wel geland zijn zonder dat wij zijn
-                    // ETag zagen. Alleen onze eigen eigenaar mag dan verder.
-                    Err(hop_discovery::Error::LeaseHeld) => self.reclaim(lease, at),
-                    other => other,
-                }
+        match self.discovery.renew_op(at) {
+            RenewOp::Write { prev, state } => Ok(Some(Renewal { at, prev, state })),
+            RenewOp::Claim => {
+                self.lost = true;
+                Err(Error::LeaseLost)
             }
-            RenewOp::Claim => Err(hop_discovery::Error::LeaseHeld),
-        };
-        match result {
+        }
+    }
+    /// De uitkomst van `lease.write(&renewal.prev, &renewal.state)`. Een
+    /// vorige PUT kan wel geland zijn zonder dat wij zijn ETag zagen: dan vraagt
+    /// [`Renewed::Reclaim`] om een `lease.read()` en [`Writer::reclaim_request`].
+    pub fn renew_commit(
+        &mut self,
+        renewal: &Renewal,
+        written: hop_discovery::Result<String>,
+    ) -> Result<Renewed> {
+        match self.discovery.on_write(&renewal.state, written) {
             Ok(()) => {
-                self.confirmed = at;
+                self.confirmed = renewal.at;
+                Ok(Renewed::Done)
+            }
+            Err(hop_discovery::Error::LeaseHeld) => Ok(Renewed::Reclaim),
+            Err(e) => Err(unreachable(e)),
+        }
+    }
+    /// Alleen onze eigen eigenaar en generatie mogen verder; `None` als er
+    /// niets te schrijven valt. Daarna `lease.write` en [`Writer::reclaim_commit`].
+    pub fn reclaim_request(
+        &mut self,
+        read: hop_discovery::Result<(LeaseState, String)>,
+        at: u64,
+    ) -> Result<Option<Renewal>> {
+        match &read {
+            Ok((state, _))
+                if state.owner == self.discovery.node_addr()
+                    && state.generation == self.generation => {}
+            Err(hop_discovery::Error::Unreachable) => {
+                return Err(unreachable(hop_discovery::Error::Unreachable));
+            }
+            _ => {
+                self.lost = true;
+                return Err(Error::LeaseLost);
+            }
+        }
+        match self.discovery.plan_claim(read, at) {
+            Claim::Write { prev, state } => Ok(Some(Renewal { at, prev, state })),
+            Claim::Fail(hop_discovery::Error::LeaseHeld) => {
+                self.lost = true;
+                Err(Error::LeaseLost)
+            }
+            Claim::Fail(e) => Err(unreachable(e)),
+        }
+    }
+    /// De uitkomst van de herovering.
+    pub fn reclaim_commit(
+        &mut self,
+        renewal: &Renewal,
+        written: hop_discovery::Result<String>,
+    ) -> Result {
+        match self.discovery.on_write(&renewal.state, written) {
+            Ok(()) => {
+                self.confirmed = renewal.at;
                 Ok(())
             }
             Err(hop_discovery::Error::LeaseHeld) => {
@@ -165,25 +234,6 @@ impl Writer {
                 Err(Error::LeaseLost)
             }
             Err(e) => Err(unreachable(e)),
-        }
-    }
-    fn reclaim<L: Backend>(&mut self, lease: &mut L, at: u64) -> hop_discovery::Result {
-        let read = lease.read();
-        match &read {
-            Ok((state, _))
-                if state.owner == self.discovery.node_addr()
-                    && state.generation == self.generation => {}
-            Err(hop_discovery::Error::Unreachable) => {
-                return Err(hop_discovery::Error::Unreachable);
-            }
-            _ => return Err(hop_discovery::Error::LeaseHeld),
-        }
-        match self.discovery.plan_claim(read, at) {
-            Claim::Write { prev, state } => {
-                let written = lease.write(&prev, &state);
-                self.discovery.on_write(&state, written)
-            }
-            Claim::Fail(e) => Err(e),
         }
     }
     /// Geeft de lease vrij, zodat een lezer meteen kan overnemen. Sluit SQL en
@@ -199,6 +249,24 @@ impl Writer {
             Err(e) => Err(unreachable(e)),
         }
     }
+}
+/// Eén voorwaardelijke schrijf van de lease, buiten de Writer om uit te voeren.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Renewal {
+    /// Het moment (Unix-milliseconden) waarop de vernieuwing is gepland.
+    pub at: u64,
+    /// De handle waarop de schrijf voorwaardelijk is.
+    pub prev: String,
+    /// De lease die geschreven wordt.
+    pub state: LeaseState,
+}
+/// Wat een bevestigde vernieuwing nog vraagt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Renewed {
+    /// De lease is tot de volgende deadline bevestigd.
+    Done,
+    /// Een eerdere PUT landde zonder gezien ETag: lees de lease en herover hem.
+    Reclaim,
 }
 /// De opslag van een lezer: alleen lezen, iedere write is `SQLITE_READONLY`.
 ///
