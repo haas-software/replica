@@ -4,12 +4,13 @@ use crate::{
     coverage::growth_gap,
     hash,
     local::{File, Name},
-    manifest::{MAX_PARTS, Part},
+    manifest::{MAX_PARTS, Part, field, hex, json_error, uint, unhex},
     object::{self, Store},
-    reserve, segment,
+    reserve, segment, string,
     tracking::Tracking,
 };
 use alloc::vec::Vec;
+use hop_types::json::{Object, Value};
 struct Chunk {
     offset: u64,
     len: usize,
@@ -54,28 +55,6 @@ impl Capture {
         snapshot: bool,
         previous_size: u64,
         segment_bytes: usize,
-    ) -> Result<Self> {
-        Self::read_with(
-            b,
-            path,
-            tracking,
-            snapshot,
-            previous_size,
-            segment_bytes,
-            &mut || Ok(()),
-        )
-    }
-    /// Als [`Capture::read`], met `tick` vóór elk segment: een snapshot van een
-    /// grote database duurt minuten, en wie de lease vasthoudt vernieuwt hem
-    /// daar (anders verloopt hij halverwege). Een fout uit `tick` breekt af.
-    pub fn read_with<B: replica_sqlite::Storage>(
-        b: &mut B,
-        path: Name,
-        tracking: &Tracking,
-        snapshot: bool,
-        previous_size: u64,
-        segment_bytes: usize,
-        tick: &mut dyn FnMut() -> Result,
     ) -> Result<Self> {
         if !(65536..=16 << 20).contains(&segment_bytes) {
             return Err(Error::Limit);
@@ -181,7 +160,6 @@ impl Capture {
         }
         // Ook een groottewijziging zonder pagina's krijgt een leeg segment.
         for index in 0..chunk_count {
-            tick()?;
             let from = (index * per_segment).min(page_count);
             let through = (from + per_segment).min(page_count);
             let numbers = if snapshot {
@@ -247,6 +225,93 @@ impl Capture {
     pub(crate) fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
+    /// Het beeld als record naast de spool, zodat een herstart de upload van een
+    /// snapshot hervat. Alleen snapshots: die hebben geen paginalijst.
+    pub(crate) fn record(&self) -> Result<Value> {
+        if !self.snapshot || !self.pages.is_empty() {
+            return Err(Error::State);
+        }
+        let push = |o: &mut Object, k, v| o.push(k, v).map_err(json_error);
+        let mut o = Object::new();
+        push(&mut o, "size", Value::uint(self.size))?;
+        push(&mut o, "page_size", Value::uint(u64::from(self.page_size)))?;
+        push(&mut o, "revision", Value::uint(self.revision))?;
+        push(&mut o, "counter", Value::uint(u64::from(self.counter)))?;
+        if let Some((page, digest)) = &self.witness {
+            push(&mut o, "witness_page", Value::uint(u64::from(*page)))?;
+            push(&mut o, "witness_hash", Value::String(hex_string(digest)?))?;
+        }
+        let mut chunks = Vec::new();
+        reserve(&mut chunks, self.chunks.len())?;
+        for chunk in &self.chunks {
+            let mut c = Object::new();
+            push(&mut c, "offset", Value::uint(chunk.offset))?;
+            push(&mut c, "len", Value::uint(chunk.len as u64))?;
+            push(&mut c, "sha256", Value::String(hex_string(&chunk.hash)?))?;
+            chunks.push(Value::Object(c));
+        }
+        push(&mut o, "chunks", Value::Array(chunks))?;
+        Ok(Value::Object(o))
+    }
+    pub(crate) fn from_record(o: &Object, spool: Name) -> Result<Self> {
+        let array = field(o, "chunks")?.as_array().ok_or(Error::Corrupt)?;
+        if array.is_empty() || array.len() > MAX_PARTS {
+            return Err(Error::Corrupt);
+        }
+        let mut chunks = Vec::new();
+        reserve(&mut chunks, array.len())?;
+        let mut end = 0_u64;
+        for v in array {
+            let c = v.as_object().ok_or(Error::Corrupt)?;
+            let offset = uint(c, "offset")?;
+            let len = usize::try_from(uint(c, "len")?).map_err(|_| Error::Corrupt)?;
+            if offset != end {
+                return Err(Error::Corrupt);
+            }
+            end = offset.checked_add(len as u64).ok_or(Error::Corrupt)?;
+            chunks.push(Chunk {
+                offset,
+                len,
+                hash: unhex(field(c, "sha256")?.as_str().ok_or(Error::Corrupt)?)?,
+            });
+        }
+        let page_size = u32::try_from(uint(o, "page_size")?).map_err(|_| Error::Corrupt)?;
+        if !segment::valid_page_size(page_size) {
+            return Err(Error::Corrupt);
+        }
+        let witness = match (o.get("witness_page"), o.get("witness_hash")) {
+            (Some(_), Some(h)) => Some((
+                u32::try_from(uint(o, "witness_page")?).map_err(|_| Error::Corrupt)?,
+                unhex(h.as_str().ok_or(Error::Corrupt)?)?,
+            )),
+            _ => None,
+        };
+        Ok(Self {
+            spool,
+            chunks,
+            size: uint(o, "size")?,
+            page_size,
+            revision: uint(o, "revision")?,
+            snapshot: true,
+            counter: u32::try_from(uint(o, "counter")?).map_err(|_| Error::Corrupt)?,
+            witness,
+            pages: Vec::new(),
+        })
+    }
+    /// Waar de spool eindigt; een hervatting eist dat het bestand zo groot is.
+    pub(crate) fn spool_end(&self) -> u64 {
+        self.chunks
+            .last()
+            .map_or(0, |c| c.offset.saturating_add(c.len as u64))
+    }
+    pub(crate) fn spool(&self) -> &Name {
+        &self.spool
+    }
+    /// Een hervatting na een herstart telt alles wat sindsdien dirty werd als
+    /// ná dit beeld geschreven; de revisie is dan de huidige.
+    pub(crate) fn resumed_at(&mut self, revision: u64) {
+        self.revision = revision;
+    }
     /// Uploadt naar een verse `.../data/<poging>/`-prefix, manifest komt later.
     /// Het geheugen houdt hoogstens één segment, niet een tweede hele database.
     pub fn upload<B: replica_sqlite::Storage, S: Store>(
@@ -260,17 +325,12 @@ impl Capture {
         }
         let mut parts = Vec::new();
         reserve(&mut parts, self.chunks.len())?;
+        // Wat een eerdere, onderbroken poging al onder deze prefix zette, blijft
+        // staan: zelfde sleutel en grootte is hetzelfde deel (de hash komt uit de
+        // spool die sindsdien niet veranderde).
+        let mut present = store.list(prefix, MAX_PARTS)?;
+        present.sort_unstable_by(|a, c| a.key.cmp(&c.key));
         for (i, chunk) in self.chunks.iter().enumerate() {
-            let mut bytes = Vec::new();
-            reserve(&mut bytes, chunk.len)?;
-            bytes.resize(chunk.len, 0);
-            let mut source = File::open(b, &self.spool, false)?;
-            source.read(chunk.offset, &mut bytes)?;
-            source.close()?;
-            // encode valideerde het segment; de hash bewijst dat de spool gelijk bleef.
-            if hash(&bytes) != chunk.hash {
-                return Err(Error::Corrupt);
-            }
             let mut name = *b"000000.seg";
             let mut n = i + 1;
             for b in name[..6].iter_mut().rev() {
@@ -281,13 +341,31 @@ impl Capture {
                 prefix,
                 core::str::from_utf8(&name).map_err(|_| Error::State)?,
             )?;
-            store.put(&key, &bytes)?;
+            let uploaded = present
+                .binary_search_by(|o| o.key.as_str().cmp(key.as_str()))
+                .is_ok_and(|at| present[at].size == Some(chunk.len as u64));
+            if !uploaded {
+                let mut bytes = Vec::new();
+                reserve(&mut bytes, chunk.len)?;
+                bytes.resize(chunk.len, 0);
+                let mut source = File::open(b, &self.spool, false)?;
+                source.read(chunk.offset, &mut bytes)?;
+                source.close()?;
+                // encode valideerde het segment; de hash bewijst dat de spool gelijk bleef.
+                if hash(&bytes) != chunk.hash {
+                    return Err(Error::Corrupt);
+                }
+                store.put(&key, &bytes)?;
+            }
             parts.push(Part {
                 key,
-                size: bytes.len() as u64,
+                size: chunk.len as u64,
                 hash: chunk.hash,
             });
         }
         Ok(parts)
     }
+}
+fn hex_string(hash: &[u8; 32]) -> Result<alloc::string::String> {
+    string(core::str::from_utf8(&hex(hash)).map_err(|_| Error::Corrupt)?)
 }

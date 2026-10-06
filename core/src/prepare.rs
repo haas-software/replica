@@ -5,7 +5,9 @@ use crate::{
     manifest::Layout,
     marker::{self, LocalMarker, Marker},
     object::{self, Store, StoreError},
-    replication, restore, string,
+    replication,
+    replication::Batch,
+    restore, string,
     time::Time,
     tracking::Tracking,
 };
@@ -241,7 +243,20 @@ pub fn run<B: Storage, S: Store>(
             return Err(Error::Unproven);
         }
     }
-    if !local.value.complete {
+    // Een onderbroken snapshot met een intacte spool en record wordt hervat:
+    // de marker blijft bij die generatie. Het dirty log draagt de laatste
+    // bevestigde commit (de vorige generatie, of niets vóór de eerste snapshot),
+    // dus daar herstelt de tracking van; de paginagrootte komt uit het record
+    // zolang de marker er nog geen heeft.
+    let resumable = if local.value.complete {
+        None
+    } else {
+        Batch::load_pending(b, options.path, &local)?.map(|(batch, _)| batch.page_size())
+    };
+    if resumable.is_some() {
+        local.value.clean = false;
+    }
+    if !local.value.complete && resumable.is_none() {
         let previous = local.value.previous.first().filter(|old| {
             remote
                 .as_ref()
@@ -255,13 +270,19 @@ pub fn run<B: Storage, S: Store>(
             None => return fresh(b, &options, "", Reason::NewSnapshot),
         }
     }
+    // Na de terugval naar de vorige generatie: het log draagt de laatste
+    // bevestigde commit, bij een hervatte eerste snapshot nog niets.
+    let (recover_generation, recover_sequence) = match (&resumable, local.value.previous.first()) {
+        (Some(_), Some(old)) => (string(&old.generation)?, old.sequence),
+        (Some(_), None) => (String::new(), 0),
+        (None, _) => (string(&local.value.generation)?, local.value.sequence),
+    };
     let mut tracking = Tracking::new(options.path, options.page_limit)?;
-    match tracking.recover(
-        b,
-        &local.value.generation,
-        local.value.sequence,
-        local.value.page_size,
-    ) {
+    let page_size = match resumable {
+        Some(size) if local.value.page_size == 0 => size,
+        _ => local.value.page_size,
+    };
+    match tracking.recover(b, &recover_generation, recover_sequence, page_size) {
         Ok(()) => {}
         Err(Error::Corrupt | Error::Limit) if local.value.clean => {
             tracking = Tracking::new(options.path, options.page_limit)?;

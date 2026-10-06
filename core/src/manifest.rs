@@ -82,7 +82,7 @@ pub fn hex(hash: &[u8; 32]) -> [u8; 64] {
     }
     out
 }
-fn unhex(s: &str) -> Result<[u8; 32]> {
+pub(crate) fn unhex(s: &str) -> Result<[u8; 32]> {
     if s.len() != 64 {
         return Err(Error::Corrupt);
     }

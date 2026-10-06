@@ -12,7 +12,9 @@ use crate::{
     tracking::{Tracked, Tracking},
     writer::{Backend, Writer},
 };
+use alloc::rc::Rc;
 use alloc::string::String;
+use core::cell::RefCell;
 use replica_sqlite::Storage;
 /// Configuratie vóór Prepare. De app bezit transport, klok en entropie.
 pub struct Config {
@@ -112,13 +114,18 @@ pub struct Status {
 /// Deze bibliotheek verstopt geen achtergrondtaak of runtime.
 pub struct Replica {
     config: Config,
-    writer: Writer,
+    /// Gedeeld met de leasetaak van de host: die vernieuwt de lease op haar
+    /// eigen stack, hoe lang een capture of upload hier ook duurt.
+    writer: Rc<RefCell<Writer>>,
     prepared: Prepared,
     status: Status,
     maintenance_at: Option<Time>,
     closed: bool,
     pending: bool,
     maintaining: bool,
+    /// Een onderbroken snapshot-upload van vóór de herstart; [`Replica::begin`]
+    /// geeft hem terug in plaats van een nieuwe capture te maken.
+    resumable: Option<Pending>,
 }
 /// Een onderhoudsbeurt als losse taak: alleen de store (en willekeur voor
 /// poging-id's), nooit SQLite, marker of tracking. De frontier is bij
@@ -194,9 +201,21 @@ impl Replica {
         now: Time,
         verify: impl FnMut(&mut B, &Name) -> Result,
     ) -> Result<Self> {
+        Self::prepare_shared(b, store, Rc::new(RefCell::new(writer)), config, now, verify)
+    }
+    /// Als [`Replica::prepare`], met een lease die de host al deelt met zijn
+    /// leasetaak: die vernieuwt dan ook tijdens een lang herstel in Prepare.
+    pub fn prepare_shared<B: Storage, S: Store>(
+        b: &mut B,
+        store: &mut S,
+        writer: Rc<RefCell<Writer>>,
+        config: Config,
+        now: Time,
+        verify: impl FnMut(&mut B, &Name) -> Result,
+    ) -> Result<Self> {
         config.validate()?;
-        writer.check(now)?;
-        let prepared = prepare::run(
+        writer.borrow().check(now)?;
+        let mut prepared = prepare::run(
             b,
             store,
             prepare::Options {
@@ -209,6 +228,16 @@ impl Replica {
             },
             verify,
         )?;
+        let resumable = match Batch::load_pending(b, config.path, &prepared.marker)? {
+            Some((mut batch, staged)) => {
+                // Wat sinds de capture dirty werd, blijft dirty bij de bevestiging:
+                // het beeld krijgt de huidige revisie, de tracking gaat er één voorbij.
+                batch.resumed_at(prepared.tracking.revision());
+                prepared.tracking.resume_capture()?;
+                Some(Pending { batch, staged })
+            }
+            None => None,
+        };
         let status = Status {
             reason: prepared.reason,
             attempted: None,
@@ -224,7 +253,12 @@ impl Replica {
             closed: false,
             pending: false,
             maintaining: false,
+            resumable,
         })
+    }
+    /// Of de volgende [`Replica::begin`] een onderbroken snapshot hervat.
+    pub fn resumes(&self) -> bool {
+        self.resumable.is_some()
     }
     /// De getrackte VFS. De lening sluit gelijktijdig synchroniseren of sluiten uit.
     /// Na de leasedeadline weigert de VFS iedere write met `SQLITE_READONLY`.
@@ -241,7 +275,7 @@ impl Replica {
     }
     /// De deadline op de klok van de opslag, of een harde fout als die voorbij is.
     fn fence<B: Storage>(&self, b: &mut B) -> Result<i64> {
-        let deadline = i64::try_from(self.writer.deadline()).map_err(|_| Error::Limit)?;
+        let deadline = i64::try_from(self.writer.borrow().deadline()).map_err(|_| Error::Limit)?;
         if b.unix_millis()? >= deadline {
             return Err(Error::LeaseLost);
         }
@@ -250,21 +284,25 @@ impl Replica {
     /// Vernieuwt de schrijverlease op leeftijd; zie [`Writer::renew`]. Na
     /// verlies is deze eigenaar permanent dicht.
     pub fn renew<L: Backend>(&mut self, lease: &mut L, now: Time) -> Result {
-        let result = self.writer.renew(lease, now);
+        let result = self.writer.borrow_mut().renew(lease, now);
         if result == Err(Error::LeaseLost) {
             self.closed = true;
         }
         result
     }
     /// De lease van deze eigenaar, met het fencing-token.
-    pub fn writer(&self) -> &Writer {
-        &self.writer
+    pub fn writer(&self) -> core::cell::Ref<'_, Writer> {
+        self.writer.borrow()
     }
     /// Sluit deze eigenaar en geeft de lease vrij, zodat een lezer meteen kan
     /// overnemen. SQLite is dan al gesloten.
     pub fn release<L: Backend>(mut self, lease: &mut L) -> Result {
         self.close();
-        self.writer.release(lease)
+        match Rc::try_unwrap(self.writer) {
+            Ok(writer) => writer.into_inner().release(lease),
+            // De leasetaak houdt het handvat nog vast: laat de lease verlopen.
+            Err(_) => Ok(()),
+        }
     }
     /// Onveranderlijke marker voor status, archiefcatalogus en diagnose.
     pub fn marker(&self) -> &Marker {
@@ -305,7 +343,7 @@ impl Replica {
         {
             return Err(Error::State);
         }
-        self.writer.check(now)
+        self.writer.borrow().check(now)
     }
     /// Eén expliciete synchronisatie op de eigenaar: capture, upload en afronding
     /// in één beurt. Wie SQL wil laten doorlopen tijdens de upload van de delen
@@ -321,7 +359,7 @@ impl Replica {
             return Err(Error::State);
         }
         self.status.attempted = Some(now);
-        let result = match self.capture(b, store, now, &mut |_| Ok(())) {
+        let result = match self.capture(b, store, now) {
             Ok(Some(pending)) => pending
                 .upload(b, store)
                 .and_then(|uploaded| self.complete(b, store, pending, uploaded, now)),
@@ -341,29 +379,25 @@ impl Replica {
         store: &mut S,
         now: Time,
     ) -> Result<Option<Pending>> {
-        self.begin_with(b, store, now, &mut |_| Ok(()))
-    }
-    /// Als [`Replica::begin`], met `renew` vóór elk segment van de capture. Een
-    /// snapshot van een grote database duurt langer dan de leasedeadline; wie
-    /// hier [`Writer::renew`] aanroept, houdt de lease tijdens de capture vast.
-    /// Een fout uit `renew` (de lease is weg) breekt de capture af.
-    pub fn begin_with<B: Storage, S: Store>(
-        &mut self,
-        b: &mut B,
-        store: &mut S,
-        now: Time,
-        renew: &mut dyn FnMut(&mut Writer) -> Result,
-    ) -> Result<Option<Pending>> {
         self.clock(now)?;
         if self.pending {
             return Err(Error::State);
         }
         // Een onderhoudstaak loopt: de volgende beurt wacht tot die klaar is.
-        if self.maintaining || !self.due(now) {
+        if self.maintaining {
+            return Ok(None);
+        }
+        // Een onderbroken snapshot gaat voor: de delen die er al staan blijven.
+        if let Some(pending) = self.resumable.take() {
+            self.status.attempted = Some(now);
+            self.pending = true;
+            return Ok(Some(pending));
+        }
+        if !self.due(now) {
             return Ok(None);
         }
         self.status.attempted = Some(now);
-        match self.capture(b, store, now, renew) {
+        match self.capture(b, store, now) {
             Ok(Some(pending)) => {
                 self.pending = true;
                 Ok(Some(pending))
@@ -505,7 +539,6 @@ impl Replica {
         b: &mut B,
         store: &mut S,
         now: Time,
-        renew_lease: &mut dyn FnMut(&mut Writer) -> Result,
     ) -> Result<Option<Pending>> {
         if self.prepared.marker.value.uncertain != 0
             && let Err(e) =
@@ -527,15 +560,12 @@ impl Replica {
             replication::renew(b, &mut self.prepared.marker, now)?;
             self.maintenance_at = None;
         }
-        let writer = &mut self.writer;
-        let mut tick = || renew_lease(writer);
-        let batch = match Batch::capture_with(
+        let batch = match Batch::capture(
             b,
             self.config.path,
             &self.prepared.tracking,
             &self.prepared.marker,
             self.config.segment_bytes,
-            &mut tick,
         ) {
             Ok(Some(batch)) => {
                 // De bron was tijdens de capture exclusief: wat nu nog
@@ -551,6 +581,7 @@ impl Replica {
             Err(e) => return Err(e),
         };
         let staged = batch.stage(b, &self.config.namespace, &self.prepared.marker, now)?;
+        batch.save_pending(b, self.config.path, &staged)?;
         Ok(Some(Pending { batch, staged }))
     }
     /// Manifest en marker na de upload, daarna het onderhoud.
@@ -575,6 +606,7 @@ impl Replica {
         ) {
             return Err(self.archive_error(b, e));
         }
+        Batch::clear_pending(b, self.config.path)?;
         let mut result = if self.config.background_maintenance {
             Synced::default()
         } else {

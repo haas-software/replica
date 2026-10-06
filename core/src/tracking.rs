@@ -241,6 +241,18 @@ impl Tracking {
     pub fn captured(&mut self) {
         self.rewritten.clear();
     }
+    /// Een hervatte capture na een herstart: wat sindsdien geschreven is, staat
+    /// niet meer per pagina bekend, dus elke dirty pagina blijft dirty als de
+    /// bevestiging komt (een veilige superset).
+    pub fn resume_capture(&mut self) -> Result {
+        for page in self.dirty.numbers()? {
+            self.rewritten.add(page)?;
+        }
+        // Een revisie verder dan het beeld: de bevestiging neemt dan nooit het
+        // pad "niets geschreven sinds de capture" dat de hele dirty set wist.
+        self.revision = self.revision.checked_add(1).ok_or(Error::Limit)?;
+        Ok(())
+    }
     /// Bevestigt een gepubliceerde capture. Zonder writes erna wordt de hele
     /// dirty set leeg; met writes erna vallen alleen de meegenomen pagina's weg
     /// die sindsdien niet opnieuw geschreven zijn (en pagina's voorbij de

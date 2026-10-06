@@ -2,7 +2,7 @@
 use crate::{
     Error, Result,
     capture::Capture,
-    local::Name,
+    local::{self, Name},
     manifest::{Manifest, Part},
     marker::{self, LocalMarker, Marker},
     object::{self, Store, StoreError},
@@ -12,7 +12,12 @@ use crate::{
 };
 use alloc::{string::String, vec::Vec};
 use core::fmt::Write;
+use hop_types::json::{self, Object, Value};
 use replica_sqlite::Storage;
+/// Het record van een onderbroken snapshot-upload naast de spool.
+const PENDING_SUFFIX: &str = ".replica-pending";
+/// Ruim onder de spoolgrootte; 32768 delen van ~100 bytes.
+const PENDING_BYTES: usize = 4 << 20;
 /// Een capture blijft aan precies één generatie en voorganger gekoppeld.
 pub struct Batch {
     capture: Capture,
@@ -66,17 +71,6 @@ impl Batch {
         local: &LocalMarker,
         segment_bytes: usize,
     ) -> Result<Option<Self>> {
-        Self::capture_with(b, path, tracking, local, segment_bytes, &mut || Ok(()))
-    }
-    /// Als [`Batch::capture`], met `tick` vóór elk segment (zie [`Capture::read_with`]).
-    pub fn capture_with<B: Storage>(
-        b: &mut B,
-        path: Name,
-        tracking: &Tracking,
-        local: &LocalMarker,
-        segment_bytes: usize,
-        tick: &mut dyn FnMut() -> Result,
-    ) -> Result<Option<Self>> {
         if local.value.generation.is_empty() || local.value.uncertain != 0 {
             return Err(Error::State);
         }
@@ -84,14 +78,13 @@ impl Batch {
             return Err(Error::State);
         }
         let generation = string(&local.value.generation)?;
-        let capture = Capture::read_with(
+        let capture = Capture::read(
             b,
             path,
             tracking,
             !local.value.complete,
             local.value.size,
             segment_bytes,
-            tick,
         )?;
         if capture.is_empty() {
             return Ok(None);
@@ -106,6 +99,119 @@ impl Batch {
             generation,
             previous_sequence: local.value.sequence,
         }))
+    }
+    /// Legt een snapshot-capture met zijn poging-prefix duurzaam naast de spool,
+    /// zodat een herstart de upload hervat waar hij ophield. Een increment is
+    /// goedkoop en begint gewoon opnieuw: dan wordt het record leeg.
+    pub fn save_pending<B: Storage>(&self, b: &mut B, path: Name, staged: &Staged) -> Result {
+        let name = path.suffix(PENDING_SUFFIX)?;
+        if !self.capture.snapshot {
+            return local::write(b, &name, b"");
+        }
+        let push = |o: &mut Object, k, v| o.push(k, v).map_err(crate::manifest::json_error);
+        let mut o = Object::new();
+        push(&mut o, "version", Value::uint(1))?;
+        push(&mut o, "id", Value::String(hex_id(&self.id)?))?;
+        push(
+            &mut o,
+            "generation",
+            Value::String(string(&self.generation)?),
+        )?;
+        push(&mut o, "previous_seq", Value::uint(self.previous_sequence))?;
+        push(
+            &mut o,
+            "namespace",
+            Value::String(string(&staged.namespace)?),
+        )?;
+        push(&mut o, "prefix", Value::String(string(&staged.prefix)?))?;
+        push(
+            &mut o,
+            "data_prefix",
+            Value::String(string(&staged.data_prefix)?),
+        )?;
+        push(&mut o, "capture", self.capture.record()?)?;
+        let text = json::to_string(&Value::Object(o)).map_err(crate::manifest::json_error)?;
+        if text.len() > PENDING_BYTES {
+            return Err(Error::Limit);
+        }
+        local::write(b, &name, text.as_bytes())
+    }
+    /// Geen hervatting meer mogelijk of nodig.
+    pub fn clear_pending<B: Storage>(b: &mut B, path: Name) -> Result {
+        let name = path.suffix(PENDING_SUFFIX)?;
+        if b.exists(name.cstr()?)? {
+            local::write(b, &name, b"")?;
+        }
+        Ok(())
+    }
+    /// Het record van een onderbroken snapshot bij precies deze marker (zelfde
+    /// generatie en voorganger, geen onzekere commit) met een intacte spool;
+    /// anders niets, en dan begint de snapshot opnieuw.
+    pub fn load_pending<B: Storage>(
+        b: &mut B,
+        path: Name,
+        local: &LocalMarker,
+    ) -> Result<Option<(Self, Staged)>> {
+        let name = path.suffix(PENDING_SUFFIX)?;
+        if local.value.complete || !b.exists(name.cstr()?)? {
+            return Ok(None);
+        }
+        let bytes = local::read(b, &name, PENDING_BYTES)?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let value = json::parse(&bytes).map_err(crate::manifest::json_error)?;
+        let o = value.as_object().ok_or(Error::Corrupt)?;
+        if crate::manifest::uint(o, "version")? != 1 {
+            return Ok(None);
+        }
+        let text = |k| -> Result<String> {
+            string(
+                crate::manifest::field(o, k)?
+                    .as_str()
+                    .ok_or(Error::Corrupt)?,
+            )
+        };
+        let generation = text("generation")?;
+        let previous_sequence = crate::manifest::uint(o, "previous_seq")?;
+        if generation != local.value.generation
+            || previous_sequence != local.value.sequence
+            || local.value.uncertain != 0
+        {
+            return Ok(None);
+        }
+        let record = crate::manifest::field(o, "capture")?
+            .as_object()
+            .ok_or(Error::Corrupt)?;
+        let capture = Capture::from_record(record, path.suffix(".replica-capture")?)?;
+        let mut spool = local::File::open(b, capture.spool(), false)?;
+        let intact = spool.size()? >= capture.spool_end();
+        spool.close()?;
+        if !intact {
+            return Ok(None);
+        }
+        let id = unhex_id(&text("id")?)?;
+        let batch = Self {
+            capture,
+            id,
+            generation,
+            previous_sequence,
+        };
+        let staged = Staged {
+            batch_id: id,
+            namespace: text("namespace")?,
+            prefix: text("prefix")?,
+            data_prefix: text("data_prefix")?,
+        };
+        Ok(Some((batch, staged)))
+    }
+    /// De paginagrootte van het beeld, voor een marker die er nog geen heeft.
+    pub fn page_size(&self) -> u32 {
+        self.capture.page_size
+    }
+    /// Een hervatte capture na een herstart (zie [`Tracking::resume_capture`]).
+    pub fn resumed_at(&mut self, revision: u64) {
+        self.capture.resumed_at(revision);
     }
     fn check(&self, local: &LocalMarker) -> Result {
         if local.value.generation != self.generation
@@ -370,4 +476,26 @@ pub fn resolve<B: Storage, S: Store>(
     local.value.clean = false;
     local.save(b)?;
     Ok(landed)
+}
+fn hex_id(id: &[u8; 16]) -> Result<String> {
+    let mut out = String::new();
+    for b in id {
+        write!(out, "{b:02x}").map_err(|_| Error::Memory)?;
+    }
+    Ok(out)
+}
+fn unhex_id(s: &str) -> Result<[u8; 16]> {
+    if s.len() != 32 {
+        return Err(Error::Corrupt);
+    }
+    let mut out = [0; 16];
+    for (dst, pair) in out.iter_mut().zip(s.as_bytes().chunks_exact(2)) {
+        let nibble = |b: u8| match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            _ => Err(Error::Corrupt),
+        };
+        *dst = nibble(pair[0])? * 16 + nibble(pair[1])?;
+    }
+    Ok(out)
 }
