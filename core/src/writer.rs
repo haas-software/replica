@@ -116,10 +116,15 @@ impl Writer {
             .saturating_add(self.ttl_ms)
             .saturating_sub(self.ttl_ms / 3)
     }
-    /// Een harde fout zodra de lease verloren is of de deadline voorbij.
+    /// Een harde fout zodra de lease verloren is of de deadline voorbij. Een
+    /// bevestiging mag iets vóór `now` liggen: de eigenaar meet `now` aan het
+    /// begin van een beurt, een vernieuwing midden in een capture meet later
+    /// (Spin 06-10-2026: LeaseLost direct na een geslaagde capture). Meer dan
+    /// een zesde TTL terug is wel een klok die terugspringt.
     pub fn check(&self, now: Time) -> Result {
         let at = millis(now)?;
-        if self.lost || at < self.confirmed || at >= self.deadline() {
+        if self.lost || self.confirmed.saturating_sub(at) > self.ttl_ms / 6 || at >= self.deadline()
+        {
             return Err(Error::LeaseLost);
         }
         Ok(())
@@ -135,7 +140,7 @@ impl Writer {
             return Err(Error::LeaseLost);
         }
         let at = millis(now)?;
-        if at - self.confirmed < self.ttl_ms / 6 {
+        if at.saturating_sub(self.confirmed) < self.ttl_ms / 6 {
             return Ok(());
         }
         let result = match self.discovery.renew_op(at) {
