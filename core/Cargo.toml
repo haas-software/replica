@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 replica-sqlite = { path = "../sqlite" }
 hop-types = { package = "types", git = "https://github.com/xinix00/hop.git", tag = "v3.0.9" }
-leancrypto = { git = "https://github.com/xinix00/lean.git", tag = "v3.1.12" }
+leancrypto = { git = "https://github.com/xinix00/lean.git", tag = "v3.1.13" }
 hop-discovery = { package = "discovery", git = "https://github.com/xinix00/hop.git", tag = "v3.0.9" }
 [lints]
 workspace = true
