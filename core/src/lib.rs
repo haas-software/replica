@@ -81,6 +81,7 @@ pub(crate) fn string(s: &str) -> Result<String> {
     out.push_str(s);
     Ok(out)
 }
-pub(crate) fn hash(data: &[u8]) -> [u8; 32] {
+/// SHA-256 van `data`, zoals delen en segmenten gehasht worden.
+pub fn hash(data: &[u8]) -> [u8; 32] {
     leancrypto::sha256::Sha256::digest(data)
 }

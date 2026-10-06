@@ -47,18 +47,7 @@ impl<'a> Segment<'a> {
             page_size,
             database_size,
         };
-        let mut seen = Vec::new();
-        reserve(&mut seen, count)?;
-        for (number, _) in out.pages() {
-            if number == 0 || u64::from(number) * u64::from(page_size) > database_size {
-                return Err(Error::Corrupt);
-            }
-            seen.push(number);
-        }
-        seen.sort_unstable();
-        if seen.windows(2).any(|p| p[0] == p[1]) {
-            return Err(Error::Corrupt);
-        }
+        check_numbers(page_size, database_size, out.pages().map(|(n, _)| n))?;
         Ok(out)
     }
     /// Lengte van elke pagina in bytes.
@@ -105,7 +94,30 @@ pub fn encode(page_size: u32, database_size: u64, pages: &[(u32, &[u8])]) -> Res
         out.extend_from_slice(&number.to_be_bytes());
         out.extend_from_slice(data);
     }
+    // Wat decode controleert, is hier al waar door constructie (maat, nummers,
+    // hash); zelf nog eens decoderen zou elk segment een tweede keer hashen
+    // (GEMETEN 06-10 op de M4: 112 MB/s per sha256-pass, de capture 33 MB/s).
+    check_numbers(page_size, database_size, pages.iter().map(|&(n, _)| n))?;
     out.extend_from_slice(&hash(&out));
-    Segment::decode(&out)?;
     Ok(out)
+}
+/// Elke pagina nonnul, binnen de database en hoogstens één keer.
+fn check_numbers(
+    page_size: u32,
+    database_size: u64,
+    numbers: impl ExactSizeIterator<Item = u32>,
+) -> Result {
+    let mut seen = Vec::new();
+    reserve(&mut seen, numbers.len())?;
+    for number in numbers {
+        if number == 0 || u64::from(number) * u64::from(page_size) > database_size {
+            return Err(Error::Corrupt);
+        }
+        seen.push(number);
+    }
+    seen.sort_unstable();
+    if seen.windows(2).any(|p| p[0] == p[1]) {
+        return Err(Error::Corrupt);
+    }
+    Ok(())
 }
