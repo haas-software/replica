@@ -61,6 +61,18 @@ pub fn points<S: Store>(
     current: &marker::Marker,
     limit: usize,
 ) -> Result<Vec<Point>> {
+    points_at(store, namespace, &current.generation, current.complete, limit)
+}
+/// Als [`points`], met alleen wat van de marker telt: de huidige generatie en
+/// of die compleet is. Zo draait een host dit buiten de eigenaar (één listing
+/// per generatie; GEMETEN 07-10 bij 55 generaties: minuten).
+pub fn points_at<S: Store>(
+    store: &mut S,
+    namespace: &str,
+    current_generation: &str,
+    current_complete: bool,
+    limit: usize,
+) -> Result<Vec<Point>> {
     if limit == 0 || limit > MAX_POINTS {
         return Err(Error::Limit);
     }
@@ -70,10 +82,17 @@ pub fn points<S: Store>(
         let layout = match object::layout(store, &prefix) {
             Ok(layout) => layout,
             Err(Error::Legacy) => continue,
-            Err(Error::Corrupt) if generation != current.generation => continue,
+            Err(Error::Corrupt) if generation != current_generation => continue,
             Err(e) => return Err(e),
         };
-        append(&mut out, &layout, &generation, current, limit)?;
+        append(
+            &mut out,
+            &layout,
+            &generation,
+            current_generation,
+            current_complete,
+            limit,
+        )?;
     }
     out.sort_unstable_by(|a, b| {
         b.at.cmp(&a.at)
@@ -86,7 +105,8 @@ fn append(
     out: &mut Vec<Point>,
     layout: &Layout,
     generation: &str,
-    current: &marker::Marker,
+    current_generation: &str,
+    current_complete: bool,
     limit: usize,
 ) -> Result {
     let snapshot = layout.snapshot();
@@ -114,7 +134,7 @@ fn append(
             generation: string(generation)?,
             at,
             level,
-            current: current.complete && generation == current.generation,
+            current: current_complete && generation == current_generation,
         });
     }
     Ok(())
