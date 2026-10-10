@@ -32,7 +32,8 @@ pub struct Stats {
     pub bytes: u64,
 }
 fn millis<B: replica_sqlite::Storage>(b: &mut B) -> u64 {
-    b.unix_millis().map_or(0, |ms| u64::try_from(ms).unwrap_or(0))
+    b.unix_millis()
+        .map_or(0, |ms| u64::try_from(ms).unwrap_or(0))
 }
 /// Eén consistent databasebeeld of dirty-setbeeld, los van de actieve SQLite-engine.
 /// De eigenaar laat maximaal één capture tegelijk publiceren; een nieuwere spool
@@ -485,7 +486,10 @@ impl Plan {
         let mut output = File::open(b, &self.spool, false)?;
         output.sync()?;
         output.close()?;
-        self.stats.write_ms = self.stats.write_ms.saturating_add(millis(b).saturating_sub(t4));
+        self.stats.write_ms = self
+            .stats
+            .write_ms
+            .saturating_add(millis(b).saturating_sub(t4));
         self.shadow.borrow_mut().finished();
         let pages = {
             let mut shadow = self.shadow.borrow_mut();

@@ -151,6 +151,33 @@ db.execute(c"CREATE TABLE IF NOT EXISTS item(id INTEGER PRIMARY KEY, title TEXT)
 foutinjectie. De app moet een betrouwbare UTC-klok en entropiebron leveren.
 De deterministische testomgeving is geen productie-entropyprovider.
 
+### Veel databases, één engine (v3.0.1)
+
+Een app met een database per tenant initialiseert één engine en opent per
+database een verbinding met `Engine::open_with(path, &mut backend)`: de engine
+gedeeld geleend, de opslag van die verbinding exclusief, elk met een eigen
+VFS `replica-<n>` in de C-shim. Elke verbinding mag op een eigen
+`applib::stacktask` parkeren terwijl de andere SQL doen; het
+veiligheidsargument staat in de moduledocs van `replica-sqlite`, de toets in
+`hopos/tests/interleave.rs` (twee stacks die bij elke callback wisselen).
+
+De eigenaar is los van de VFS: `Replica::tracker()` geeft de SQL-kant
+(`Tracker::vfs(&mut storage)`) en de `Replica` blijft bij de Sync-taak. Zolang
+de verbinding openstaat, lopen `begin`/`finish`/`tick`/`maintenance_*` alleen
+terwijl de SQL-kant in rust is (geen lopend statement, geen open transactie);
+de upload, `Capturing::run`, `Maintenance::run` en `renew` mogen altijd. Wie
+het protocol schendt, krijgt `Error::Busy` (eigenaar) of `SQLITE_BUSY` (VFS),
+nooit een halve wijziging. Zie de moduledocs van `owner` en
+`core/tests/owner_split.rs`.
+
+S3 vanuit een app-slot: `replica_hopos::s3::store(&endpoint, Wait(s))` is een
+`replica_s3::S3` over `leans3http::Http` over Lean's `WebDial` over
+`applib::tcp::Dialer`, met `MOZILLA_ROOTS`, de wandklok van de app en een
+`applib::rand::Rng` per verbinding; `store.lease(key, ttl)` is de hop-lease
+erover. Op de host (feature `std`): `replica_sqlite::host::Dir` (bestanden,
+`fsync`, mapbarrière) en `replica_core::host::{Dir, DirLease}` (objectstore en
+lease in een map).
+
 ## Grenzen
 
 Alle allocaties voor buffers/metadata zijn faalbaar en expliciet begrensd.

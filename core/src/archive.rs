@@ -61,7 +61,13 @@ pub fn points<S: Store>(
     current: &marker::Marker,
     limit: usize,
 ) -> Result<Vec<Point>> {
-    points_at(store, namespace, &current.generation, current.complete, limit)
+    points_at(
+        store,
+        namespace,
+        &current.generation,
+        current.complete,
+        limit,
+    )
 }
 /// Als [`points`], met alleen wat van de marker telt: de huidige generatie en
 /// of die compleet is. Zo draait een host dit buiten de eigenaar (één listing

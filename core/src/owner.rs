@@ -1,4 +1,49 @@
 //! De expliciete Replica-levensloop van één app-eigenaar; geen verborgen threads.
+//!
+//! # De eigenaar los van de VFS
+//!
+//! De SQL-kant (een verbinding op haar eigen stack) en de Sync-kant (capture,
+//! upload, onderhoud en de lease, op een andere stack) delen twee dingen: de
+//! tracking met de lokale marker ([`State`], in een `Rc<RefCell<..>>`) en de
+//! lease ([`Writer`], ook gedeeld, zoals de leasetaak hem al deelde). De
+//! [`Vfs`] die [`Replica::vfs`] (of [`Tracker::vfs`]) geeft, leent de eigenaar
+//! dus niet meer: hij houdt eigen handvatten op die gedeelde staat, en de
+//! eigenaar blijft vrij voor `tick`, `begin`, `finish`, `renew` en het
+//! onderhoud terwijl de verbinding openstaat.
+//!
+//! Het handboek (§1.2) noemt gedeeld eigendom een teken dat de eigenaar nog
+//! niet gekozen is. Hier is hij gekozen, alleen niet in de tijd: in rust is de
+//! staat van de eigenaar, midden in een SQL-callback van de VFS. Dat is het
+//! rustprotocol, en de `RefCell` is de controle erop.
+//!
+//! ## Het rustprotocol
+//!
+//! - **De VFS** leent de staat alleen binnen één callback (open, write,
+//!   truncate, sync, remove), en houdt die lening wél vast over de opslag-I/O
+//!   van die callback heen (de dirty log, de marker, de schaduw). Een callback
+//!   die de staat niet kan lenen, geeft `SQLITE_BUSY` zonder I/O.
+//! - **De eigenaar** leent de staat in [`Replica::sync`], [`Replica::tick`],
+//!   [`Replica::begin`], [`Replica::begin_capture`], [`Replica::abandon`],
+//!   [`Replica::finish`], [`Replica::maintenance_begin`] en
+//!   [`Replica::maintenance_finish`], van begin tot eind, ook over hun I/O.
+//!   Kan hij niet lenen, dan geven ze [`Error::Busy`] zonder iets te wijzigen.
+//!   Ze mogen dus alleen lopen terwijl de SQL-kant **in rust** is: de host
+//!   sluit de verbinding, of laat haar actor wachten tussen twee verzoeken (geen
+//!   lopend statement, geen open transactie), en hervat haar daarna. Wat
+//!   ertussen hoort, is lokaal en kort: de capture naar de spool, het manifest
+//!   en de marker.
+//! - **Zonder rust** mogen: [`Pending::upload`] (alleen spool en store),
+//!   [`Capturing::run`] (database, spool en schaduw), [`Maintenance::run`]
+//!   (alleen de store), [`Replica::renew`] (alleen de lease) en
+//!   [`Replica::status`]. Zo blokkeert een upload van megabytes geen enkel
+//!   verzoek.
+//! - **Geen lening over een `.await`**: alle leningen hier zijn synchroon en
+//!   eindigen binnen hun functie; een parkeerpunt (een `Suspend::wait` in de
+//!   opslag) ligt alleen binnen de lening van de kant die op dat moment de
+//!   staat heeft, en de andere kant mag er dan per protocol niet aan komen.
+//!   De lint `await_holding_refcell_ref` staat op deny; de lease wordt in
+//!   stappen vernieuwd ([`Writer::renew_request`]), zodat de VFS zijn deadline
+//!   altijd kan lezen.
 use crate::{
     Error, Result,
     capture::Plan,
@@ -6,17 +51,18 @@ use crate::{
     maintenance::{self, Budget, Report, Schedule},
     marker::{LocalMarker, Marker},
     object::Store,
-    prepare::{self, Prepared, Reason},
+    prepare::{self, Reason},
     replication::{self, Batch, Staged, Uploaded},
     string,
     time::Time,
-    tracking::{Tracked, Tracking},
-    writer::{Backend, Writer},
+    tracking::{Tracked, Tracking, sqlite_error},
+    writer::{Backend, Renewed, Writer},
 };
 use alloc::rc::Rc;
 use alloc::string::String;
-use core::cell::RefCell;
-use replica_sqlite::Storage;
+use core::cell::{Cell, Ref, RefCell};
+use core::ffi::CStr;
+use replica_sqlite::{FileId, OpenFlags, Storage};
 /// Configuratie vóór Prepare. De app bezit transport, klok en entropie.
 pub struct Config {
     /// `prefix/domain` in objectopslag.
@@ -105,9 +151,15 @@ pub struct Status {
     /// Laatste fout; transportfouten maken de generatie niet beschadigd.
     pub error: Option<Error>,
 }
-/// Eén eigenaar van marker, dirty logs en cadans. Alle SQL-writes lopen via `vfs`;
-/// SQL is gesloten vóór `sync`/`tick`. Voor overlappende SQL en upload kan een app
-/// de losse capture/publicatie-API gebruiken met expliciete eigendomsoverdracht.
+/// De staat die eigenaar en VFS delen: de lokale marker en de tracking.
+pub struct State {
+    marker: LocalMarker,
+    tracking: Tracking,
+}
+/// Eén eigenaar van marker, dirty logs en cadans. Alle SQL-writes lopen via `vfs`.
+///
+/// Zie de moduledocs voor het rustprotocol: de VFS mag openblijven, maar de
+/// stappen die de tracking raken lopen alleen terwijl de SQL-kant in rust is.
 ///
 /// Alleen de houder van de schrijverlease maakt een eigenaar. Na de deadline van
 /// die lease weigeren VFS, synchronisatie en publicatie hard; de app roept
@@ -115,13 +167,15 @@ pub struct Status {
 /// Deze bibliotheek verstopt geen achtergrondtaak of runtime.
 pub struct Replica {
     config: Config,
-    /// Gedeeld met de leasetaak van de host: die vernieuwt de lease op haar
-    /// eigen stack, hoe lang een capture of upload hier ook duurt.
+    /// Gedeeld met de leasetaak van de host en met elke VFS: die leest er de
+    /// deadline uit, de leasetaak vernieuwt hem op zijn eigen stack.
     writer: Rc<RefCell<Writer>>,
-    prepared: Prepared,
+    /// Gedeeld met elke VFS, onder het rustprotocol.
+    state: Rc<RefCell<State>>,
+    /// Gedeeld met elke VFS: dicht weigert iedere write.
+    closed: Rc<Cell<bool>>,
     status: Status,
     maintenance_at: Option<Time>,
-    closed: bool,
     pending: bool,
     maintaining: bool,
     /// Een onderbroken snapshot-upload van vóór de herstart; [`Replica::begin`]
@@ -231,6 +285,146 @@ impl Capturing {
         Ok(Pending { batch, staged })
     }
 }
+/// De SQL-kant van een eigenaar: wat een VFS nodig heeft, zonder de eigenaar
+/// zelf. Een host geeft dit aan zijn SQL-taak en houdt de [`Replica`] bij zijn
+/// Sync-taak; [`Tracker::vfs`] maakt er per verbinding een [`Vfs`] van.
+#[derive(Clone)]
+pub struct Tracker {
+    path: Name,
+    writer: Rc<RefCell<Writer>>,
+    state: Rc<RefCell<State>>,
+    closed: Rc<Cell<bool>>,
+}
+impl Tracker {
+    /// De getrackte VFS over `b`, met dezelfde controles als [`Replica::vfs`].
+    pub fn vfs<'a, B: Storage>(&self, b: &'a mut B) -> Result<Vfs<'a, B>> {
+        if self.closed.get() {
+            return Err(Error::State);
+        }
+        let deadline = fence(&self.writer, b)?;
+        Ok(Vfs {
+            tracker: self.clone(),
+            storage: b,
+            main: None,
+            deadline,
+        })
+    }
+    /// Het canonieke pad van de database in deze opslag.
+    pub fn path(&self) -> Name {
+        self.path
+    }
+}
+/// De deadline op de klok van de opslag, of een harde fout als die voorbij is.
+fn fence<B: Storage>(writer: &RefCell<Writer>, b: &mut B) -> Result<i64> {
+    let deadline = {
+        let w = writer.try_borrow().map_err(|_| Error::Busy)?;
+        if w.is_lost() {
+            return Err(Error::LeaseLost);
+        }
+        i64::try_from(w.deadline()).map_err(|_| Error::Limit)?
+    };
+    if b.unix_millis()? >= deadline {
+        return Err(Error::LeaseLost);
+    }
+    Ok(deadline)
+}
+/// SQLITE_BUSY: de gedeelde staat is geleend (zie het rustprotocol).
+const BUSY: replica_sqlite::Error = replica_sqlite::Error { code: 5 };
+/// De getrackte VFS van één verbinding. Leent de eigenaar niet: per callback
+/// leent hij de gedeelde staat (zie het rustprotocol), en de deadline van de
+/// lease leest hij telkens opnieuw, zodat een vernieuwing ook een verbinding
+/// die al uren openstaat laat doorschrijven.
+pub struct Vfs<'a, B: Storage> {
+    tracker: Tracker,
+    storage: &'a mut B,
+    main: Option<FileId>,
+    /// De laatst gelezen deadline: geldt ook als de leasetaak de lease net
+    /// vernieuwt (en dus leent); een vernieuwing schuift hem alleen op.
+    deadline: i64,
+}
+impl<B: Storage> Vfs<'_, B> {
+    /// Dicht of verloren: geen write meer. Anders de actuele deadline.
+    fn deadline(&mut self) -> replica_sqlite::Result<i64> {
+        if self.tracker.closed.get() {
+            return Err(replica_sqlite::Error::READONLY);
+        }
+        if let Ok(w) = self.tracker.writer.try_borrow() {
+            if w.is_lost() {
+                return Err(replica_sqlite::Error::READONLY);
+            }
+            self.deadline = i64::try_from(w.deadline()).unwrap_or(i64::MAX);
+        }
+        Ok(self.deadline)
+    }
+    /// Eén callback via de tracking-VFS, met de staat geleend voor precies
+    /// deze callback.
+    fn tracked<R>(
+        &mut self,
+        f: impl FnOnce(&mut Tracked<'_, B, LocalMarker>) -> replica_sqlite::Result<R>,
+    ) -> replica_sqlite::Result<R> {
+        let deadline = self.deadline()?;
+        let state = Rc::clone(&self.tracker.state);
+        let mut guard = state.try_borrow_mut().map_err(|_| BUSY)?;
+        let st = &mut *guard;
+        let mut tracked = st
+            .tracking
+            .wrap(&mut *self.storage, &mut st.marker)
+            .until(deadline);
+        tracked.main = self.main;
+        let result = f(&mut tracked);
+        self.main = tracked.main;
+        result
+    }
+}
+impl<B: Storage> Storage for Vfs<'_, B> {
+    fn cooperate(&mut self) -> replica_sqlite::Result {
+        self.storage.cooperate()
+    }
+    fn open(&mut self, name: &CStr, flags: OpenFlags) -> replica_sqlite::Result<FileId> {
+        let main = name == self.tracker.path.cstr().map_err(sqlite_error)?;
+        if !main {
+            return self.storage.open(name, flags);
+        }
+        self.tracked(|t| t.open(name, flags))
+    }
+    fn close(&mut self, file: FileId) -> replica_sqlite::Result {
+        if self.main == Some(file) {
+            self.main = None;
+        }
+        self.storage.close(file)
+    }
+    fn read(&mut self, file: FileId, offset: u64, dst: &mut [u8]) -> replica_sqlite::Result<usize> {
+        self.storage.read(file, offset, dst)
+    }
+    fn write(&mut self, file: FileId, offset: u64, src: &[u8]) -> replica_sqlite::Result {
+        self.tracked(|t| t.write(file, offset, src))
+    }
+    fn truncate(&mut self, file: FileId, size: u64) -> replica_sqlite::Result {
+        self.tracked(|t| t.truncate(file, size))
+    }
+    fn sync(&mut self, file: FileId, flags: i32) -> replica_sqlite::Result {
+        self.tracked(|t| t.sync(file, flags))
+    }
+    fn size(&mut self, file: FileId) -> replica_sqlite::Result<u64> {
+        self.storage.size(file)
+    }
+    fn remove(&mut self, name: &CStr, dir: bool) -> replica_sqlite::Result {
+        self.tracked(|t| t.remove(name, dir))
+    }
+    fn exists(&mut self, name: &CStr) -> replica_sqlite::Result<bool> {
+        self.storage.exists(name)
+    }
+    fn random(&mut self, dst: &mut [u8]) -> replica_sqlite::Result {
+        self.storage.random(dst)
+    }
+    fn unix_millis(&mut self) -> replica_sqlite::Result<i64> {
+        self.storage.unix_millis()
+    }
+}
+/// Leent de gedeelde staat voor één stap van de eigenaar, of [`Error::Busy`].
+fn rest(state: &Rc<RefCell<State>>) -> Result<core::cell::RefMut<'_, State>> {
+    state.try_borrow_mut().map_err(|_| Error::Busy)
+}
 impl Replica {
     /// Prepare vóór SQLite openen, inclusief geverifieerde restore waar nodig.
     /// De [`Writer`] uit [`crate::writer::claim`] is het bewijs van de lease.
@@ -255,7 +449,7 @@ impl Replica {
         verify: impl FnMut(&mut B, &Name) -> Result,
     ) -> Result<Self> {
         config.validate()?;
-        writer.borrow().check(now)?;
+        writer.try_borrow().map_err(|_| Error::Busy)?.check(now)?;
         let mut prepared = prepare::run(
             b,
             store,
@@ -288,10 +482,13 @@ impl Replica {
         Ok(Self {
             config,
             writer,
-            prepared,
+            state: Rc::new(RefCell::new(State {
+                marker: prepared.marker,
+                tracking: prepared.tracking,
+            })),
+            closed: Rc::new(Cell::new(false)),
             status,
             maintenance_at: None,
-            closed: false,
             pending: false,
             maintaining: false,
             resumable,
@@ -301,65 +498,85 @@ impl Replica {
     pub fn resumes(&self) -> bool {
         self.resumable.is_some()
     }
-    /// De getrackte VFS. De lening sluit gelijktijdig synchroniseren of sluiten uit.
-    /// Na de leasedeadline weigert de VFS iedere write met `SQLITE_READONLY`.
-    pub fn vfs<'a, B: Storage>(&'a mut self, b: &'a mut B) -> Result<Tracked<'a, B, LocalMarker>> {
-        if self.closed {
+    /// De getrackte VFS. Leent de eigenaar niet (zie het rustprotocol): de
+    /// eigenaar kan synchroniseren terwijl de verbinding openstaat. Na de
+    /// leasedeadline weigert de VFS iedere write met `SQLITE_READONLY`.
+    pub fn vfs<'a, B: Storage>(&self, b: &'a mut B) -> Result<Vfs<'a, B>> {
+        self.tracker()?.vfs(b)
+    }
+    /// De SQL-kant van deze eigenaar, voor een VFS op een andere stack.
+    pub fn tracker(&self) -> Result<Tracker> {
+        if self.closed.get() {
             return Err(Error::State);
         }
-        let deadline = self.fence(b)?;
-        Ok(self
-            .prepared
-            .tracking
-            .wrap(b, &mut self.prepared.marker)
-            .until(deadline))
+        Ok(Tracker {
+            path: self.config.path,
+            writer: Rc::clone(&self.writer),
+            state: Rc::clone(&self.state),
+            closed: Rc::clone(&self.closed),
+        })
     }
     /// De deadline op de klok van de opslag, of een harde fout als die voorbij is.
     fn fence<B: Storage>(&self, b: &mut B) -> Result<i64> {
-        let deadline = i64::try_from(self.writer.borrow().deadline()).map_err(|_| Error::Limit)?;
-        if b.unix_millis()? >= deadline {
-            return Err(Error::LeaseLost);
-        }
-        Ok(deadline)
+        fence(&self.writer, b)
     }
     /// Vernieuwt de schrijverlease op leeftijd; zie [`Writer::renew`]. Na
     /// verlies is deze eigenaar permanent dicht.
+    ///
+    /// In stappen: de lening op de [`Writer`] loopt nooit over de store-I/O
+    /// heen, zodat een VFS ook tijdens een trage PUT zijn deadline leest.
+    /// Mag zonder rust lopen.
     pub fn renew<L: Backend>(&mut self, lease: &mut L, now: Time) -> Result {
-        let result = self.writer.borrow_mut().renew(lease, now);
+        let result = renew_shared(&self.writer, lease, now);
         if result == Err(Error::LeaseLost) {
-            self.closed = true;
+            self.closed.set(true);
         }
         result
     }
     /// De lease van deze eigenaar, met het fencing-token.
-    pub fn writer(&self) -> core::cell::Ref<'_, Writer> {
+    pub fn writer(&self) -> Ref<'_, Writer> {
         self.writer.borrow()
     }
     /// Sluit deze eigenaar en geeft de lease vrij, zodat een lezer meteen kan
-    /// overnemen. SQLite is dan al gesloten.
-    pub fn release<L: Backend>(mut self, lease: &mut L) -> Result {
-        self.close();
-        match Rc::try_unwrap(self.writer) {
+    /// overnemen. SQLite is dan al gesloten en elke [`Vfs`] gedropt; leeft er
+    /// nog een (of een [`Tracker`]), dan verloopt de lease vanzelf.
+    pub fn release<L: Backend>(self, lease: &mut L) -> Result {
+        self.closed.set(true);
+        let Self { writer, .. } = self;
+        match Rc::try_unwrap(writer) {
             Ok(writer) => writer.into_inner().release(lease),
-            // De leasetaak houdt het handvat nog vast: laat de lease verlopen.
+            // De leasetaak of een VFS houdt het handvat nog vast: laat de lease verlopen.
             Err(_) => Ok(()),
         }
     }
     /// Onveranderlijke marker voor status, archiefcatalogus en diagnose.
-    pub fn marker(&self) -> &Marker {
-        &self.prepared.marker.value
+    ///
+    /// # Panics
+    /// Als de VFS de gedeelde staat op dit moment leent (buiten het
+    /// rustprotocol); [`Replica::try_marker`] geeft dan een fout.
+    pub fn marker(&self) -> Ref<'_, Marker> {
+        Ref::map(self.state.borrow(), |s| &s.marker.value)
+    }
+    /// Als [`Replica::marker`], met [`Error::Busy`] in plaats van een panic.
+    pub fn try_marker(&self) -> Result<Ref<'_, Marker>> {
+        let state = self.state.try_borrow().map_err(|_| Error::Busy)?;
+        Ok(Ref::map(state, |s| &s.marker.value))
     }
     /// De laatste beurt, ook na sluiten.
     pub fn status(&self) -> Status {
         self.status
     }
-    /// Zet de eigenaar permanent dicht. Actieve VFS-leningen moeten eerst eindigen;
-    /// de host sluit SQLite en geeft daarna de lease vrij met [`Replica::release`].
+    /// Zet de eigenaar permanent dicht: elke VFS weigert vanaf nu writes; de
+    /// host sluit SQLite en geeft daarna de lease vrij met [`Replica::release`].
     pub fn close(&mut self) {
-        self.closed = true;
+        self.closed.set(true);
+    }
+    /// Is deze eigenaar dicht (gesloten, of de lease verloren)?
+    pub fn is_closed(&self) -> bool {
+        self.closed.get()
     }
     /// Hosttimer-aanroep: vóór het interval geen I/O. Ook fouten krijgen een interval
-    /// voordat de automatische volgende poging mag beginnen.
+    /// voordat de automatische volgende poging mag beginnen. Alleen in rust.
     pub fn tick<B: Storage, S: Store>(
         &mut self,
         b: &mut B,
@@ -377,18 +594,26 @@ impl Replica {
             .attempted
             .is_none_or(|last| now.seconds() - last.seconds() >= i64::from(self.config.interval))
     }
+    /// Is een volgende [`Replica::tick`] of [`Replica::begin`] aan de beurt?
+    /// Een host die voor de capture eerst rust moet vragen, vraagt dit eerst.
+    pub fn is_due(&self, now: Time) -> bool {
+        self.resumable.is_some() || (!self.pending && !self.maintaining && self.due(now))
+    }
     fn clock(&self, now: Time) -> Result {
-        if self.closed
+        if self.closed.get()
             || now.seconds() < 1_577_836_800
             || self.status.attempted.is_some_and(|last| now < last)
         {
             return Err(Error::State);
         }
-        self.writer.borrow().check(now)
+        self.writer
+            .try_borrow()
+            .map_err(|_| Error::Busy)?
+            .check(now)
     }
     /// Eén expliciete synchronisatie op de eigenaar: capture, upload en afronding
-    /// in één beurt. Wie SQL wil laten doorlopen tijdens de upload van de delen
-    /// gebruikt [`Replica::begin`] en [`Replica::finish`].
+    /// in één beurt, in rust. Wie SQL wil laten doorlopen tijdens de upload van
+    /// de delen gebruikt [`Replica::begin`] en [`Replica::finish`].
     pub fn sync<B: Storage, S: Store>(
         &mut self,
         b: &mut B,
@@ -399,49 +624,64 @@ impl Replica {
         if self.pending || self.maintaining {
             return Err(Error::State);
         }
+        let state = Rc::clone(&self.state);
+        let mut st = rest(&state)?;
         self.status.attempted = Some(now);
-        let result = match self.plan(b, store, now) {
+        let result = match self.plan(&mut st, b, store, now) {
             Ok(Some(capturing)) => match capturing.run(b) {
                 Ok(pending) => {
-                    self.disarm(b);
-                    pending
-                        .upload(b, store)
-                        .and_then(|uploaded| self.complete(b, store, pending, uploaded, now))
+                    self.disarm(&mut st, b);
+                    pending.upload(b, store).and_then(|uploaded| {
+                        self.complete(&mut st, b, store, pending, uploaded, now)
+                    })
                 }
-                Err(e) => return self.abandon(b, e, now),
+                Err(e) => return self.abandon_in(&mut st, b, e, now),
             },
-            Ok(None) => self.maintain(b, store, now),
+            Ok(None) => self.maintain(&mut st, b, store, now),
             Err(e) => Err(e),
         };
         self.settle(result, now)
     }
     /// Alles vóór de upload van de delen: interval, onzekere commits, generatie
     /// en de capture. `None` als het interval nog loopt of als niets veranderde;
-    /// in dat laatste geval is het onderhoud al gedaan. Tot [`Replica::finish`]
-    /// schrijft SQL via [`Replica::vfs`] gewoon door, en is een tweede `begin`
-    /// een fout.
+    /// in dat laatste geval is het onderhoud al gedaan. In rust; daarna mag
+    /// SQL via de [`Vfs`] gewoon doorschrijven tot [`Replica::finish`], en is
+    /// een tweede `begin` een fout.
     pub fn begin<B: Storage, S: Store>(
         &mut self,
         b: &mut B,
         store: &mut S,
         now: Time,
     ) -> Result<Option<Pending>> {
-        match self.begin_capture(b, store, now)? {
+        let state = Rc::clone(&self.state);
+        let mut st = rest(&state)?;
+        match self.begin_in(&mut st, b, store, now)? {
             None => Ok(None),
             Some(Begun::Upload(pending)) => Ok(Some(pending)),
             Some(Begun::Capture(capturing)) => match capturing.run(b) {
                 Ok(pending) => Ok(Some(pending)),
-                Err(e) => self.abandon(b, e, now).map(|_| None),
+                Err(e) => self.abandon_in(&mut st, b, e, now).map(|_| None),
             },
         }
     }
     /// Als [`Replica::begin`], maar het lezen van de pagina's gebeurt buiten
     /// de eigenaar: [`Capturing::run`] mag op een andere stack draaien terwijl
-    /// SQL hier via [`Replica::vfs`] doorschrijft; de schaduw houdt het beeld
-    /// op dit moment. De uitkomst gaat naar [`Replica::finish`] (na de
-    /// upload) of [`Replica::abandon`] (een mislukte capture).
+    /// SQL via de [`Vfs`] doorschrijft; de schaduw houdt het beeld op dit
+    /// moment. De uitkomst gaat naar [`Replica::finish`] (na de upload) of
+    /// [`Replica::abandon`] (een mislukte capture). Deze stap zelf in rust.
     pub fn begin_capture<B: Storage, S: Store>(
         &mut self,
+        b: &mut B,
+        store: &mut S,
+        now: Time,
+    ) -> Result<Option<Begun>> {
+        let state = Rc::clone(&self.state);
+        let mut st = rest(&state)?;
+        self.begin_in(&mut st, b, store, now)
+    }
+    fn begin_in<B: Storage, S: Store>(
+        &mut self,
+        st: &mut State,
         b: &mut B,
         store: &mut S,
         now: Time,
@@ -464,7 +704,7 @@ impl Replica {
             return Ok(None);
         }
         self.status.attempted = Some(now);
-        match self.plan(b, store, now) {
+        match self.plan(st, b, store, now) {
             Ok(Some(capturing)) => {
                 self.pending = true;
                 Ok(Some(Begun::Capture(capturing)))
@@ -473,7 +713,7 @@ impl Replica {
                 self.settle(Ok(Synced::default()), now).map(|_| None)
             }
             Ok(None) => {
-                let result = self.maintain(b, store, now);
+                let result = self.maintain(st, b, store, now);
                 self.settle(result, now).map(|_| None)
             }
             Err(e) => self.settle(Err(e), now).map(|_| None),
@@ -481,17 +721,28 @@ impl Replica {
     }
     /// Een [`Capturing::run`] die mislukte: de schaduw gaat weg, een beeld dat
     /// niet meer te maken was plant een nieuwe snapshot, en dit is de fout van
-    /// deze beurt.
+    /// deze beurt. In rust.
     pub fn abandon<B: Storage>(&mut self, b: &mut B, error: Error, now: Time) -> Result<Synced> {
+        let state = Rc::clone(&self.state);
+        let mut st = rest(&state)?;
+        self.abandon_in(&mut st, b, error, now)
+    }
+    fn abandon_in<B: Storage>(
+        &mut self,
+        st: &mut State,
+        b: &mut B,
+        error: Error,
+        now: Time,
+    ) -> Result<Synced> {
         self.pending = false;
-        self.disarm(b);
+        self.disarm(st, b);
         if matches!(error, Error::ForeignWrite | Error::Gap | Error::State) {
-            self.invalidate(b, false)?;
+            self.invalidate(st, b, false)?;
         }
         self.settle(Err(error), now)
     }
-    fn disarm<B: Storage>(&mut self, b: &mut B) {
-        self.prepared.tracking.disarm();
+    fn disarm<B: Storage>(&mut self, st: &mut State, b: &mut B) {
+        st.tracking.disarm();
         if let Ok(name) = self.config.path.suffix(".replica-shadow") {
             let _ = local::write(b, &name, b"");
         }
@@ -499,6 +750,7 @@ impl Replica {
     /// Rondt een [`Replica::begin`] af met het resultaat van [`Pending::upload`]:
     /// manifest, marker, bevestiging en onderhoud. Een mislukte upload is de
     /// fout van deze beurt; de volgende capture neemt dezelfde pagina's mee.
+    /// In rust: het manifest is één kleine PUT, de rest lokaal.
     pub fn finish<B: Storage, S: Store>(
         &mut self,
         b: &mut B,
@@ -507,26 +759,31 @@ impl Replica {
         uploaded: Result<Uploaded>,
         now: Time,
     ) -> Result<Synced> {
+        let state = Rc::clone(&self.state);
+        let mut st = rest(&state)?;
         self.pending = false;
-        self.disarm(b);
+        self.disarm(&mut st, b);
         self.clock(now)?;
-        let result = uploaded.and_then(|uploaded| self.complete(b, store, pending, uploaded, now));
+        let result =
+            uploaded.and_then(|uploaded| self.complete(&mut st, b, store, pending, uploaded, now));
         self.settle(result, now)
     }
     /// Het onderhoud als losse taak (met [`Config::background_maintenance`]):
     /// hoogstens eens per minuut, nooit naast een andere taak. Legt de
     /// frontier op `now` duurzaam vast, zodat elk venster dat de taak
-    /// samenvoegt binnen de frontier valt en nieuwe commits erbuiten.
+    /// samenvoegt binnen de frontier valt en nieuwe commits erbuiten. In rust.
     pub fn maintenance_begin<B: Storage>(
         &mut self,
         b: &mut B,
         now: Time,
     ) -> Result<Option<Maintenance>> {
         self.clock(now)?;
+        let state = Rc::clone(&self.state);
+        let mut st = rest(&state)?;
         if self.maintaining
             || self.pending
-            || !self.prepared.marker.value.complete
-            || self.prepared.marker.value.uncertain != 0
+            || !st.marker.value.complete
+            || st.marker.value.uncertain != 0
             || self
                 .maintenance_at
                 .is_some_and(|last| now.seconds() - last.seconds() < 60)
@@ -535,10 +792,10 @@ impl Replica {
         }
         self.maintenance_at = Some(now);
         let sealed = Time::unix(now.seconds(), 0)?;
-        if sealed > self.prepared.marker.value.sealed_at {
+        if sealed > st.marker.value.sealed_at {
             self.fence(b)?;
-            self.prepared.marker.value.sealed_at = sealed;
-            self.prepared.marker.save(b)?;
+            st.marker.value.sealed_at = sealed;
+            st.marker.save(b)?;
         }
         let mut levels = alloc::vec::Vec::new();
         crate::reserve(&mut levels, self.config.schedule.levels().len())?;
@@ -546,9 +803,9 @@ impl Replica {
         self.maintaining = true;
         Ok(Some(Maintenance {
             namespace: string(&self.config.namespace)?,
-            generation: string(&self.prepared.marker.value.generation)?,
-            sequence: self.prepared.marker.value.sequence,
-            sealed_at: self.prepared.marker.value.sealed_at,
+            generation: string(&st.marker.value.generation)?,
+            sequence: st.marker.value.sequence,
+            sealed_at: st.marker.value.sealed_at,
             now,
             levels,
             budget: (self.config.pages, self.config.segment_bytes),
@@ -557,17 +814,19 @@ impl Replica {
     }
     /// Rondt een [`Maintenance::run`] af. Bewezen archiefschade plant, net als
     /// het inline onderhoud, een nieuwe snapshot; een transportfout is alleen
-    /// de fout van deze beurt.
+    /// de fout van deze beurt. In rust.
     pub fn maintenance_finish<B: Storage>(
         &mut self,
         b: &mut B,
         result: Result<Synced>,
     ) -> Result<Synced> {
+        let state = Rc::clone(&self.state);
+        let mut st = rest(&state)?;
         self.maintaining = false;
         match result {
             Ok(synced) => Ok(synced),
             Err(e) => {
-                let e = self.archive_error(b, e);
+                let e = self.archive_error(&mut st, b, e);
                 self.status.error = Some(e);
                 Err(e)
             }
@@ -580,8 +839,8 @@ impl Replica {
         }
         result
     }
-    fn invalidate<B: Storage>(&mut self, b: &mut B, damaged: bool) -> Result {
-        let old = &self.prepared.marker.value;
+    fn invalidate<B: Storage>(&mut self, st: &mut State, b: &mut B, damaged: bool) -> Result {
+        let old = &st.marker.value;
         let mut marker = Marker::new(&self.config.destination, "", Time::ZERO)?;
         // Behoud herkomstbewijs, ook bij onbetrouwbare lokale tracking. Deze
         // generatie is geen fallback, maar current mag tijdens de nieuwe
@@ -596,11 +855,11 @@ impl Replica {
         let tracking = Tracking::new(self.config.path, self.config.pages)?;
         if let Err(e) = local.save(b) {
             // De herstelbeslissing kan half op schijf staan; eerst opnieuw Prepare.
-            self.closed = true;
+            self.closed.set(true);
             return Err(e);
         }
-        self.prepared.marker = local;
-        self.prepared.tracking = tracking;
+        st.marker = local;
+        st.tracking = tracking;
         self.status.reason = if damaged {
             Reason::Repair
         } else {
@@ -609,9 +868,9 @@ impl Replica {
         self.maintenance_at = None;
         Ok(())
     }
-    fn archive_error<B: Storage>(&mut self, b: &mut B, error: Error) -> Error {
+    fn archive_error<B: Storage>(&mut self, st: &mut State, b: &mut B, error: Error) -> Error {
         if matches!(error, Error::Corrupt | Error::Gap | Error::Legacy)
-            && let Err(e) = self.invalidate(b, true)
+            && let Err(e) = self.invalidate(st, b, true)
         {
             return e;
         }
@@ -621,31 +880,27 @@ impl Replica {
     /// en het plan van de capture met de schaduw gewapend; nog geen pagina's.
     fn plan<B: Storage, S: Store>(
         &mut self,
+        st: &mut State,
         b: &mut B,
         store: &mut S,
         now: Time,
     ) -> Result<Option<Capturing>> {
-        if self.prepared.marker.value.uncertain != 0
-            && let Err(e) =
-                replication::resolve(b, store, &self.config.namespace, &mut self.prepared.marker)
+        if st.marker.value.uncertain != 0
+            && let Err(e) = replication::resolve(b, store, &self.config.namespace, &mut st.marker)
         {
-            return Err(self.archive_error(b, e));
+            return Err(self.archive_error(st, b, e));
         }
-        let renew = self.prepared.marker.value.generation.is_empty()
-            || (self.prepared.marker.value.complete
-                && maintenance::renewal_due(
-                    &self.prepared.marker.value,
-                    now,
-                    self.config.generation,
-                )?);
+        let renew = st.marker.value.generation.is_empty()
+            || (st.marker.value.complete
+                && maintenance::renewal_due(&st.marker.value, now, self.config.generation)?);
         if renew {
-            if self.prepared.marker.value.complete {
+            if st.marker.value.complete {
                 self.status.reason = Reason::NewSnapshot;
             }
-            replication::renew(b, &mut self.prepared.marker, now)?;
+            replication::renew(b, &mut st.marker, now)?;
             self.maintenance_at = None;
         }
-        let local = &self.prepared.marker.value;
+        let local = &st.marker.value;
         if local.generation.is_empty()
             || local.uncertain != 0
             || (!local.complete && local.sequence != 0)
@@ -655,7 +910,7 @@ impl Replica {
         let plan = match Plan::new(
             b,
             self.config.path,
-            &self.prepared.tracking,
+            &st.tracking,
             !local.complete,
             local.size,
             self.config.segment_bytes,
@@ -663,20 +918,20 @@ impl Replica {
             Ok(Some(plan)) => plan,
             Ok(None) => return Ok(None),
             Err(e @ (Error::ForeignWrite | Error::Gap | Error::State)) => {
-                self.invalidate(b, false)?;
+                self.invalidate(st, b, false)?;
                 return Err(e);
             }
             Err(e) => return Err(e),
         };
         // Het beeld is dat van nu: wat vanaf hier geschreven wordt, is ná deze
         // capture geschreven en gaat eerst oud de schaduw in.
-        self.prepared.tracking.captured();
-        self.prepared.tracking.arm(plan.shadow());
+        st.tracking.captured();
+        st.tracking.arm(plan.shadow());
         Ok(Some(Capturing {
             plan,
             namespace: string(&self.config.namespace)?,
-            generation: string(&self.prepared.marker.value.generation)?,
-            previous_sequence: self.prepared.marker.value.sequence,
+            generation: string(&st.marker.value.generation)?,
+            previous_sequence: st.marker.value.sequence,
             path: self.config.path,
             now,
         }))
@@ -684,6 +939,7 @@ impl Replica {
     /// Manifest en marker na de upload, daarna het onderhoud.
     fn complete<B: Storage, S: Store>(
         &mut self,
+        st: &mut State,
         b: &mut B,
         store: &mut S,
         pending: Pending,
@@ -693,21 +949,18 @@ impl Replica {
         // De upload kan lang duren; het manifest gaat alleen uit onder een
         // geldige lease, gemeten nu en niet bij het begin van de beurt.
         self.fence(b)?;
-        if let Err(e) = pending.batch.finish(
-            b,
-            store,
-            uploaded,
-            &mut self.prepared.marker,
-            &mut self.prepared.tracking,
-            now,
-        ) {
-            return Err(self.archive_error(b, e));
+        if let Err(e) =
+            pending
+                .batch
+                .finish(b, store, uploaded, &mut st.marker, &mut st.tracking, now)
+        {
+            return Err(self.archive_error(st, b, e));
         }
         Batch::clear_pending(b, self.config.path)?;
         let mut result = if self.config.background_maintenance {
             Synced::default()
         } else {
-            self.maintain(b, store, now)?
+            self.maintain(st, b, store, now)?
         };
         result.published = true;
         Ok(result)
@@ -716,12 +969,13 @@ impl Replica {
     /// iedere SQL-wijziging.
     fn maintain<B: Storage, S: Store>(
         &mut self,
+        st: &mut State,
         b: &mut B,
         store: &mut S,
         now: Time,
     ) -> Result<Synced> {
         let mut result = Synced::default();
-        if self.prepared.marker.value.complete
+        if st.marker.value.complete
             && self
                 .maintenance_at
                 .is_none_or(|last| now.seconds() - last.seconds() >= 60)
@@ -731,7 +985,7 @@ impl Replica {
                 b,
                 store,
                 &self.config.namespace,
-                &mut self.prepared.marker,
+                &mut st.marker,
                 &self.config.schedule,
                 now,
                 Budget {
@@ -740,19 +994,42 @@ impl Replica {
                 },
             ) {
                 Ok(report) => report,
-                Err(e) => return Err(self.archive_error(b, e)),
+                Err(e) => return Err(self.archive_error(st, b, e)),
             };
             result.expired_objects = match maintenance::generations(
                 store,
                 &self.config.namespace,
-                &self.prepared.marker.value.generation,
+                &st.marker.value.generation,
                 now,
                 self.config.retention,
             ) {
                 Ok(removed) => removed,
-                Err(e) => return Err(self.archive_error(b, e)),
+                Err(e) => return Err(self.archive_error(st, b, e)),
             };
         }
         Ok(result)
+    }
+}
+/// De vernieuwing in stappen over een gedeelde [`Writer`]: elke lening is
+/// kort en geen enkele loopt over de I/O van `lease` heen.
+fn renew_shared<L: Backend>(writer: &RefCell<Writer>, lease: &mut L, now: Time) -> Result {
+    let borrow = || writer.try_borrow_mut().map_err(|_| Error::Busy);
+    let Some(renewal) = borrow()?.renew_request(now)? else {
+        return Ok(());
+    };
+    let written = lease.write(&renewal.prev, &renewal.state);
+    match borrow()?.renew_commit(&renewal, written)? {
+        Renewed::Done => Ok(()),
+        Renewed::Reclaim => {
+            let read = lease.read();
+            let again = borrow()?.reclaim_request(read, renewal.at)?;
+            match again {
+                Some(again) => {
+                    let written = lease.write(&again.prev, &again.state);
+                    borrow()?.reclaim_commit(&again, written)
+                }
+                None => Ok(()),
+            }
+        }
     }
 }

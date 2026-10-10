@@ -150,7 +150,10 @@ fn renewal_in_steps_keeps_the_store_io_outside_the_writer() {
     let renewal = w.renew_request(at(11_000)).unwrap().unwrap();
     let written = lease.write(&renewal.prev, &renewal.state);
     assert_eq!(w.renew_commit(&renewal, written).unwrap(), Renewed::Reclaim);
-    let again = w.reclaim_request(lease.read(), renewal.at).unwrap().unwrap();
+    let again = w
+        .reclaim_request(lease.read(), renewal.at)
+        .unwrap()
+        .unwrap();
     let written = lease.write(&again.prev, &again.state);
     w.reclaim_commit(&again, written).unwrap();
     assert_eq!(w.deadline(), 1_790_765_296_000 + 31_000);

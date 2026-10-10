@@ -36,6 +36,7 @@ pub trait Environment {
     fn unix_millis(&mut self) -> Result<i64>;
 }
 /// De kleine adapter van de runtime naar SQLite's parkeercontract.
+#[derive(Clone, Copy)]
 pub struct Wait<'a>(pub &'a Suspender);
 impl Suspend for Wait<'_> {
     fn wait<F: Future>(&self, f: F) -> core::result::Result<F::Output, Cancelled> {

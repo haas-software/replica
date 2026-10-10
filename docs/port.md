@@ -123,9 +123,12 @@ paginanummervector respectievelijk een volledige metadatascan per commit.
 Meet doorvoer en SQL-latency op een representatieve database voordat de Go-host
 wordt vervangen. Er is nog geen live S3- of O6N-run uitgevoerd.
 
-De objectstore op HopOS is nog niet aangesloten. `replica-s3` parkeert al op
-dezelfde `Suspend`, maar mist een `leans3::Transport` voor een app-slot (Hop's
-`SlotTransport` zit in zijn binary) en sleutels in de app. De andere weg, de
+De objectstore op HopOS heeft sinds v3.0.1 een transport voor een app-slot:
+`replica_hopos::s3` (`leans3http::Http` over `leanhttps::WebDial` over
+`applib::tcp::Dialer`, `MOZILLA_ROOTS`, de wandklok en `applib::rand::Rng`), met
+de sleutels in de app (de env van de jobspec). Het bouwt voor ARM64 en RISC-V;
+een run tegen een echte bucket vanuit QEMU of ijzer is nog niet gedaan. De
+andere weg, de
 store-ops van Hop (`store_push/pull/list/drop`), vraagt een `Store`-adapter in
 `replica-hopos`: een objectnaam los van het lokale spoolpad (de ABI kan het via
 `data`; de `store_*`-helpers van `applib` niet, `Client::call` met een eigen

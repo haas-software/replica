@@ -32,7 +32,13 @@ fn sql(r: &mut Replica, fs: &mut Fs, heap: &mut [u64], sql: &std::ffi::CStr) {
     engine.open(c"db").unwrap().execute(sql).unwrap();
 }
 /// Herstelt de laatste commit van `generation` en leest er één getal uit.
-fn restored(fs: &mut Fs, bucket: &mut Bucket, heap: &mut [u64], generation: &str, query: &std::ffi::CStr) -> i64 {
+fn restored(
+    fs: &mut Fs,
+    bucket: &mut Bucket,
+    heap: &mut [u64],
+    generation: &str,
+    query: &std::ffi::CStr,
+) -> i64 {
     let mut result = 0;
     archive::fetch(
         fs,
@@ -125,7 +131,13 @@ fn writes_during_a_capture_stay_out_of_its_image_and_in_the_next_increment() {
     // Het snapshot is het beeld van vóór de writes: 4000 rijen, niets 'changed'.
     r.close();
     assert_eq!(
-        restored(&mut fs, &mut bucket, &mut heap, &generation, c"SELECT count(*) FROM item"),
+        restored(
+            &mut fs,
+            &mut bucket,
+            &mut heap,
+            &generation,
+            c"SELECT count(*) FROM item"
+        ),
         4000
     );
     assert_eq!(
@@ -156,7 +168,13 @@ fn writes_during_a_capture_stay_out_of_its_image_and_in_the_next_increment() {
     assert_eq!(r.marker().sequence, 2);
     r.close();
     assert_eq!(
-        restored(&mut fs, &mut bucket, &mut heap, &generation, c"SELECT count(*) FROM item"),
+        restored(
+            &mut fs,
+            &mut bucket,
+            &mut heap,
+            &generation,
+            c"SELECT count(*) FROM item"
+        ),
         4000 + 500 - 101
     );
     assert_eq!(

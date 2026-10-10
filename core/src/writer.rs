@@ -110,6 +110,10 @@ impl Writer {
     pub fn owner(&self) -> &str {
         self.discovery.node_addr()
     }
+    /// Is de lease blijvend verloren (een andere houder)?
+    pub fn is_lost(&self) -> bool {
+        self.lost
+    }
     /// Het laatste moment (Unix-milliseconden) waarop deze node mag schrijven.
     pub fn deadline(&self) -> u64 {
         self.confirmed

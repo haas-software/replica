@@ -441,15 +441,19 @@ pub struct Tracked<'a, B: Storage, M: CleanMarker<B>> {
     tracking: &'a mut Tracking,
     storage: &'a mut B,
     marker: &'a mut M,
-    main: Option<FileId>,
+    /// Het handvat van de database zelf; `owner::Vfs` bewaart het tussen
+    /// twee callbacks, omdat zij per callback een nieuwe lening maakt.
+    pub(crate) main: Option<FileId>,
     deadline: Option<i64>,
 }
-fn sqlite_error(e: Error) -> replica_sqlite::Error {
+pub(crate) fn sqlite_error(e: Error) -> replica_sqlite::Error {
     match e {
         Error::Storage(e) => e,
         Error::Memory => replica_sqlite::Error::MEMORY,
         Error::Limit => replica_sqlite::Error::FULL,
         Error::LeaseLost => replica_sqlite::Error::READONLY,
+        // SQLITE_BUSY: de eigenaar houdt de gedeelde staat; geen I/O gedaan.
+        Error::Busy => replica_sqlite::Error { code: 5 },
         _ => replica_sqlite::Error::IO,
     }
 }

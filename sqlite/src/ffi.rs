@@ -27,6 +27,12 @@ unsafe extern "C" {
     pub(crate) fn replica_sqlite_open(path: *const c_char, db: *mut *mut c_void) -> c_int;
     pub(crate) fn replica_sqlite_open_read_only(path: *const c_char, db: *mut *mut c_void)
     -> c_int;
+    pub(crate) fn replica_sqlite_open_with(
+        path: *const c_char,
+        storage: *const Callbacks,
+        readonly: c_int,
+        db: *mut *mut c_void,
+    ) -> c_int;
     pub(crate) fn replica_sqlite_close(db: *mut c_void);
     pub(crate) fn sqlite3_exec(
         db: *mut c_void,

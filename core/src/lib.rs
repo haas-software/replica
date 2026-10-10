@@ -3,11 +3,15 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 pub mod archive;
 pub mod capture;
 pub mod compact;
 pub mod coverage;
 pub mod dirty;
+#[cfg(feature = "std")]
+pub mod host;
 pub mod local;
 pub mod maintenance;
 pub mod manifest;
@@ -44,6 +48,10 @@ pub enum Error {
     Unproven,
     /// De schrijverlease is niet meer bevestigd; de eigenaar moet stoppen met schrijven.
     LeaseLost,
+    /// De gedeelde staat van eigenaar en VFS is op dit moment geleend: de
+    /// SQL-kant staat midden in een callback. Het rustprotocol van
+    /// [`owner`] is geschonden; niets is gewijzigd, probeer het in rust opnieuw.
+    Busy,
     /// Een lokale SQLite/VFS-fout.
     Storage(replica_sqlite::Error),
     /// Objectopslag: niet verwarren met beschadigde committed bytes.

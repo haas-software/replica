@@ -7,5 +7,12 @@ license.workspace = true
 build = "build.rs"
 description = "Native SQLite met een eigenaar, begrensde heap en een eigen VFS, zonder OS-bestandssysteem."
 
+[features]
+# `host::Dir`: echte bestanden op de host (std), voor ontwikkeling en tests.
+std = []
+
+[dev-dependencies]
+replica-sqlite = { path = ".", features = ["std"] }
+
 [lints]
 workspace = true

@@ -32,7 +32,7 @@ cargo test --locked --workspace
 for target in aarch64-unknown-none-softfloat riscv64gc-unknown-none-elf; do
     cargo build --locked --release --target "$target" \
         -p replica-sqlite-smoke -p replica-sqlite-persist -p replica-sqlite-bench \
-        -p replica-core -p replica-s3
+        -p replica-hopos -p replica-core -p replica-s3
     cargo clippy --locked --release --target "$target" \
         -p replica-sqlite-smoke -p replica-sqlite-persist -p replica-sqlite-bench \
         -p replica-hopos -p replica-core -p replica-s3 -- -D warnings

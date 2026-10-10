@@ -145,7 +145,11 @@ pub(crate) fn copy_before_write<B: Storage>(
         }
         let mut read = 0;
         while read < bytes.len() {
-            let n = b.read(main, u64::from(page - 1) * page_size + read as u64, &mut bytes[read..])?;
+            let n = b.read(
+                main,
+                u64::from(page - 1) * page_size + read as u64,
+                &mut bytes[read..],
+            )?;
             if n == 0 || n > bytes.len() - read {
                 // Korter dan het beeld: de database kromp onder de capture.
                 shadow.borrow_mut().broken = true;

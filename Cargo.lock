@@ -22,6 +22,7 @@ dependencies = [
  "dev",
  "executor",
  "heap",
+ "leanhttp",
  "leannet",
  "netdev",
  "sync",
@@ -70,12 +71,43 @@ version = "3.1.13"
 source = "git+https://github.com/xinix00/lean.git?tag=v3.1.13#1568e4d90acfa6161a1b84beafdd45a3a3b05565"
 
 [[package]]
+name = "leanhttp"
+version = "3.1.12"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.1.12#30dfbd73743a57b59ad42ed0258b7e3c10d04b20"
+
+[[package]]
+name = "leanhttps"
+version = "3.1.12"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.1.12#30dfbd73743a57b59ad42ed0258b7e3c10d04b20"
+dependencies = [
+ "leanhttp",
+ "leantls",
+]
+
+[[package]]
 name = "leannet"
 version = "3.1.12"
 source = "git+https://github.com/xinix00/lean.git?tag=v3.1.12#30dfbd73743a57b59ad42ed0258b7e3c10d04b20"
 
 [[package]]
 name = "leans3"
+version = "3.1.12"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.1.12#30dfbd73743a57b59ad42ed0258b7e3c10d04b20"
+dependencies = [
+ "leancrypto 3.1.12",
+]
+
+[[package]]
+name = "leans3http"
+version = "3.1.12"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.1.12#30dfbd73743a57b59ad42ed0258b7e3c10d04b20"
+dependencies = [
+ "leanhttp",
+ "leans3",
+]
+
+[[package]]
+name = "leantls"
 version = "3.1.12"
 source = "git+https://github.com/xinix00/lean.git?tag=v3.1.12#30dfbd73743a57b59ad42ed0258b7e3c10d04b20"
 dependencies = [
@@ -96,6 +128,7 @@ version = "0.1.0"
 dependencies = [
  "discovery",
  "leancrypto 3.1.13",
+ "replica-core",
  "replica-sqlite",
  "types",
 ]
@@ -105,6 +138,13 @@ name = "replica-hopos"
 version = "0.1.0"
 dependencies = [
  "applib",
+ "leanhttp",
+ "leanhttps",
+ "leans3",
+ "leans3http",
+ "leantls",
+ "replica-core",
+ "replica-s3",
  "replica-sqlite",
 ]
 
@@ -120,6 +160,9 @@ dependencies = [
 [[package]]
 name = "replica-sqlite"
 version = "0.1.0"
+dependencies = [
+ "replica-sqlite",
+]
 
 [[package]]
 name = "replica-sqlite-bench"

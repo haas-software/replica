@@ -84,7 +84,7 @@ pub(super) unsafe fn run<B: Storage>(b: &mut B, heap: &mut [u64], restored: bool
         applib::log!("REPLICA_PIPELINE_REPAIR_OK");
     }
     let points =
-        archive::points(&mut bucket, "replica/qemu", replica.marker(), 32).map_err(error)?;
+        archive::points(&mut bucket, "replica/qemu", &replica.marker(), 32).map_err(error)?;
     if points.is_empty() || !points[0].current {
         return Err(Error::MISUSE);
     }
