@@ -9,6 +9,12 @@
 //!
 //! Entropie komt uit `/dev/urandom`, de klok is `SystemTime`. Deze module is
 //! er alleen met de feature `std`; op HopOS is `replica-hopos` de opslag.
+//!
+//! [`Dir::volatile`] slaat de `fsync` over: op macOS is `sync_all` een
+//! `F_FULLFSYNC` van tientallen milliseconden, en een toets met honderden
+//! commits duurt dan minuten (GEMETEN 10-10-2026: 800 commits van de
+//! hb-tenants-toets 276 s). Zo'n map is niet stroomvast; de volgorde van
+//! de writes en de semantiek van elke callback blijven gelijk.
 use crate::{Error, FileId, OpenFlags, Result, Storage};
 use core::ffi::CStr;
 use std::{
@@ -29,6 +35,7 @@ pub struct Dir {
     root: PathBuf,
     files: Vec<Option<File>>,
     random: Option<File>,
+    durable: bool,
 }
 
 impl Dir {
@@ -42,6 +49,14 @@ impl Dir {
             root,
             files,
             random: None,
+            durable: true,
+        })
+    }
+    /// Als [`Dir::new`], zonder `fsync`: alleen voor toetsen (zie de moduledocs).
+    pub fn volatile(root: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            durable: false,
+            ..Self::new(root)?
         })
     }
     /// De map van deze eigenaar.
@@ -68,7 +83,10 @@ impl Dir {
             .and_then(Option::as_ref)
             .ok_or(Error::IO)
     }
-    fn sync_parent(path: &Path) -> Result {
+    fn sync_parent(&self, path: &Path) -> Result {
+        if !self.durable {
+            return Ok(());
+        }
         let parent = path.parent().ok_or(Error::IO)?;
         File::open(parent)
             .and_then(|d| d.sync_all())
@@ -138,7 +156,11 @@ impl Storage for Dir {
         })
     }
     fn sync(&mut self, file: FileId, _flags: i32) -> Result {
-        self.file(file)?.sync_all().map_err(|_| Error {
+        let f = self.file(file)?;
+        if !self.durable {
+            return Ok(());
+        }
+        f.sync_all().map_err(|_| Error {
             code: 10 | (4 << 8),
         })
     }
@@ -162,7 +184,7 @@ impl Storage for Dir {
             }
         }
         if sync_directory {
-            Self::sync_parent(&path)?;
+            self.sync_parent(&path)?;
         }
         Ok(())
     }

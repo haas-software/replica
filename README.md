@@ -168,7 +168,10 @@ terwijl de SQL-kant in rust is (geen lopend statement, geen open transactie);
 de upload, `Capturing::run`, `Maintenance::run` en `renew` mogen altijd. Wie
 het protocol schendt, krijgt `Error::Busy` (eigenaar) of `SQLITE_BUSY` (VFS),
 nooit een halve wijziging. Zie de moduledocs van `owner` en
-`core/tests/owner_split.rs`.
+`core/tests/owner_split.rs`. `Replica::has_changes` zegt zonder I/O of er iets
+te publiceren is, zodat een host de rust alleen vraagt als het nodig is;
+`writer::renew_shared` vernieuwt de gedeelde lease in stappen, bijvoorbeeld
+vóór elke PUT van een lange upload.
 
 S3 vanuit een app-slot: `replica_hopos::s3::store(&endpoint, Wait(s))` is een
 `replica_s3::S3` over `leans3http::Http` over Lean's `WebDial` over

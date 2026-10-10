@@ -12,6 +12,7 @@
 use crate::{Error, Result, object::StoreError, string};
 use crate::{manifest::hex, time::Time};
 use alloc::{format, string::String};
+use core::cell::RefCell;
 use core::ffi::CStr;
 pub use hop_discovery::{self as discovery, Backend, LeaseState, MemBackend};
 use hop_discovery::{Claim, Discovery, RenewOp};
@@ -251,6 +252,31 @@ impl Writer {
             // Al weg of al van een ander: niets meer van ons om op te ruimen.
             Ok(()) | Err(hop_discovery::Error::NoLease | hop_discovery::Error::LeaseHeld) => Ok(()),
             Err(e) => Err(unreachable(e)),
+        }
+    }
+}
+/// De vernieuwing in stappen over een gedeelde [`Writer`]: elke lening is
+/// kort en geen enkele loopt over de I/O van `lease` heen. Voor een host die
+/// de lease naast de eigenaar vernieuwt (tussen de PUT's van een upload, of
+/// op een eigen taak); [`Error::Busy`] als iemand de Writer op dat moment leent.
+pub fn renew_shared<L: Backend>(writer: &RefCell<Writer>, lease: &mut L, now: Time) -> Result {
+    let borrow = || writer.try_borrow_mut().map_err(|_| Error::Busy);
+    let Some(renewal) = borrow()?.renew_request(now)? else {
+        return Ok(());
+    };
+    let written = lease.write(&renewal.prev, &renewal.state);
+    match borrow()?.renew_commit(&renewal, written)? {
+        Renewed::Done => Ok(()),
+        Renewed::Reclaim => {
+            let read = lease.read();
+            let again = borrow()?.reclaim_request(read, renewal.at)?;
+            match again {
+                Some(again) => {
+                    let written = lease.write(&again.prev, &again.state);
+                    borrow()?.reclaim_commit(&again, written)
+                }
+                None => Ok(()),
+            }
         }
     }
 }

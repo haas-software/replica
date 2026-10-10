@@ -56,7 +56,7 @@ use crate::{
     string,
     time::Time,
     tracking::{Tracked, Tracking, sqlite_error},
-    writer::{Backend, Renewed, Writer},
+    writer::{Backend, Writer, renew_shared},
 };
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -599,6 +599,18 @@ impl Replica {
     pub fn is_due(&self, now: Time) -> bool {
         self.resumable.is_some() || (!self.pending && !self.maintaining && self.due(now))
     }
+    /// Is er iets te publiceren: writes sinds de laatste bevestigde capture
+    /// (de marker is niet clean), een onzekere of nog nooit voltooide
+    /// generatie, of een onderbroken upload? Zonder I/O en zonder rust: een
+    /// VFS die de staat op dit moment leent, telt als "ja". Een host die voor
+    /// de capture eerst rust moet vragen, slaat die vraag zo over als er niets
+    /// te doen is.
+    pub fn has_changes(&self) -> bool {
+        self.resumable.is_some()
+            || self.state.try_borrow().map_or(true, |s| {
+                !s.marker.value.clean || s.marker.value.uncertain != 0 || !s.marker.value.complete
+            })
+    }
     fn clock(&self, now: Time) -> Result {
         if self.closed.get()
             || now.seconds() < 1_577_836_800
@@ -1008,28 +1020,5 @@ impl Replica {
             };
         }
         Ok(result)
-    }
-}
-/// De vernieuwing in stappen over een gedeelde [`Writer`]: elke lening is
-/// kort en geen enkele loopt over de I/O van `lease` heen.
-fn renew_shared<L: Backend>(writer: &RefCell<Writer>, lease: &mut L, now: Time) -> Result {
-    let borrow = || writer.try_borrow_mut().map_err(|_| Error::Busy);
-    let Some(renewal) = borrow()?.renew_request(now)? else {
-        return Ok(());
-    };
-    let written = lease.write(&renewal.prev, &renewal.state);
-    match borrow()?.renew_commit(&renewal, written)? {
-        Renewed::Done => Ok(()),
-        Renewed::Reclaim => {
-            let read = lease.read();
-            let again = borrow()?.reclaim_request(read, renewal.at)?;
-            match again {
-                Some(again) => {
-                    let written = lease.write(&again.prev, &again.state);
-                    borrow()?.reclaim_commit(&again, written)
-                }
-                None => Ok(()),
-            }
-        }
     }
 }

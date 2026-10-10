@@ -258,6 +258,7 @@ fn sync_runs_between_statements_while_the_vfs_stays_open() {
             drop(marker);
         }
         round(&mut db, 99);
+        assert!(r.has_changes());
         // De laatste wijzigingen, in rust, en daarna niets meer te doen.
         let pending = r
             .begin(&mut sync_side, &mut bucket, at(1000))
@@ -266,6 +267,9 @@ fn sync_runs_between_statements_while_the_vfs_stays_open() {
         let uploaded = pending.upload(&mut sync_side, &mut bucket);
         r.finish(&mut sync_side, &mut bucket, pending, uploaded, at(1001))
             .unwrap();
+        // Een host die vóór de rust eerst `has_changes` vraagt, slaat de
+        // handdruk nu over.
+        assert!(!r.has_changes());
         assert!(
             r.begin(&mut sync_side, &mut bucket, at(1100))
                 .unwrap()

@@ -22,6 +22,7 @@ use crate::{
     },
 };
 use alloc::{string::String, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::{
     fs::{self, File},
     io::{ErrorKind, Write},
@@ -33,11 +34,18 @@ pub const NAME_BYTES: usize = 240;
 /// Tijdelijke bestanden van een PUT beginnen zo; LIST slaat ze over.
 const TEMP: &str = ".put-";
 
+/// Telt tijdelijke bestanden in dit proces: twee handvatten op dezelfde map
+/// (de Sync-taken van twee tenants) kiezen nooit dezelfde naam.
+static PUTS: AtomicU64 = AtomicU64::new(0);
+fn temp_name(kind: &str) -> String {
+    let n = PUTS.fetch_add(1, Relaxed);
+    alloc::format!("{TEMP}{kind}{}-{n}", std::process::id())
+}
+
 /// Een objectstore in één lokale map.
 pub struct Dir {
     root: PathBuf,
-    /// Telt PUT's, voor unieke tijdelijke namen binnen dit proces.
-    puts: u64,
+    durable: bool,
 }
 
 impl Dir {
@@ -45,7 +53,20 @@ impl Dir {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, StoreError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|_| StoreError::Configuration)?;
-        Ok(Self { root, puts: 0 })
+        Ok(Self {
+            root,
+            durable: true,
+        })
+    }
+    /// Als [`Dir::new`], zonder `fsync`: alleen voor toetsen met virtuele
+    /// tijd (een lease die 36 uur lang elke vijf seconden vernieuwt, is op
+    /// macOS anders tienduizenden `F_FULLFSYNC`'s). Niet stroomvast; de
+    /// atomaire vervanging (`rename`) blijft.
+    pub fn volatile(root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Ok(Self {
+            durable: false,
+            ..Self::new(root)?
+        })
     }
     /// De map van deze store.
     pub fn root(&self) -> &Path {
@@ -63,14 +84,11 @@ impl Dir {
     }
     /// Schrijft `bytes` atomair naar `path`.
     fn replace(&mut self, path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-        self.puts = self.puts.wrapping_add(1);
-        let temp = self
-            .root
-            .join(alloc::format!("{TEMP}{}-{}", std::process::id(), self.puts));
+        let temp = self.root.join(temp_name(""));
         let written = File::create(&temp)
-            .and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()))
+            .and_then(|mut f| f.write_all(bytes).and_then(|()| sync(&f, self.durable)))
             .and_then(|()| fs::rename(&temp, path))
-            .and_then(|()| File::open(&self.root).and_then(|d| d.sync_all()));
+            .and_then(|()| File::open(&self.root).and_then(|d| sync(&d, self.durable)));
         if written.is_err() {
             let _ = fs::remove_file(&temp);
             return Err(StoreError::Transport);
@@ -108,6 +126,11 @@ fn decode(name: &str) -> Option<String> {
     Some(out)
 }
 
+/// `fsync`, behalve in een vluchtige map.
+fn sync(file: &File, durable: bool) -> std::io::Result<()> {
+    if durable { file.sync_all() } else { Ok(()) }
+}
+
 fn io(e: &std::io::Error) -> StoreError {
     match e.kind() {
         ErrorKind::NotFound => StoreError::Missing,
@@ -137,7 +160,7 @@ impl Store for Dir {
         let path = self.path(key)?;
         match fs::remove_file(&path) {
             Ok(()) => File::open(&self.root)
-                .and_then(|d| d.sync_all())
+                .and_then(|d| sync(&d, self.durable))
                 .map_err(|e| io(&e)),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
             Err(e) => Err(io(&e)),
@@ -174,6 +197,7 @@ impl Store for Dir {
 /// De hop-lease als bestand in een lokale map.
 pub struct DirLease {
     path: PathBuf,
+    durable: bool,
 }
 
 impl DirLease {
@@ -182,6 +206,7 @@ impl DirLease {
     pub fn new(dir: &Dir, key: &str) -> Result<Self, StoreError> {
         Ok(Self {
             path: dir.path(key)?,
+            durable: dir.durable,
         })
     }
     fn current(&self) -> discovery::Result<Option<(Vec<u8>, String)>> {
@@ -216,9 +241,9 @@ impl Backend for DirLease {
         }
         let bytes = wire::encode(state).map_err(|_| discovery::Error::Unreachable)?;
         let parent = self.path.parent().ok_or(discovery::Error::Unreachable)?;
-        let temp = parent.join(alloc::format!("{TEMP}lease-{}", std::process::id()));
+        let temp = parent.join(temp_name("lease-"));
         File::create(&temp)
-            .and_then(|mut f| f.write_all(&bytes).and_then(|()| f.sync_all()))
+            .and_then(|mut f| f.write_all(&bytes).and_then(|()| sync(&f, self.durable)))
             .and_then(|()| fs::rename(&temp, &self.path))
             .map_err(|_| discovery::Error::Unreachable)?;
         Ok(handle(&bytes))

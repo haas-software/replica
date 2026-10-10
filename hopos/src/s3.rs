@@ -9,11 +9,10 @@
 //! een handtekening met een verzonnen tijd weigert S3 toch.
 //!
 //! [`store`] geeft een `replica_s3::S3` die op de stack van de aanroeper
-//! parkeert ([`crate::Wait`]): de objectstore van `replica_core::owner`, en
+//! parkeert (bijvoorbeeld [`crate::Wait`]): de objectstore van `replica_core::owner`, en
 //! met `S3::lease` de schrijverlease (`writer::Backend`, de hop-lease) over
 //! dezelfde client en hetzelfde transport. Dezelfde [`Transport`] dient een
 //! app ook voor gewone bestanden in S3.
-use crate::Wait;
 use alloc::boxed::Box;
 use applib::{
     EXEC,
@@ -24,6 +23,7 @@ use core::{future::Future, time::Duration};
 use leanhttps::WebDial;
 use leantls::Entropy;
 use replica_core::object::StoreError;
+use replica_sqlite::asynchronous::Suspend;
 
 /// 2020-01-01: een wandklok daarvoor is niet gezet.
 const EPOCH: u64 = 1_577_836_800;
@@ -65,9 +65,9 @@ pub type Transport = leans3http::Http<Web, Clock>;
 /// Een verbinding van [`Transport`]: TCP of TLS.
 pub type Conn = leanhttps::Link<TcpConn>;
 /// De objectstore van Replica op de stack van de aanroeper.
-pub type Store<'s> = replica_s3::S3<Transport, Wait<'s>>;
+pub type Store<W> = replica_s3::S3<Transport, W>;
 /// De schrijverlease over dezelfde store.
-pub type Lease<'a, 's> = replica_s3::Lease<'a, Transport, Wait<'s>>;
+pub type Lease<'a, W> = replica_s3::Lease<'a, Transport, W>;
 
 /// Eén transport met een eigen [`Rng`] uit de control-page van de app. Zonder
 /// app (een hosttest) geeft de dialer geen entropie: elke `https://`-dial
@@ -131,7 +131,7 @@ pub fn client(endpoint: &Endpoint<'_>) -> Result<leans3::Client, StoreError> {
 /// verbinding meteen, tot `replica_s3::STREAMS` als een herstel ze vraagt.
 /// Zonder app (`applib::app()` leeg) of zonder wandklok is dit
 /// [`StoreError::Configuration`].
-pub fn store<'s>(endpoint: &Endpoint<'_>, wait: Wait<'s>) -> Result<Store<'s>, StoreError> {
+pub fn store<W: Suspend>(endpoint: &Endpoint<'_>, wait: W) -> Result<Store<W>, StoreError> {
     if applib::app().is_none() {
         return Err(StoreError::Configuration);
     }
