@@ -49,6 +49,8 @@ unsafe extern "C" {
         tail: *mut *const c_char,
     ) -> c_int;
     pub(crate) fn sqlite3_finalize(stmt: *mut c_void) -> c_int;
+    pub(crate) fn sqlite3_sql(stmt: *mut c_void) -> *const c_char;
+    pub(crate) fn sqlite3_clear_bindings(stmt: *mut c_void) -> c_int;
     pub(crate) fn sqlite3_step(stmt: *mut c_void) -> c_int;
     pub(crate) fn sqlite3_reset(stmt: *mut c_void) -> c_int;
     pub(crate) fn sqlite3_bind_int64(stmt: *mut c_void, index: c_int, value: i64) -> c_int;

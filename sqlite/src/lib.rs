@@ -81,7 +81,7 @@ use core::{
     marker::PhantomData,
     ptr,
 };
-pub use statement::{Statement, Value};
+pub use statement::{CACHE_SIZE, CacheStats, CachedStatement, Statement, Value};
 pub use storage::{FileId, OpenFlags, Storage};
 
 /// Resultaat met SQLite's primaire of uitgebreide foutcode.
@@ -164,6 +164,7 @@ impl<'a, B: Storage> Engine<'a, B> {
         }
         Ok(Connection {
             raw,
+            cache: statement::StatementCache::new(),
             _borrow: PhantomData,
         })
     }
@@ -178,6 +179,7 @@ impl<'a, B: Storage> Engine<'a, B> {
         }
         Ok(Connection {
             raw,
+            cache: statement::StatementCache::new(),
             _borrow: PhantomData,
         })
     }
@@ -226,6 +228,7 @@ impl<'a, B: Storage> Engine<'a, B> {
         }
         Ok(Connection {
             raw,
+            cache: statement::StatementCache::new(),
             _borrow: PhantomData,
         })
     }
@@ -244,6 +247,7 @@ impl<B: Storage> Drop for Engine<'_, B> {
 /// exclusief. `!Send` en `!Sync`: een verbinding loopt op één stack.
 pub struct Connection<'e, 'a, B: Storage> {
     pub(crate) raw: *mut c_void,
+    cache: statement::StatementCache,
     _borrow: PhantomData<(&'e mut B, &'a mut [u64], *mut ())>,
 }
 impl<B: Storage> Connection<'_, '_, B> {
@@ -264,6 +268,23 @@ impl<B: Storage> Connection<'_, '_, B> {
     pub fn prepare<'s>(&'s mut self, sql: &CStr) -> Result<Statement<'s>> {
         Statement::prepare(self.raw, sql)
     }
+    /// Een voorbereid statement uit de cache van deze verbinding (een LRU
+    /// van [`CACHE_SIZE`], op de SQL-tekst); een miss bereidt het voor zoals
+    /// [`Connection::prepare`]. Bij zijn drop gaat het gereset en zonder
+    /// bindingen terug. Een vergeten (`mem::forget`) statement verlaat de
+    /// cache en sluit met de verbinding.
+    pub fn prepare_cached<'s>(&'s mut self, sql: &CStr) -> Result<CachedStatement<'s>> {
+        CachedStatement::get(self.raw, &mut self.cache, sql)
+    }
+    /// Finaliseert alle statements in de cache, bijvoorbeeld bij krapte in de
+    /// vaste heap: een voorbereid statement houdt zijn geheugen vast.
+    pub fn clear_statement_cache(&mut self) {
+        self.cache.clear();
+    }
+    /// De tellers van de statement-cache.
+    pub fn statement_cache_stats(&self) -> CacheStats {
+        self.cache.stats()
+    }
     /// Het aantal gewijzigde rijen van het laatst voltooide statement.
     pub fn changes(&self) -> i64 {
         // SAFETY: Deze lening kan niet naast een actieve statement-mutatie bestaan.
@@ -272,6 +293,8 @@ impl<B: Storage> Connection<'_, '_, B> {
 }
 impl<B: Storage> Drop for Connection<'_, '_, B> {
     fn drop(&mut self) {
+        // Eerst de cache: zijn handvatten zijn van deze verbinding.
+        self.cache.clear();
         // SAFETY: Geen statement kan deze eigenaar veilig overleven; de C-shim
         // sluit ook vergeten statements, zodat close geen verbinding laat lekken.
         unsafe { ffi::replica_sqlite_close(self.raw) };
