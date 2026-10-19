@@ -40,8 +40,8 @@ source = "git+https://github.com/xinix00/HopOS.git?tag=v3.0.13#ba0006d2159b0dcf4
 
 [[package]]
 name = "discovery"
-version = "3.0.9"
-source = "git+https://github.com/xinix00/hop.git?tag=v3.0.9#a0130f207b58415e7c541a1b23fca63f7d809214"
+version = "3.0.11"
+source = "git+https://github.com/xinix00/hop.git?tag=v3.0.11#f34fbb7a96351792751554b49c1b40d1e7a01c7c"
 dependencies = [
  "types",
 ]
@@ -201,5 +201,5 @@ dependencies = [
 
 [[package]]
 name = "types"
-version = "3.0.9"
-source = "git+https://github.com/xinix00/hop.git?tag=v3.0.9#a0130f207b58415e7c541a1b23fca63f7d809214"
+version = "3.0.11"
+source = "git+https://github.com/xinix00/hop.git?tag=v3.0.11#f34fbb7a96351792751554b49c1b40d1e7a01c7c"
