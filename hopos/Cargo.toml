@@ -8,7 +8,7 @@ license.workspace = true
 replica-sqlite = { path = "../sqlite" }
 replica-core = { path = "../core" }
 replica-s3 = { path = "../s3" }
-applib = { git = "https://github.com/xinix00/HopOS.git", tag = "v3.0.13", features = ["http"] }
+applib = { git = "https://github.com/xinix00/HopOS.git", tag = "v3.0.14", features = ["http"] }
 # Dezelfde Lean-tag als applib, zodat `TcpConn` en leanhttp één `Dial` kennen.
 leanhttp = { git = "https://github.com/xinix00/lean.git", tag = "v3.1.12" }
 leanhttps = { git = "https://github.com/xinix00/lean.git", tag = "v3.1.12", features = ["mozilla-roots"] }
