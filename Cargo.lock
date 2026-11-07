@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "abi"
-version = "3.2.0-rc3"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc3#092cb539f563e742cc8de6f6444839daa83cd9af"
+version = "3.2.0-rc5"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
 dependencies = [
  "bounded",
  "dev",
@@ -14,8 +14,8 @@ dependencies = [
 
 [[package]]
 name = "applib"
-version = "3.2.0-rc3"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc3#092cb539f563e742cc8de6f6444839daa83cd9af"
+version = "3.2.0-rc5"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
 dependencies = [
  "abi",
  "bounded",
@@ -30,26 +30,26 @@ dependencies = [
 
 [[package]]
 name = "bounded"
-version = "3.2.0-rc3"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc3#092cb539f563e742cc8de6f6444839daa83cd9af"
+version = "3.2.0-rc5"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
 
 [[package]]
 name = "dev"
-version = "3.2.0-rc3"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc3#092cb539f563e742cc8de6f6444839daa83cd9af"
+version = "3.2.0-rc5"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
 
 [[package]]
 name = "discovery"
-version = "3.2.0-rc3"
-source = "git+https://github.com/xinix00/hop.git?tag=v3.2.0-rc3#ea8c3ebbd7f9727c2adf67f9dfcdd368b2d3e141"
+version = "3.2.0-rc5"
+source = "git+https://github.com/xinix00/hop.git?tag=v3.2.0-rc5#a22b80c474ded1533c68ea81ffd037e5a49abdb9"
 dependencies = [
  "types",
 ]
 
 [[package]]
 name = "executor"
-version = "3.2.0-rc3"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc3#092cb539f563e742cc8de6f6444839daa83cd9af"
+version = "3.2.0-rc5"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
 dependencies = [
  "dev",
  "sync",
@@ -57,23 +57,23 @@ dependencies = [
 
 [[package]]
 name = "heap"
-version = "3.2.0-rc3"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc3#092cb539f563e742cc8de6f6444839daa83cd9af"
+version = "3.2.0-rc5"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
 
 [[package]]
 name = "leancrypto"
 version = "3.2.0"
-source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc2#cf1623de98e2125e377fe0f201c40cc78b4e018f"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc3#af6410e22a479169a162fbc578ff62b5693f20f8"
 
 [[package]]
 name = "leanhttp"
 version = "3.2.0"
-source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc2#cf1623de98e2125e377fe0f201c40cc78b4e018f"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc3#af6410e22a479169a162fbc578ff62b5693f20f8"
 
 [[package]]
 name = "leanhttps"
 version = "3.2.0"
-source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc2#cf1623de98e2125e377fe0f201c40cc78b4e018f"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc3#af6410e22a479169a162fbc578ff62b5693f20f8"
 dependencies = [
  "leanhttp",
  "leantls",
@@ -82,12 +82,12 @@ dependencies = [
 [[package]]
 name = "leannet"
 version = "3.2.0"
-source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc2#cf1623de98e2125e377fe0f201c40cc78b4e018f"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc3#af6410e22a479169a162fbc578ff62b5693f20f8"
 
 [[package]]
 name = "leans3"
 version = "3.2.0"
-source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc2#cf1623de98e2125e377fe0f201c40cc78b4e018f"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc3#af6410e22a479169a162fbc578ff62b5693f20f8"
 dependencies = [
  "leancrypto",
 ]
@@ -95,7 +95,7 @@ dependencies = [
 [[package]]
 name = "leans3http"
 version = "3.2.0"
-source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc2#cf1623de98e2125e377fe0f201c40cc78b4e018f"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc3#af6410e22a479169a162fbc578ff62b5693f20f8"
 dependencies = [
  "leanhttp",
  "leans3",
@@ -104,15 +104,15 @@ dependencies = [
 [[package]]
 name = "leantls"
 version = "3.2.0"
-source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc2#cf1623de98e2125e377fe0f201c40cc78b4e018f"
+source = "git+https://github.com/xinix00/lean.git?tag=v3.2.0-rc3#af6410e22a479169a162fbc578ff62b5693f20f8"
 dependencies = [
  "leancrypto",
 ]
 
 [[package]]
 name = "netdev"
-version = "3.2.0-rc3"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc3#092cb539f563e742cc8de6f6444839daa83cd9af"
+version = "3.2.0-rc5"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
 dependencies = [
  "sync",
 ]
@@ -188,13 +188,13 @@ dependencies = [
 
 [[package]]
 name = "sync"
-version = "3.2.0-rc3"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc3#092cb539f563e742cc8de6f6444839daa83cd9af"
+version = "3.2.0-rc5"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
 dependencies = [
  "bounded",
 ]
 
 [[package]]
 name = "types"
-version = "3.2.0-rc3"
-source = "git+https://github.com/xinix00/hop.git?tag=v3.2.0-rc3#ea8c3ebbd7f9727c2adf67f9dfcdd368b2d3e141"
+version = "3.2.0-rc5"
+source = "git+https://github.com/xinix00/hop.git?tag=v3.2.0-rc5#a22b80c474ded1533c68ea81ffd037e5a49abdb9"
