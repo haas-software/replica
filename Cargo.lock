@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "abi"
-version = "3.2.0-rc5"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
+version = "3.2.0-rc8"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc8#f16908ac6a716e61cf04f8095902d4ae607a1519"
 dependencies = [
  "bounded",
  "dev",
@@ -14,8 +14,8 @@ dependencies = [
 
 [[package]]
 name = "applib"
-version = "3.2.0-rc5"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
+version = "3.2.0-rc8"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc8#f16908ac6a716e61cf04f8095902d4ae607a1519"
 dependencies = [
  "abi",
  "bounded",
@@ -30,26 +30,26 @@ dependencies = [
 
 [[package]]
 name = "bounded"
-version = "3.2.0-rc5"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
+version = "3.2.0-rc8"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc8#f16908ac6a716e61cf04f8095902d4ae607a1519"
 
 [[package]]
 name = "dev"
-version = "3.2.0-rc5"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
+version = "3.2.0-rc8"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc8#f16908ac6a716e61cf04f8095902d4ae607a1519"
 
 [[package]]
 name = "discovery"
-version = "3.2.0-rc5"
-source = "git+https://github.com/xinix00/hop.git?tag=v3.2.0-rc5#a22b80c474ded1533c68ea81ffd037e5a49abdb9"
+version = "3.2.0-rc8"
+source = "git+https://github.com/xinix00/hop.git?tag=v3.2.0-rc8#c7093d1cbfcbdb80bb29584d53b48d42fae05cb1"
 dependencies = [
  "types",
 ]
 
 [[package]]
 name = "executor"
-version = "3.2.0-rc5"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
+version = "3.2.0-rc8"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc8#f16908ac6a716e61cf04f8095902d4ae607a1519"
 dependencies = [
  "dev",
  "sync",
@@ -57,8 +57,8 @@ dependencies = [
 
 [[package]]
 name = "heap"
-version = "3.2.0-rc5"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
+version = "3.2.0-rc8"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc8#f16908ac6a716e61cf04f8095902d4ae607a1519"
 
 [[package]]
 name = "leancrypto"
@@ -111,8 +111,8 @@ dependencies = [
 
 [[package]]
 name = "netdev"
-version = "3.2.0-rc5"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
+version = "3.2.0-rc8"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc8#f16908ac6a716e61cf04f8095902d4ae607a1519"
 dependencies = [
  "sync",
 ]
@@ -188,13 +188,13 @@ dependencies = [
 
 [[package]]
 name = "sync"
-version = "3.2.0-rc5"
-source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc5#5f4179b8d7db374424ce0a4fdaaba77797cfc9ef"
+version = "3.2.0-rc8"
+source = "git+https://github.com/xinix00/HopOS.git?tag=v3.2.0-rc8#f16908ac6a716e61cf04f8095902d4ae607a1519"
 dependencies = [
  "bounded",
 ]
 
 [[package]]
 name = "types"
-version = "3.2.0-rc5"
-source = "git+https://github.com/xinix00/hop.git?tag=v3.2.0-rc5#a22b80c474ded1533c68ea81ffd037e5a49abdb9"
+version = "3.2.0-rc8"
+source = "git+https://github.com/xinix00/hop.git?tag=v3.2.0-rc8#c7093d1cbfcbdb80bb29584d53b48d42fae05cb1"
