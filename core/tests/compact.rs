@@ -100,6 +100,35 @@ fn merged_segment_matches_go_and_retains_truncation_history() {
     );
 }
 #[test]
+fn a_compressed_input_makes_a_compressed_merge_with_the_same_pages() {
+    let (mut fs, mut store, mut marker, m2, m3, _, _) = fixture();
+    // m3's segment opnieuw als SPINSEG2: zelfde pagina's, andere bytes.
+    let key = m3.parts[0].key.clone();
+    let packed = segment::encode_with(512, 1536, &[(3, &[7; 512])], true).unwrap();
+    assert_eq!(&packed[..8], b"SPINSEG2");
+    let mut m3 = m3;
+    m3.parts[0].size = packed.len() as u64;
+    m3.parts[0].hash = leancrypto::sha256::Sha256::digest(&packed);
+    store.data.insert(key, packed);
+    let merged =
+        compact::merge(&mut fs, &mut store, NS, &mut marker, window(), &[&m2, &m3]).unwrap();
+    let out = &store.data[&merged.parts[0].key];
+    assert_eq!(&out[..8], b"SPINSEG2");
+    let seg = segment::Segment::decode(out).unwrap();
+    let go = segment::Segment::decode(include_bytes!("fixtures/compact.bin")).unwrap();
+    assert_eq!(seg.database_size(), go.database_size());
+    let (mut a, mut b) = (vec![0u8; 512], vec![0u8; 512]);
+    let pages: Vec<_> = seg.pages().collect();
+    let want: Vec<_> = go.pages().collect();
+    assert_eq!(pages.len(), want.len());
+    for ((n, p), (wn, wp)) in pages.iter().zip(&want) {
+        assert_eq!(n, wn);
+        p.read(&mut a).unwrap();
+        wp.read(&mut b).unwrap();
+        assert_eq!(a, b);
+    }
+}
+#[test]
 fn parallel_downloads_merge_to_the_same_go_segment() {
     let (mut fs, mut store, mut marker, m2, m3, _, _) = fixture();
     store.parallel = Some(replica_core::object::Parallel {
