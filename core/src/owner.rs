@@ -75,6 +75,9 @@ pub struct Config {
     pub pages: u32,
     /// Paginabytes per segment: 64 KiB..16 MiB, standaard 4 MiB.
     pub segment_bytes: usize,
+    /// Segmenten gecomprimeerd (`SPINSEG2`) in de objectopslag; standaard uit,
+    /// zodat Go's lezer ze kan lezen. Lezen kan altijd beide.
+    pub compress: bool,
     /// Synchronisatie-interval in hele seconden, standaard 15.
     pub interval: u32,
     /// Generatieleeftijd in seconden, standaard één week.
@@ -99,6 +102,7 @@ impl Config {
             path,
             pages,
             segment_bytes: 4 << 20,
+            compress: false,
             interval: 15,
             generation: 7 * 86400,
             retention: 28 * 86400,
@@ -925,7 +929,10 @@ impl Replica {
             &st.tracking,
             !local.complete,
             local.size,
-            self.config.segment_bytes,
+            crate::segment::Segments {
+                bytes: self.config.segment_bytes,
+                compress: self.config.compress,
+            },
         ) {
             Ok(Some(plan)) => plan,
             Ok(None) => return Ok(None),

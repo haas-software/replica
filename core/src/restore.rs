@@ -53,6 +53,8 @@ pub fn stage<B: Storage, S: Store>(
     let mut file = File::open(b, &scratch, true)?;
     file.truncate(0)?;
     let mut shipped = Pages::new(page_limit);
+    // Eén gedecodeerde pagina tegelijk (een segment kan gecomprimeerd zijn).
+    let mut page: Vec<u8> = Vec::new();
     let mut result = Restored {
         sequence: 0,
         at: Time::ZERO,
@@ -79,9 +81,15 @@ pub fn stage<B: Storage, S: Store>(
             {
                 return Err(Error::Corrupt);
             }
-            for (page, data) in seg.pages() {
-                file.write(u64::from(page - 1) * u64::from(size), data)?;
-                shipped.add(page)?;
+            if page.len() != size as usize {
+                page.clear();
+                reserve(&mut page, size as usize)?;
+                page.resize(size as usize, 0);
+            }
+            for (number, stored) in seg.pages() {
+                stored.read(&mut page)?;
+                file.write(u64::from(number - 1) * u64::from(size), &page)?;
+                shipped.add(number)?;
             }
             file.truncate(seg.database_size())?;
             result.page_size = size;

@@ -6,7 +6,8 @@ use crate::{
     local::{File, Name},
     manifest::{MAX_PARTS, Part, field, hex, json_error, uint, unhex},
     object::{self, Store},
-    reserve, segment,
+    reserve,
+    segment::{self, Segments},
     shadow::{Shadow, Shared},
     string,
     tracking::Tracking,
@@ -75,9 +76,9 @@ impl Capture {
         tracking: &Tracking,
         snapshot: bool,
         previous_size: u64,
-        segment_bytes: usize,
+        segments: impl Into<Segments>,
     ) -> Result<Self> {
-        match Plan::new(b, path, tracking, snapshot, previous_size, segment_bytes)? {
+        match Plan::new(b, path, tracking, snapshot, previous_size, segments)? {
             Some(plan) => plan.run(b),
             None => Ok(Self::empty(path, tracking)?),
         }
@@ -253,6 +254,7 @@ pub struct Plan {
     snapshot: bool,
     counter: u32,
     per_segment: usize,
+    compress: bool,
     chunk_count: usize,
     index: usize,
     offset: u64,
@@ -269,8 +271,12 @@ impl Plan {
         tracking: &Tracking,
         snapshot: bool,
         previous_size: u64,
-        segment_bytes: usize,
+        segments: impl Into<Segments>,
     ) -> Result<Option<Self>> {
+        let Segments {
+            bytes: segment_bytes,
+            compress,
+        } = segments.into();
         if !(65536..=16 << 20).contains(&segment_bytes) {
             return Err(Error::Limit);
         }
@@ -370,6 +376,7 @@ impl Plan {
             snapshot,
             counter,
             per_segment,
+            compress,
             chunk_count,
             index: 0,
             offset: 0,
@@ -456,7 +463,7 @@ impl Plan {
         for (&page, bytes) in numbers.iter().zip(data.chunks_exact(page_size as usize)) {
             records.push((page, bytes));
         }
-        let encoded = segment::encode(page_size, self.size, &records)?;
+        let encoded = segment::encode_with(page_size, self.size, &records, self.compress)?;
         let checksum = hash(&encoded);
         let len = encoded.len();
         let t2 = millis(b);

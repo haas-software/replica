@@ -18,7 +18,8 @@ const GEN: &str = "20260930-123456-abcdef0123456789";
 fn go_segment_exact_and_untrusted_lengths() {
     let seg = Segment::decode(SEG).unwrap();
     assert_eq!((seg.page_size(), seg.database_size()), (512, 1536));
-    let pages: Vec<_> = seg.pages().collect();
+    // SPINSEG1 is rauw: de opgeslagen bytes zijn de pagina.
+    let pages: Vec<(u32, &[u8])> = seg.pages().map(|(n, p)| (n, p.stored())).collect();
     assert_eq!(segment::encode(512, 1536, &pages).unwrap(), SEG);
     for end in 0..SEG.len() {
         assert!(Segment::decode(&SEG[..end]).is_err());
@@ -34,6 +35,78 @@ fn go_segment_exact_and_untrusted_lengths() {
     let mut malformed = SEG.to_vec();
     malformed[20..24].copy_from_slice(&u32::MAX.to_be_bytes());
     assert!(Segment::decode(&malformed).is_err());
+}
+#[test]
+fn compressed_segments_roundtrip_and_reject_damage() {
+    // Echte vormen: JSON-achtig, nul, onsamendrukbaar, half; en SPINSEG1 ernaast.
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    let mut rnd = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for page_size in [512u32, 4096, 16384, 65536] {
+        let mut images: Vec<Vec<u8>> = Vec::new();
+        let mut json = String::new();
+        while json.len() < page_size as usize {
+            json.push_str(&format!(
+                "{{\"Id\":\"orders/{}\",\"Lines\":[{{\"Qty\":{}}}]}},",
+                rnd() % 9999,
+                rnd() % 50
+            ));
+        }
+        images.push(json.as_bytes()[..page_size as usize].to_vec());
+        images.push(vec![0u8; page_size as usize]);
+        images.push((0..page_size).map(|_| rnd() as u8).collect());
+        let mut half = vec![0u8; page_size as usize];
+        half[..page_size as usize / 2].fill(b'a');
+        images.push(half);
+        let records: Vec<(u32, &[u8])> = images
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i as u32 + 1, p.as_slice()))
+            .collect();
+        let size = u64::from(page_size) * 4;
+        let packed = segment::encode_with(page_size, size, &records, true).unwrap();
+        let plain = segment::encode(page_size, size, &records).unwrap();
+        assert_eq!(&packed[..8], b"SPINSEG2");
+        assert!(packed.len() < plain.len());
+        for bytes in [&packed, &plain] {
+            let seg = Segment::decode(bytes).unwrap();
+            assert_eq!(seg.is_compressed(), bytes == &packed);
+            let mut out = vec![0u8; page_size as usize];
+            for ((n, page), (want_n, want)) in seg.pages().zip(&records) {
+                assert_eq!(n, *want_n);
+                page.read(&mut out).unwrap();
+                assert_eq!(&out[..], *want);
+            }
+        }
+        // Elke afgebroken lengte en omgedraaide bit: een fout, geen paniek.
+        for end in (0..packed.len()).step_by(7) {
+            assert!(Segment::decode(&packed[..end]).is_err());
+        }
+        for index in (0..packed.len()).step_by(3) {
+            let mut damaged = packed.clone();
+            damaged[index] ^= 0x10;
+            assert!(Segment::decode(&damaged).is_err());
+        }
+    }
+    // Een kloppende hash over een kapot LZ-blok: decode slaagt, het lezen
+    // van de pagina geeft een fout of nooit de oorspronkelijke pagina.
+    let page = vec![b'x'; 4096];
+    let packed = segment::encode_with(4096, 4096, &[(1, &page)], true).unwrap();
+    for at in 32..packed.len() - 32 {
+        let mut bad = packed[..packed.len() - 32].to_vec();
+        bad[at] ^= 0xFF;
+        let digest = replica_core::hash(&bad);
+        bad.extend_from_slice(&digest);
+        if let Ok(seg) = Segment::decode(&bad) {
+            let mut out = vec![0u8; 4096];
+            let (_, p) = seg.pages().next().unwrap();
+            assert!(p.read(&mut out).is_err() || out != page);
+        }
+    }
 }
 #[test]
 fn dirty_header_and_append_match_go_and_choose_conservatively() {

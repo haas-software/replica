@@ -120,6 +120,7 @@ pub fn merge_sealed<B: Storage, S: Store>(
     let mut page_size = 0;
     let mut size = 0;
     let mut source_index = 0;
+    let mut packed = false;
     let mut minimum = inputs[0].min_size;
     let mut prefetch = object::Prefetch::new(&refs);
     for m in inputs {
@@ -142,6 +143,7 @@ pub fn merge_sealed<B: Storage, S: Store>(
             if seg.database_size() < size {
                 winners.truncate((seg.database_size() / u64::from(seg.page_size())) as usize);
             }
+            packed |= seg.is_compressed();
             for (page, _) in seg.pages() {
                 let index = (page - 1) as usize;
                 if index >= winners.len() {
@@ -163,6 +165,7 @@ pub fn merge_sealed<B: Storage, S: Store>(
         page_size,
         size,
         prefix: &data_prefix,
+        compress: packed,
     };
     let segment_pages = segment_bytes / page_size as usize;
     reserve(&mut output.numbers, segment_pages)?;
@@ -176,7 +179,9 @@ pub fn merge_sealed<B: Storage, S: Store>(
                 continue;
             }
             output.numbers.push(page);
-            output.data.extend_from_slice(data);
+            let at = output.data.len();
+            output.data.resize(at + page_size as usize, 0);
+            data.read(&mut output.data[at..])?;
             if output.numbers.len() >= segment_pages {
                 output.flush(store)?;
             }
@@ -207,6 +212,8 @@ struct Output<'a> {
     page_size: u32,
     size: u64,
     prefix: &'a str,
+    /// SPINSEG2 zodra één invoersegment dat is.
+    compress: bool,
 }
 impl Output<'_> {
     fn flush<S: Store>(&mut self, store: &mut S) -> Result {
@@ -222,7 +229,7 @@ impl Output<'_> {
         {
             records.push((page, data));
         }
-        let bytes = segment::encode(self.page_size, self.size, &records)?;
+        let bytes = segment::encode_with(self.page_size, self.size, &records, self.compress)?;
         let mut name = *b"000000.seg";
         let mut n = self.parts.len() + 1;
         for b in name[..6].iter_mut().rev() {

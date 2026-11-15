@@ -73,7 +73,7 @@ impl Batch {
         path: Name,
         tracking: &Tracking,
         local: &LocalMarker,
-        segment_bytes: usize,
+        segments: impl Into<crate::segment::Segments>,
     ) -> Result<Option<Self>> {
         if local.value.generation.is_empty() || local.value.uncertain != 0 {
             return Err(Error::State);
@@ -87,7 +87,7 @@ impl Batch {
             tracking,
             !local.value.complete,
             local.value.size,
-            segment_bytes,
+            segments,
         )?;
         if capture.is_empty() {
             return Ok(None);

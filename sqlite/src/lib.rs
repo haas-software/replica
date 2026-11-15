@@ -64,14 +64,17 @@
     )
 )]
 
+extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
 pub mod asynchronous;
 mod callbacks;
+pub mod compress;
 mod ffi;
 #[cfg(feature = "std")]
 pub mod host;
+pub mod lz;
 pub mod memory;
 mod statement;
 mod storage;
