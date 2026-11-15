@@ -74,7 +74,7 @@ sequence, logische maat en checksum van het snapshot.
 - Past het record niet meer, dan een **checkpoint**: de hele kaart als nieuw
   snapshot in vrije segmenten, `sync`, het andere superblok met een hogere
   generatie en een nieuw zout, `sync`. Het oude gebied is daarna vrij. Het log
-  is half zo groot als het snapshot (64 KiB tot 64 MiB): een checkpoint kost
+  is half zo groot als het snapshot (60 KiB tot 64 MiB): een checkpoint kost
   zo ongeveer 32 bytes per gewijzigde kaartingang extra, plus de sectorvulling
   van kleine records.
 - Zonder `sync` van SQLite (`synchronous=OFF`, offline werk) is de afronding
@@ -137,6 +137,22 @@ VACUUM INTO '<nieuw>'` op een `Compressed`-opslag (de doelnaam is nieuw, dus een
 container met SQLite's paginamaat), controleren, dan hernoemen. EasyFlor's
 `migrate compress` doet precies dat. Na omzetten krijgt een gerepliceerd
 bestand een nieuw snapshot (alle pagina's zijn anders).
+
+## Metingen (15-11-2026, M4, USB-SSD, release)
+
+Klonen van EasyFlor's gemigreerde tenants, omgezet met `migrate compress` (16 KiB):
+
+| Bestand | Ongecomprimeerd (4 KiB) | Container (16 KiB) | Ratio | Omzetten | In S3 (`SPINSEG2`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Nagel `main.db` | 32,55 GB | 6,22 GB | 5,24 | 463 s | 6,04 GB |
+| Nagel `2024.db` | 11,71 GB | 2,10 GB | 5,58 | 112 s | 2,05 GB |
+| LGFlowers, 5 bestanden | 720 MB | 115 MB | 6,3 | 17 s | |
+
+Het containerbestand is iets groter dan zijn gecomprimeerde pagina's: het
+metadatagebied (8 bytes per pagina plus log), de sectoralignering per commit en
+de vrije ruimte die de schoonmaker laat staan. In S3 staan 10.601 segmenten,
+8,09 GB voor 44,26 GB logische pagina's; de seed van beide bestanden had een
+piekgeheugen van 44 MB.
 
 ## Toetsen
 

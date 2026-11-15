@@ -581,6 +581,47 @@ fn damaged_containers_give_errors_not_panics() {
     });
 }
 
+#[test]
+fn big_pages_in_a_paged_engine_survive_a_big_transaction() {
+    // Een paginacache in slots van 16 KiB (`initialize_paged`): een transactie van
+    // tientallen MiB aan 16 KiB-pagina's in een heap van 16 MiB loopt niet vol.
+    let _guard = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heap = vec![0_u64; 2 << 20];
+    let mut base = Vol::new(&disk(2));
+    // SAFETY: Het slot houdt dit de enige SQLite-runtime van het proces.
+    let engine = unsafe { Engine::initialize_paged(&mut heap, &mut base, 16384) }.unwrap();
+    let d = disk(19);
+    let mut cs = Compressed::new(Vol::new(&d), Policy::compressed());
+    let mut db = engine.open_with(c"main.db", &mut cs).unwrap();
+    exec(&mut db, "PRAGMA page_size=16384");
+    exec(&mut db, SCHEMA);
+    let mut rng = Rng(4242);
+    exec(&mut db, "BEGIN");
+    for id in 0..12_000 {
+        let b = body(&mut rng, 3000);
+        run(
+            &mut db,
+            c"INSERT INTO docs(id, kind, body) VALUES(?1, 'k', ?2)",
+            &[Value::Integer(id), Value::Text(&b)],
+        );
+    }
+    exec(&mut db, "COMMIT");
+    exec(
+        &mut db,
+        "UPDATE docs SET body = body || 'x' WHERE id % 3 = 0",
+    );
+    assert_eq!(integer(&mut db, c"SELECT count(*) FROM docs"), 12_000);
+    assert_eq!(integer(&mut db, c"PRAGMA page_size"), 16384);
+    integrity(&mut db);
+    // Een ongeldige paginamaat is een fout, geen engine.
+    drop(db);
+    drop(engine);
+    let mut heap = vec![0_u64; 1 << 16];
+    let mut base = Vol::new(&disk(3));
+    // SAFETY: Idem; de vorige engine is weg.
+    assert!(unsafe { Engine::initialize_paged(&mut heap, &mut base, 1000) }.is_err());
+}
+
 /// Eén scenario voor de stroomuitval: een schone begintoestand en één
 /// transactie erbovenop.
 struct Scenario {

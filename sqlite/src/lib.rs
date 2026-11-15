@@ -144,15 +144,35 @@ impl<'a, B: Storage> Engine<'a, B> {
     /// opslagcallbacks mogen niet in SQLite herintreden. Deze voorwaarde hoort
     /// bij de boot-schil, omdat SQLite zelf procesglobale C-staat bevat.
     pub unsafe fn initialize(heap: &'a mut [u64], backend: &'a mut B) -> Result<Self> {
+        // SAFETY: Dezelfde voorwaarden, doorgegeven aan de aanroeper.
+        unsafe { Self::initialize_paged(heap, backend, 4096) }
+    }
+    /// Als [`Engine::initialize`], met de paginacache in slots van `page_size`
+    /// (512..=65536, een macht van twee): de paginamaat van de databases van de
+    /// app. Een grotere pagina dan het slot komt uit de heap en vult die; een
+    /// kleinere laat de rest van zijn slot leeg. `initialize` neemt 4 KiB;
+    /// gecomprimeerde opslag ([`compress`]) wil grotere pagina's, bijvoorbeeld
+    /// 16 KiB.
+    ///
+    /// # Safety
+    /// Als [`Engine::initialize`].
+    pub unsafe fn initialize_paged(
+        heap: &'a mut [u64],
+        backend: &'a mut B,
+        page_size: u32,
+    ) -> Result<Self> {
         let bytes = heap
             .len()
             .checked_mul(8)
             .and_then(|n| i32::try_from(n).ok())
             .ok_or(Error::MEMORY)?;
+        let page_size = i32::try_from(page_size).map_err(|_| Error::MISUSE)?;
         let callbacks = callbacks::callbacks(backend);
         // SAFETY: De aanroeper bewijst de unieke boot-runtime; heap en B zijn geleend
         // tot Drop. De C-shim kopieert callbacks voordat deze stackwaarde verdwijnt.
-        check(unsafe { ffi::replica_sqlite_init(heap.as_mut_ptr().cast(), bytes, &callbacks) })?;
+        check(unsafe {
+            ffi::replica_sqlite_init(heap.as_mut_ptr().cast(), bytes, page_size, &callbacks)
+        })?;
         Ok(Self {
             _owner: PhantomData,
         })

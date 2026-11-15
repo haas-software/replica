@@ -21,6 +21,7 @@ unsafe extern "C" {
     pub(crate) fn replica_sqlite_init(
         heap: *mut c_void,
         bytes: c_int,
+        page_size: c_int,
         storage: *const Callbacks,
     ) -> c_int;
     pub(crate) fn replica_sqlite_end();

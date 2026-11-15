@@ -20,7 +20,7 @@ typedef struct {
  int (*time)(void *, int64_t *);
  int (*cooperate)(void *);
 } ReplicaStorage;
-int replica_sqlite_init(void *heap, int bytes, const ReplicaStorage *storage);
+int replica_sqlite_init(void *heap, int bytes, int page_size, const ReplicaStorage *storage);
 void replica_sqlite_end(void);
 int replica_sqlite_open(const char *path, sqlite3 **db);
 int replica_sqlite_open_read_only(const char *path, sqlite3 **db);

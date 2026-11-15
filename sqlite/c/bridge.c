@@ -163,8 +163,9 @@ static sqlite3_vfs vfs={
 int sqlite3_os_init(void){return sqlite3_vfs_register(&vfs,1);}
 int sqlite3_os_end(void){return SQLITE_OK;}
 
-int replica_sqlite_init(void *heap,int bytes,const ReplicaStorage *storage) {
+int replica_sqlite_init(void *heap,int bytes,int page_size,const ReplicaStorage *storage) {
  if(active || bytes<65536 || !heap || !storage)return SQLITE_MISUSE;
+ if(page_size<512 || page_size>65536 || (page_size&(page_size-1)))return SQLITE_MISUSE;
  /* De paginacache uit een eigen pool: in memsys5 (machten van twee) kost een
   * pagina van 4 KiB plus kop 8 KiB, in de pool precies wat hij is. Drie
   * achtste van de heap; de rest is memsys5 voor de sorter, statements en
@@ -174,7 +175,11 @@ int replica_sqlite_init(void *heap,int bytes,const ReplicaStorage *storage) {
   * PMA's van enkele MiB schreef en in meer lagen moest mergen. */
  int hdr=0,rc=sqlite3_config(SQLITE_CONFIG_PCACHE_HDRSZ,&hdr);
  if(rc!=SQLITE_OK)return rc;
- int page=(4096+hdr+7)&~7;
+ /* Een slot per pagina van de paginamaat van de app (standaard 4 KiB): een
+  * grotere pagina past niet in een slot en komt uit memsys5, tegen het dubbele;
+  * met cache_size in slots van de pool liep die dan vol (NOMEM, GEMETEN
+  * 15-11-2026: EasyFlor met 16 KiB-pagina's in een heap van 64 MiB). */
+ int page=(page_size+hdr+7)&~7;
  /* De cache zestien pagina's kleiner dan de pool: pcache1 meldt "druk" zodra
   * er minder dan tien slots vrij zijn, en dan spilt de pager bij elke nieuwe
   * pagina één vuile pagina los (willekeurige volgorde, dus losse writes) in
