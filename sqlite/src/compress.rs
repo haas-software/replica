@@ -595,6 +595,8 @@ struct Handle {
     inner: FileId,
     /// `Some(i)`: container `i`, anders gewoon doorgeven.
     container: Option<usize>,
+    /// Het journal (`<naam>-journal`) van container `i`: zijn afronding is een commit.
+    journal_of: Option<usize>,
 }
 
 /// Werkbuffers, één keer per eigenaar.
@@ -618,8 +620,13 @@ pub struct Compressed<S: Storage> {
     inner: S,
     policy: Policy,
     handles: Vec<Option<Handle>>,
-    files: Vec<Container>,
+    /// Containers by slot; a handle keeps its slot number, so a slot is emptied
+    /// (`None`) but never moved.
+    files: Vec<Option<Container>>,
     work: Work,
+    /// `false` tijdens een commit die SQLite niet met `sync` vroeg (de afronding van
+    /// het journal bij `synchronous=OFF`): het record zonder `sync`.
+    durable: bool,
 }
 
 impl<S: Storage> Compressed<S> {
@@ -636,6 +643,7 @@ impl<S: Storage> Compressed<S> {
                 page: Vec::new(),
                 cached: None,
             },
+            durable: true,
         }
     }
     /// De binnenste opslag.
@@ -664,7 +672,11 @@ impl<S: Storage> Compressed<S> {
     }
 
     fn container(&mut self, i: usize) -> Result<&mut Container> {
-        let c = self.files.get_mut(i).ok_or(Error::IO)?;
+        let c = self
+            .files
+            .get_mut(i)
+            .and_then(Option::as_mut)
+            .ok_or(Error::IO)?;
         if c.broken { Err(Error::IO) } else { Ok(c) }
     }
 
@@ -1231,9 +1243,12 @@ impl<S: Storage> Compressed<S> {
     /// Opent of hergebruikt container `name` met handvat `id` van de binnenste opslag.
     fn open_container(&mut self, name: &[u8], id: FileId, create: bool) -> Result<Option<usize>> {
         let size = self.inner.size(id)?;
-        let ci = self.files.iter().position(|c| c.name() == name);
+        let ci = self
+            .files
+            .iter()
+            .position(|c| c.as_ref().is_some_and(|c| c.name() == name));
         if let Some(i) = ci
-            && let Some(c) = self.files.get(i)
+            && let Some(Some(c)) = self.files.get(i)
             && c.opens > 0
         {
             // Al open in deze eigenaar: die kaart is de waarheid.
@@ -1249,7 +1264,9 @@ impl<S: Storage> Compressed<S> {
         let blank = size > 0 && head.iter().all(|&b| b == 0);
         if !(ours || (create && (size == 0 || blank))) {
             if let Some(i) = ci {
-                self.files.swap_remove(i);
+                if let Some(slot) = self.files.get_mut(i) {
+                    *slot = None;
+                }
                 self.work.cached = None;
             }
             return Ok(None);
@@ -1257,13 +1274,28 @@ impl<S: Storage> Compressed<S> {
         let i = match ci {
             Some(i) => i,
             None => {
-                self.files.try_reserve(1).map_err(|_| Error::MEMORY)?;
-                self.files.push(Container::new(name)?);
-                self.files.len() - 1
+                let c = Container::new(name)?;
+                match self.files.iter().position(Option::is_none) {
+                    Some(free) => {
+                        if let Some(slot) = self.files.get_mut(free) {
+                            *slot = Some(c);
+                        }
+                        free
+                    }
+                    None => {
+                        self.files.try_reserve(1).map_err(|_| Error::MEMORY)?;
+                        self.files.push(Some(c));
+                        self.files.len() - 1
+                    }
+                }
             }
         };
         self.work.cached = None;
-        let c = self.files.get_mut(i).ok_or(Error::IO)?;
+        let c = self
+            .files
+            .get_mut(i)
+            .and_then(Option::as_mut)
+            .ok_or(Error::IO)?;
         c.broken = false;
         if let Err(e) = refresh(&mut self.inner, c, id) {
             c.valid = false;
@@ -1271,7 +1303,9 @@ impl<S: Storage> Compressed<S> {
         }
         if c.page_size == 0 && !create {
             // Leeg zonder toestemming om te comprimeren: gewoon bestand.
-            self.files.swap_remove(i);
+            if let Some(slot) = self.files.get_mut(i) {
+                *slot = None;
+            }
             return Ok(None);
         }
         Ok(Some(i))
@@ -1364,7 +1398,10 @@ impl<S: Storage> Compressed<S> {
             let Self {
                 inner, files, work, ..
             } = self;
-            let c = files.get_mut(ci).ok_or(Error::IO)?;
+            let c = files
+                .get_mut(ci)
+                .and_then(Option::as_mut)
+                .ok_or(Error::IO)?;
             let enc = work.enc.as_mut().ok_or(Error::MEMORY)?;
             if n == page_size as usize {
                 store(inner, enc, &mut work.stored, c, id, page, piece)?;
@@ -1424,7 +1461,7 @@ impl<S: Storage> Compressed<S> {
             let Self {
                 inner, files, work, ..
             } = self;
-            let c = files.get(ci).ok_or(Error::IO)?;
+            let c = files.get(ci).and_then(Option::as_ref).ok_or(Error::IO)?;
             let out = dst.get_mut(pos..pos + n).ok_or(Error::IO)?;
             if n == page_size as usize {
                 load_page(inner, &mut work.stored, c, id, page, out)?;
@@ -1474,7 +1511,10 @@ impl<S: Storage> Compressed<S> {
             let Self {
                 inner, files, work, ..
             } = self;
-            let c = files.get_mut(ci).ok_or(Error::IO)?;
+            let c = files
+                .get_mut(ci)
+                .and_then(Option::as_mut)
+                .ok_or(Error::IO)?;
             let scratch = work.page.get_mut(..page_size as usize).ok_or(Error::IO)?;
             load_page(inner, &mut work.stored, c, id, last, scratch)?;
             if let Some(t) = scratch.get_mut(within..) {
@@ -1509,13 +1549,52 @@ impl<S: Storage> Compressed<S> {
         }
         let out = self.commit_inner(ci, id);
         if out.is_err()
-            && let Some(c) = self.files.get_mut(ci)
+            && let Some(Some(c)) = self.files.get_mut(ci)
         {
             // Onbekend wat er duurzaam is: pas na heropenen verder.
             c.broken = true;
             c.valid = false;
         }
         out
+    }
+
+    /// Een commit zonder `sync` op het moment dat SQLite zijn transactie afrondt
+    /// zonder de database te synchroniseren (`synchronous=OFF`, een rollback): het
+    /// journal wordt verwijderd, op nul gekapt of zijn kop gewist. Zo ziet een andere
+    /// eigenaar (een ander proces) wat er geschreven is, zoals bij een gewoon bestand;
+    /// duurzaam is het pas na een volgende `sync`, zoals SQLite bij `OFF` ook belooft.
+    /// Een checkpoint blijft wel gesynct: het superblok mag nooit naar een half
+    /// snapshot wijzen.
+    fn settle(&mut self, ci: usize) -> Result {
+        let pending = self
+            .files
+            .get(ci)
+            .and_then(Option::as_ref)
+            .is_some_and(|c| c.pending && !c.broken && c.opens > 0);
+        if !pending {
+            return Ok(());
+        }
+        let Some(id) = self
+            .handles
+            .iter()
+            .flatten()
+            .find(|h| h.container == Some(ci))
+            .map(|h| h.inner)
+        else {
+            return Ok(());
+        };
+        self.durable = false;
+        let out = self.commit(ci, id);
+        self.durable = true;
+        out
+    }
+
+    /// De container met open handvatten waarvan `name` het journal is.
+    fn journal_owner(&self, name: &[u8]) -> Option<usize> {
+        let base = name.strip_suffix(b"-journal")?;
+        self.files
+            .iter()
+            .position(|c| c.as_ref().is_some_and(|c| c.opens > 0 && c.name() == base))
     }
 
     fn commit_inner(&mut self, ci: usize, id: FileId) -> Result {
@@ -1563,7 +1642,9 @@ impl<S: Storage> Compressed<S> {
         put(&mut rec, 40, &s.to_le_bytes());
         let at = c.log_off + c.log_end;
         self.inner.write(id, at, &rec)?;
-        self.inner.sync(id, 3)?;
+        if self.durable {
+            self.inner.sync(id, 3)?;
+        }
         let c = self.container(ci)?;
         c.physical = c.physical.max(at + len as u64);
         c.log_end += align(len as u64, SECTOR);
@@ -1842,7 +1923,10 @@ impl<S: Storage> Compressed<S> {
             let Self {
                 inner, files, work, ..
             } = self;
-            let c = files.get_mut(ci).ok_or(Error::IO)?;
+            let c = files
+                .get_mut(ci)
+                .and_then(Option::as_mut)
+                .ok_or(Error::IO)?;
             let e = c.map.get(page).copied().unwrap_or(0);
             let Some(s) = slot_of(e, page_size) else {
                 continue;
@@ -1887,18 +1971,24 @@ impl<S: Storage> Storage for Compressed<S> {
             }
         };
         if let Some(ci) = container
-            && let Some(c) = self.files.get_mut(ci)
+            && let Some(Some(c)) = self.files.get_mut(ci)
         {
             c.opens += 1;
         }
+        let journal_of = if container.is_none() {
+            self.journal_owner(bytes)
+        } else {
+            None
+        };
         match self.new_handle(Handle {
             inner: id,
             container,
+            journal_of,
         }) {
             Ok(h) => Ok(h),
             Err(e) => {
                 if let Some(ci) = container
-                    && let Some(c) = self.files.get_mut(ci)
+                    && let Some(Some(c)) = self.files.get_mut(ci)
                 {
                     c.opens -= 1;
                 }
@@ -1914,7 +2004,7 @@ impl<S: Storage> Storage for Compressed<S> {
         }
         let mut out = Ok(());
         if let Some(ci) = h.container
-            && let Some(c) = self.files.get_mut(ci)
+            && let Some(Some(c)) = self.files.get_mut(ci)
         {
             c.opens = c.opens.saturating_sub(1);
             if c.opens == 0 {
@@ -1925,7 +2015,7 @@ impl<S: Storage> Storage for Compressed<S> {
                     // Ook zonder sync van SQLite (synchronous=OFF, VACUUM INTO)
                     // is het bestand na sluiten compleet.
                     out = self.commit(ci, h.inner);
-                    if let Some(c) = self.files.get_mut(ci)
+                    if let Some(Some(c)) = self.files.get_mut(ci)
                         && c.broken
                     {
                         c.broken = false;
@@ -1947,14 +2037,32 @@ impl<S: Storage> Storage for Compressed<S> {
     fn write(&mut self, file: FileId, offset: u64, src: &[u8]) -> Result {
         let h = self.handle(file)?;
         match h.container {
-            None => self.inner.write(h.inner, offset, src),
+            None => {
+                self.inner.write(h.inner, offset, src)?;
+                // SQLite wist de journalkop: de transactie is af.
+                if let Some(ci) = h.journal_of
+                    && offset == 0
+                    && src.iter().all(|&b| b == 0)
+                {
+                    self.settle(ci)?;
+                }
+                Ok(())
+            }
             Some(ci) => self.write_container(ci, h.inner, offset, src),
         }
     }
     fn truncate(&mut self, file: FileId, size: u64) -> Result {
         let h = self.handle(file)?;
         match h.container {
-            None => self.inner.truncate(h.inner, size),
+            None => {
+                self.inner.truncate(h.inner, size)?;
+                if let Some(ci) = h.journal_of
+                    && size == 0
+                {
+                    self.settle(ci)?;
+                }
+                Ok(())
+            }
             Some(ci) => self.truncate_container(ci, h.inner, size),
         }
     }
@@ -1974,14 +2082,22 @@ impl<S: Storage> Storage for Compressed<S> {
     }
     fn remove(&mut self, name: &CStr, sync_directory: bool) -> Result {
         let bytes = name.to_bytes();
-        if let Some(i) = self.files.iter().position(|c| c.name() == bytes) {
-            if self.files.get(i).is_some_and(|c| c.opens > 0) {
+        if let Some(slot) = self
+            .files
+            .iter_mut()
+            .find(|c| c.as_ref().is_some_and(|c| c.name() == bytes))
+        {
+            if slot.as_ref().is_some_and(|c| c.opens > 0) {
                 return Err(Error { code: 5 });
             }
-            self.files.swap_remove(i);
+            *slot = None;
             self.work.cached = None;
         }
-        self.inner.remove(name, sync_directory)
+        self.inner.remove(name, sync_directory)?;
+        if let Some(ci) = self.journal_owner(bytes) {
+            self.settle(ci)?;
+        }
+        Ok(())
     }
     fn exists(&mut self, name: &CStr) -> Result<bool> {
         self.inner.exists(name)

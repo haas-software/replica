@@ -3,7 +3,8 @@
 Native SQLite en paginareplicatie voor `no_std`-apps op HopOS. SQLite wordt als
 C gelinkt en gebruikt een Rust-VFS, een vaste heap en rollback-journals.
 De bestaande Go-formaten blijven behouden: `SPINSEG1`, `SPINDRT1`, manifest v2,
-markers en objectnamen. Geen WASM, POSIX-bestandssysteem of verborgen executor.
+markers en objectnamen; gecomprimeerde segmenten (`SPINSEG2`) zijn een keuze
+per eigenaar (`owner::Config::compress`). Geen WASM, POSIX-bestandssysteem of verborgen executor.
 
 De replicatiebibliotheek bevat tracking, prepare/restore, snapshot/increment,
 onzekere-publicatieherstel, compactie, retentie, generatieopruiming, herstelpuntcatalogus, offline Fetch en de schrijverlease in S3.
@@ -18,7 +19,7 @@ Zie [contracten en resterende aansluiting](docs/port.md).
 
 | Crate | Verantwoordelijkheid |
 | --- | --- |
-| `replica-sqlite` | SQLite 3.53.4, C-shim, veilige verbindingen/statements, vaste `memsys5`-heap en VFS |
+| `replica-sqlite` | SQLite 3.53.4, C-shim, veilige verbindingen/statements, vaste `memsys5`-heap en VFS; transparante paginacompressie (`compress`, `lz`, zie [docs/compress.md](docs/compress.md)) |
 | `replica-core` | Go-formaten, tracking/dirty logs, lokale markers, capture, publicatie, prepare, restore, compactie, retentie en schrijverlease |
 | `replica-s3` | Concrete objectadapter op Lean S3 v3.1.1, SigV4, begrensd streamen en volledige listings |
 | `replica-hopos` | Async system-client als SQLite-opslag via de private stack; `xSync` is OP_SYNC |

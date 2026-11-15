@@ -448,7 +448,15 @@ fn two_owners_see_each_others_commits() {
         let mut db = engine.open_with(c"main.db", &mut sql).unwrap();
         exec(&mut db, "PRAGMA page_size=4096");
         exec(&mut db, SCHEMA);
-        for round in 0..40 {
+        for round in 0..60 {
+            if round == 30 {
+                // Zonder sync van SQLite (offline werk, migrate): de afronding van het
+                // journal is de commit, en de andere eigenaar ziet hem meteen.
+                exec(&mut db, "PRAGMA synchronous=OFF");
+            }
+            if round == 45 {
+                exec(&mut db, "PRAGMA journal_mode=TRUNCATE");
+            }
             exec(&mut db, "BEGIN");
             for _ in 0..1 + rng.below(if round % 9 == 0 { 400 } else { 5 }) {
                 let n = 100 + rng.below(3000) as usize;
@@ -467,6 +475,10 @@ fn two_owners_see_each_others_commits() {
             assert_eq!(raw, again);
             let mut check = Compressed::new(Vol::new(&d), Policy::compressed());
             assert_eq!(logical(&mut check, c"main.db"), raw, "round {round}");
+            // En dat is wat SQLite ziet: dezelfde rijen via de verse eigenaar.
+            let mut fresh = Compressed::new(Vol::new(&d), Policy::compressed());
+            let mut other = engine.open_with(c"main.db", &mut fresh).unwrap();
+            assert_eq!(digest(&mut other), digest(&mut db), "round {round}");
         }
         integrity(&mut db);
     });
