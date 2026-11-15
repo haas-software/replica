@@ -43,7 +43,10 @@ sidecars nooit (`compress::is_sidecar`, de restore-scratch wel).
 
 - **Pagina's.** De container heeft één paginamaat: die van SQLite's kop in de
   eerste write (16 KiB in EasyFlor), anders `Policy::page_size`. Een write
-  die geen hele pagina is, wordt read-modify-write.
+  die geen hele pagina is, wordt read-modify-write. Een app met pagina's van
+  16 KiB start de engine met `Engine::initialize_paged(heap, opslag, 16384)`:
+  met de slots van 4 KiB van `initialize` komen grotere pagina's uit memsys5 en
+  loopt de heap onder belasting vol (NOMEM, gemeten in EasyFlor).
 - **Slot.** Een gecomprimeerde pagina staat zonder kop aaneengesloten in één
   segment. Onsamendrukbaar: rauw. Een nulpagina heeft geen slot.
 - **Kaart.** Per pagina een `u64`: byte-offset (48 bits) en lengtecode (0: nul,
