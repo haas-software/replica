@@ -45,6 +45,12 @@ todo = "deny"
 unimplemented = "deny"
 large_stack_arrays = "deny"
 
+# De codec en de container rekenen per byte: ongeoptimaliseerd duurt de
+# stroomuitvaltoets van sqlite/tests/compress.rs ruim tien minuten
+# (GEMETEN 15-11-2026: 626 s voor de hele binary).
+[profile.dev.package.replica-sqlite]
+opt-level = 2
+
 [profile.release]
 panic = "abort"
 overflow-checks = true
