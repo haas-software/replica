@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 replica-sqlite = { path = "../sqlite" }
 hop-types = { package = "types", git = "https://github.com/hop-os/hop.git", tag = "v3.2.1" }
-leancrypto = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.0" }
+leancrypto = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.3" }
 hop-discovery = { package = "discovery", git = "https://github.com/hop-os/hop.git", tag = "v3.2.1" }
 [features]
 # `host::{Dir, DirLease}`: objectstore en lease in een lokale map (std), en

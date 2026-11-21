@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "abi"
-version = "3.2.0"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.0#8dc79d43feae6d652620b6e32abcfc05906d1ead"
+version = "3.2.3"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.3#db03eca5c865b9874e5e0d9d0de5ecea030483e1"
 dependencies = [
  "bounded",
  "dev",
@@ -14,8 +14,8 @@ dependencies = [
 
 [[package]]
 name = "applib"
-version = "3.2.0"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.0#8dc79d43feae6d652620b6e32abcfc05906d1ead"
+version = "3.2.3"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.3#db03eca5c865b9874e5e0d9d0de5ecea030483e1"
 dependencies = [
  "abi",
  "bounded",
@@ -30,13 +30,13 @@ dependencies = [
 
 [[package]]
 name = "bounded"
-version = "3.2.0"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.0#8dc79d43feae6d652620b6e32abcfc05906d1ead"
+version = "3.2.3"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.3#db03eca5c865b9874e5e0d9d0de5ecea030483e1"
 
 [[package]]
 name = "dev"
-version = "3.2.0"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.0#8dc79d43feae6d652620b6e32abcfc05906d1ead"
+version = "3.2.3"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.3#db03eca5c865b9874e5e0d9d0de5ecea030483e1"
 
 [[package]]
 name = "discovery"
@@ -48,8 +48,8 @@ dependencies = [
 
 [[package]]
 name = "executor"
-version = "3.2.0"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.0#8dc79d43feae6d652620b6e32abcfc05906d1ead"
+version = "3.2.3"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.3#db03eca5c865b9874e5e0d9d0de5ecea030483e1"
 dependencies = [
  "dev",
  "sync",
@@ -57,23 +57,23 @@ dependencies = [
 
 [[package]]
 name = "heap"
-version = "3.2.0"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.0#8dc79d43feae6d652620b6e32abcfc05906d1ead"
+version = "3.2.3"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.3#db03eca5c865b9874e5e0d9d0de5ecea030483e1"
 
 [[package]]
 name = "leancrypto"
-version = "3.2.0"
-source = "git+https://github.com/haas-software/lean.git?tag=v3.2.0#36212e601bbcf6a76149e089a606012c609cb1c9"
+version = "3.2.3"
+source = "git+https://github.com/haas-software/lean.git?tag=v3.2.3#de0bbd7c6bd4c2103f5f4dd26d9c4731a3fff8eb"
 
 [[package]]
 name = "leanhttp"
-version = "3.2.0"
-source = "git+https://github.com/haas-software/lean.git?tag=v3.2.0#36212e601bbcf6a76149e089a606012c609cb1c9"
+version = "3.2.3"
+source = "git+https://github.com/haas-software/lean.git?tag=v3.2.3#de0bbd7c6bd4c2103f5f4dd26d9c4731a3fff8eb"
 
 [[package]]
 name = "leanhttps"
-version = "3.2.0"
-source = "git+https://github.com/haas-software/lean.git?tag=v3.2.0#36212e601bbcf6a76149e089a606012c609cb1c9"
+version = "3.2.3"
+source = "git+https://github.com/haas-software/lean.git?tag=v3.2.3#de0bbd7c6bd4c2103f5f4dd26d9c4731a3fff8eb"
 dependencies = [
  "leanhttp",
  "leantls",
@@ -81,21 +81,21 @@ dependencies = [
 
 [[package]]
 name = "leannet"
-version = "3.2.0"
-source = "git+https://github.com/haas-software/lean.git?tag=v3.2.0#36212e601bbcf6a76149e089a606012c609cb1c9"
+version = "3.2.3"
+source = "git+https://github.com/haas-software/lean.git?tag=v3.2.3#de0bbd7c6bd4c2103f5f4dd26d9c4731a3fff8eb"
 
 [[package]]
 name = "leans3"
-version = "3.2.0"
-source = "git+https://github.com/haas-software/lean.git?tag=v3.2.0#36212e601bbcf6a76149e089a606012c609cb1c9"
+version = "3.2.3"
+source = "git+https://github.com/haas-software/lean.git?tag=v3.2.3#de0bbd7c6bd4c2103f5f4dd26d9c4731a3fff8eb"
 dependencies = [
  "leancrypto",
 ]
 
 [[package]]
 name = "leans3http"
-version = "3.2.0"
-source = "git+https://github.com/haas-software/lean.git?tag=v3.2.0#36212e601bbcf6a76149e089a606012c609cb1c9"
+version = "3.2.3"
+source = "git+https://github.com/haas-software/lean.git?tag=v3.2.3#de0bbd7c6bd4c2103f5f4dd26d9c4731a3fff8eb"
 dependencies = [
  "leanhttp",
  "leans3",
@@ -103,23 +103,23 @@ dependencies = [
 
 [[package]]
 name = "leantls"
-version = "3.2.0"
-source = "git+https://github.com/haas-software/lean.git?tag=v3.2.0#36212e601bbcf6a76149e089a606012c609cb1c9"
+version = "3.2.3"
+source = "git+https://github.com/haas-software/lean.git?tag=v3.2.3#de0bbd7c6bd4c2103f5f4dd26d9c4731a3fff8eb"
 dependencies = [
  "leancrypto",
 ]
 
 [[package]]
 name = "netdev"
-version = "3.2.0"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.0#8dc79d43feae6d652620b6e32abcfc05906d1ead"
+version = "3.2.3"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.3#db03eca5c865b9874e5e0d9d0de5ecea030483e1"
 dependencies = [
  "sync",
 ]
 
 [[package]]
 name = "replica-core"
-version = "0.1.0"
+version = "3.2.3"
 dependencies = [
  "discovery",
  "leancrypto",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "replica-hopos"
-version = "0.1.0"
+version = "3.2.3"
 dependencies = [
  "applib",
  "leanhttp",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "replica-s3"
-version = "0.1.0"
+version = "3.2.3"
 dependencies = [
  "leans3",
  "replica-core",
@@ -155,14 +155,14 @@ dependencies = [
 
 [[package]]
 name = "replica-sqlite"
-version = "0.1.0"
+version = "3.2.3"
 dependencies = [
  "replica-sqlite",
 ]
 
 [[package]]
 name = "replica-sqlite-bench"
-version = "0.1.0"
+version = "3.2.3"
 dependencies = [
  "applib",
  "replica-hopos",
@@ -171,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "replica-sqlite-persist"
-version = "0.1.0"
+version = "3.2.3"
 dependencies = [
  "applib",
  "replica-core",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "replica-sqlite-smoke"
-version = "0.1.0"
+version = "3.2.3"
 dependencies = [
  "applib",
  "replica-sqlite",
@@ -189,8 +189,8 @@ dependencies = [
 
 [[package]]
 name = "sync"
-version = "3.2.0"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.0#8dc79d43feae6d652620b6e32abcfc05906d1ead"
+version = "3.2.3"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.3#db03eca5c865b9874e5e0d9d0de5ecea030483e1"
 dependencies = [
  "bounded",
 ]

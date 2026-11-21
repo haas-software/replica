@@ -8,7 +8,7 @@ per eigenaar (`owner::Config::compress`). Geen WASM, POSIX-bestandssysteem of ve
 
 De replicatiebibliotheek bevat tracking, prepare/restore, snapshot/increment,
 onzekere-publicatieherstel, compactie, retentie, generatieopruiming, herstelpuntcatalogus, offline Fetch en de schrijverlease in S3.
-Op HopOS (SDK `v3.0.0-alpha.16`) heeft SQLite echte persistente bestands-I/O
+Op HopOS heeft SQLite echte persistente bestands-I/O
 via de parkeerbare C-stack (`applib::stacktask`) en de bevestigde barrière
 `sys::Client::sync` (OP_SYNC). Dit is nog geen vervanging van een bestaande
 Spin-instantie: de hostapp moet zijn database-eigenaar en de renew van de
@@ -21,7 +21,7 @@ Zie [contracten en resterende aansluiting](docs/port.md).
 | --- | --- |
 | `replica-sqlite` | SQLite 3.53.4, C-shim, veilige verbindingen/statements, vaste `memsys5`-heap en VFS; transparante paginacompressie (`compress`, `lz`, zie [docs/compress.md](docs/compress.md)) |
 | `replica-core` | Go-formaten, tracking/dirty logs, lokale markers, capture, publicatie, prepare, restore, compactie, retentie en schrijverlease; meer databases onder één lease (`group`), banen (`lanes`), capturenummers (`publications`) en een volgende lezer (`follow`), zie [docs/group.md](docs/group.md) |
-| `replica-s3` | Concrete objectadapter op Lean S3 v3.1.1, SigV4, begrensd streamen en volledige listings |
+| `replica-s3` | Concrete objectadapter op Lean S3 (`leans3`), SigV4, begrensd streamen en volledige listings; één stroom- en bytepoort per app (`Gate`) |
 | `replica-hopos` | Async system-client als SQLite-opslag via de private stack; `xSync` is OP_SYNC; de banen van een eigenaarslot (`lanes`) |
 | `replica-sqlite-smoke` | RAM-SQLite als echte Hop-job, twee onafhankelijke slots |
 | `replica-sqlite-persist` | HopFS-commit, koude herstart, echte capture/restore en annulering van langlopende SQL |
@@ -51,6 +51,31 @@ stroom aaneengesloten leest; elke call is een ronde door de OS-core. WAL is niet
 databasebestand als de enige waarheid (capture, dirty tracking, restore), en
 een WAL zou die pagina's pas bij een checkpoint laten zien.
 
+## Versies en pins
+
+Replica zelf: **v3.2.3** (voorstel, nog niet getagd; dezelfde nummering als
+HopOS en Lean). Afnemers pinnen een tag, geen rev op een branch.
+
+| Afhankelijkheid | Crates | Pin |
+| --- | --- | --- |
+| HopOS (`hop-os/HopOS`) | `applib`, `sync` | `v3.2.3` |
+| Lean (`haas-software/lean`) | `leans3`, `leans3http`, `leanhttp`, `leanhttps`, `leantls`, `leancrypto` (en `leannet` via applib) | `v3.2.3` |
+| Hop (`hop-os/hop`) | `types`, `discovery` | `v3.2.1` |
+| SQLite | gevendord in `vendor/sqlite` | 3.53.4 |
+| Rust | `rust-toolchain.toml` | 1.93.0 |
+
+HopOS en Lean hebben dezelfde tag: applib brengt `leannet` mee en `TcpConn`
+moet dezelfde `Dial` kennen als leanhttp. `tools/gate.sh` legt deze tabel
+tegen de `Cargo.toml`'s.
+
+**Het contract met Hop.** De schrijverlease is het leaseobject van
+`hop-discovery` (formaat en CAS-regels van Hop `v3.2.1`, met `hop-types` voor
+node en generatie): één JSON-object per namespace in de bucket, aangemaakt met
+`If-None-Match: *` en vernieuwd met `If-Match: <etag>`. Een Hop-cluster en
+Replica lezen elkaars lease dus zonder vertaling; een nieuwe Hop-tag met een
+ander leaseformaat is een nieuwe Replica-versie. Het call-budget staat onder
+"Inbouwen": één store-call < TTL/3 min het klokverschil.
+
 ## Bouwen en toetsen
 
 Rust 1.93.0 staat vast in `rust-toolchain.toml`. Nodig: clang, llvm-ar en
@@ -68,7 +93,7 @@ REPLICA_BENCH_MIB=64 python3 tools/qemu-bench.py
 
 De gewone poort controleert de meegeleverde SQLite-bronhashes, formatting,
 strikte clippy, hosttests en volledige ARM64- en RISC-V-builds. Met `QEMU=1`
-start hij de RAM-probe tweemaal onder de **gepinde SDK v3.0.12**. Beide apps
+start hij de RAM-probe tweemaal onder de **gepinde HopOS** (zie de pins hierboven). Beide apps
 bouwen ook voor RISC-V; uitvoering is alleen onder ARM64 QEMU getoetst.
 
 De laatste opdracht is de persist-proef, zonder kopie of patch: de app bouwt

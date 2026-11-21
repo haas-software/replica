@@ -8,15 +8,15 @@ license.workspace = true
 replica-sqlite = { path = "../sqlite" }
 replica-core = { path = "../core" }
 replica-s3 = { path = "../s3" }
-applib = { git = "https://github.com/hop-os/HopOS.git", tag = "v3.2.0", features = ["http"] }
+applib = { git = "https://github.com/hop-os/HopOS.git", tag = "v3.2.3", features = ["http"] }
 # `select` en `yield_now` van de banen (`lanes`); dezelfde tag als applib.
-hopsync = { package = "sync", git = "https://github.com/hop-os/HopOS.git", tag = "v3.2.0" }
+hopsync = { package = "sync", git = "https://github.com/hop-os/HopOS.git", tag = "v3.2.3" }
 # Dezelfde Lean-tag als applib, zodat `TcpConn` en leanhttp één `Dial` kennen.
-leanhttp = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.0" }
-leanhttps = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.0", features = ["mozilla-roots"] }
-leantls = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.0", features = ["mozilla-roots"] }
-leans3 = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.0" }
-leans3http = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.0" }
+leanhttp = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.3" }
+leanhttps = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.3", features = ["mozilla-roots"] }
+leantls = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.3", features = ["mozilla-roots"] }
+leans3 = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.3" }
+leans3http = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.3" }
 [dev-dependencies]
 replica-sqlite = { path = "../sqlite", features = ["std"] }
 [lints]
