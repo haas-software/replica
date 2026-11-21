@@ -275,3 +275,18 @@ impl Backend for DirLease {
         }
     }
 }
+
+/// Een map als bucket van een [`crate::group::Group`]: de lease is een
+/// [`DirLease`] in dezelfde map, de identiteit `("dir", <map>)`.
+impl crate::group::Bucket for Dir {
+    type Lease<'l> = DirLease;
+    fn lease<'l>(&'l mut self, key: &'l str, _ttl_ms: u64) -> Result<DirLease, StoreError> {
+        DirLease::new(self, key)
+    }
+    fn identity(&self) -> (String, String) {
+        (
+            String::from("dir"),
+            alloc::format!("{}", self.root().display()),
+        )
+    }
+}

@@ -60,6 +60,7 @@ fn an_interrupted_snapshot_upload_resumes_after_a_restart() {
     bucket.fail_put_match = Some("000010.seg".into());
     bucket.fail_before_put = true;
     let pending = r.begin(&mut fs, &mut bucket, at(1)).unwrap().unwrap();
+    assert_eq!((pending.capture(), r.begun(), r.confirmed()), (1, 1, 0));
     let total = pending.pages().div_ceil(16) as usize;
     assert!(total > 12, "enough segments to interrupt: {total}");
     let uploaded = pending.upload(&mut fs, &mut bucket);
@@ -91,13 +92,19 @@ fn an_interrupted_snapshot_upload_resumes_after_a_restart() {
     )
     .unwrap();
     assert!(r.resumes(), "the record and spool survive the restart");
+    // De hervatte upload is de eerste capture van dit leven: een write van
+    // na de herstart wacht op een nummer erboven.
+    assert_eq!((r.begun(), r.confirmed()), (1, 0));
     assert_eq!(r.marker().generation, generation);
     let pending = r.begin(&mut fs, &mut bucket, at(31)).unwrap().unwrap();
+    assert_eq!(pending.capture(), 1);
     let uploaded = pending.upload(&mut fs, &mut bucket);
     assert!(uploaded.is_ok());
     assert_eq!(segments(&bucket), total, "only the missing parts were sent");
-    r.finish(&mut fs, &mut bucket, pending, uploaded, at(32))
+    let synced = r
+        .finish(&mut fs, &mut bucket, pending, uploaded, at(32))
         .unwrap();
+    assert_eq!((synced.capture, r.confirmed()), (1, 1));
     assert!(r.marker().complete);
     assert_eq!(r.marker().generation, generation);
     assert!(!r.resumes());
@@ -105,14 +112,17 @@ fn an_interrupted_snapshot_upload_resumes_after_a_restart() {
     // na de capture zijn geschreven, is na een herstart niet meer per pagina
     // bekend: alles wat dirty was blijft dirty, een veilige superset.
     let pending = r.begin(&mut fs, &mut bucket, at(50)).unwrap().unwrap();
+    assert_eq!((pending.capture(), r.begun()), (2, 2));
     assert!(
         pending.pages() >= 1 && pending.pages() <= 503,
         "{} pages",
         pending.pages()
     );
     let uploaded = pending.upload(&mut fs, &mut bucket);
-    r.finish(&mut fs, &mut bucket, pending, uploaded, at(51))
+    let synced = r
+        .finish(&mut fs, &mut bucket, pending, uploaded, at(51))
         .unwrap();
+    assert_eq!((synced.capture, r.confirmed()), (2, 2));
     r.close();
     archive::fetch(
         &mut fs,

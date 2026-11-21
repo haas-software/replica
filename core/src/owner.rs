@@ -138,6 +138,10 @@ impl Config {
 pub struct Synced {
     /// Er is een snapshot of increment bevestigd.
     pub published: bool,
+    /// Het nummer van de capture die gepubliceerd is ([`Pending::capture`]);
+    /// 0 zonder publicatie. Een host die wacht tot een write in de store
+    /// staat, vergelijkt dit met [`Replica::begun`] van het moment van de write.
+    pub capture: u64,
     /// Aantal gecompacteerde en geprunede manifesten.
     pub maintenance: Report,
     /// Verwijderde objecten uit verlopen generaties.
@@ -185,6 +189,10 @@ pub struct Replica {
     /// Een onderbroken snapshot-upload van vóór de herstart; [`Replica::begin`]
     /// geeft hem terug in plaats van een nieuwe capture te maken.
     resumable: Option<Pending>,
+    /// Captures die in dit leven begonnen (de hervatte telt als eerste).
+    begun: u64,
+    /// Het hoogste nummer dat gepubliceerd is.
+    confirmed: u64,
 }
 /// Een onderhoudsbeurt als losse taak: alleen de store (en willekeur voor
 /// poging-id's), nooit SQLite, marker of tracking. De frontier is bij
@@ -243,6 +251,7 @@ impl Maintenance {
         )?;
         Ok(Synced {
             published: false,
+            capture: 0,
             maintenance,
             expired_objects,
         })
@@ -253,8 +262,15 @@ impl Maintenance {
 pub struct Pending {
     batch: Batch,
     staged: Staged,
+    capture: u64,
 }
 impl Pending {
+    /// Het nummer van deze capture in dit leven van de eigenaar
+    /// ([`Replica::begun`] toen hij begon). Een hervatte upload van vóór de
+    /// herstart is nummer 1: hij bevat geen write van dit leven.
+    pub fn capture(&self) -> u64 {
+        self.capture
+    }
     /// Hoeveel pagina's deze capture meeneemt.
     pub fn pages(&self) -> u64 {
         self.batch.page_count()
@@ -282,6 +298,7 @@ pub enum Begun {
 /// de schaduw, nooit SQLite, marker of tracking.
 pub struct Capturing {
     plan: Plan,
+    capture: u64,
     namespace: String,
     generation: String,
     previous_sequence: u64,
@@ -302,7 +319,11 @@ impl Capturing {
         let batch = Batch::new(b, capture, &self.generation, self.previous_sequence)?;
         let staged = batch.stage_at(b, &self.namespace, self.now)?;
         batch.save_pending(b, self.path, &staged)?;
-        Ok(Pending { batch, staged })
+        Ok(Pending {
+            batch,
+            staged,
+            capture: self.capture,
+        })
     }
 }
 /// De SQL-kant van een eigenaar: wat een VFS nodig heeft, zonder de eigenaar
@@ -532,7 +553,11 @@ impl Replica {
                 // het beeld krijgt de huidige revisie, de tracking gaat er één voorbij.
                 batch.resumed_at(prepared.tracking.revision());
                 prepared.tracking.resume_capture()?;
-                Some(Pending { batch, staged })
+                Some(Pending {
+                    batch,
+                    staged,
+                    capture: 1,
+                })
             }
             None => None,
         };
@@ -554,8 +579,27 @@ impl Replica {
             maintenance_at: None,
             pending: false,
             maintaining: false,
+            begun: u64::from(resumable.is_some()),
+            confirmed: 0,
             resumable,
         })
+    }
+    /// Hoeveel captures in dit leven begonnen, gepubliceerd of onderweg (een
+    /// hervatte upload van vóór de herstart telt als de eerste). Een write
+    /// van nu staat in de store zodra [`Replica::confirmed`] hier voorbij is.
+    ///
+    /// Met [`Replica::begin`] en [`Replica::finish`] wordt een capture in het
+    /// ene rustmoment genomen en in een later gepubliceerd; een write die
+    /// ertussen kwam, zit er niet in. Een host die zelf publicaties telde,
+    /// bevestigde zo een write die nog niet in de store stond (EasyFlor,
+    /// 21-11-2026). Daarom nummert de eigenaar zijn captures zelf.
+    pub fn begun(&self) -> u64 {
+        self.begun
+    }
+    /// Het nummer van de laatst gepubliceerde capture in dit leven
+    /// ([`Synced::capture`]); 0: nog geen.
+    pub fn confirmed(&self) -> u64 {
+        self.confirmed
     }
     /// Of de volgende [`Replica::begin`] een onderbroken snapshot hervat.
     pub fn resumes(&self) -> bool {
@@ -1006,8 +1050,10 @@ impl Replica {
         // capture geschreven en gaat eerst oud de schaduw in.
         st.tracking.captured();
         st.tracking.arm(plan.shadow());
+        self.begun += 1;
         Ok(Some(Capturing {
             plan,
+            capture: self.begun,
             namespace: string(&self.config.namespace)?,
             generation: string(&st.marker.value.generation)?,
             previous_sequence: st.marker.value.sequence,
@@ -1045,12 +1091,14 @@ impl Replica {
             return Err(self.archive_error(st, b, e));
         }
         Batch::clear_pending(b, self.config.path)?;
+        self.confirmed = self.confirmed.max(pending.capture);
         let mut result = if self.config.background_maintenance {
             Synced::default()
         } else {
             self.maintain(st, b, store, now)?
         };
         result.published = true;
+        result.capture = pending.capture;
         Ok(result)
     }
     /// Onderhoud hoogstens eens per minuut; ook na een fout geen hotloop bij
