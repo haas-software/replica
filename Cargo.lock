@@ -141,6 +141,7 @@ dependencies = [
  "replica-core",
  "replica-s3",
  "replica-sqlite",
+ "sync",
 ]
 
 [[package]]

@@ -6,9 +6,13 @@
 //!
 //! [`s3`] is de objectstore en de schrijverlease vanuit een app-slot: S3 over
 //! HTTPS met applib's TCP, Lean's TLS, de wandklok en de willekeur van de app.
+//!
+//! [`lanes`] draait het S3-werk van een eigenaar (uploads, onderhoud, de
+//! lease) op twee eigen stacks naast hem (`replica_core::lanes`).
 #![no_std]
 #![forbid(unsafe_code)]
 extern crate alloc;
+pub mod lanes;
 pub mod s3;
 mod storage;
 pub use storage::{Environment, Files, Stats, Wait};
