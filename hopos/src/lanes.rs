@@ -112,7 +112,7 @@ impl Lanes {
         let queue = self.queue(lane);
         while let Ok(job) = sus.wait(queue.next()) {
             queue.running.set(true);
-            job(side);
+            job.run(side);
             queue.done();
         }
     }

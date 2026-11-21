@@ -667,7 +667,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
         let slot: Slot<Result> = Rc::new(RefCell::new(None));
         let back = slot.clone();
         *self.lease_flight.borrow_mut() = Some(slot);
-        let job: Job = Box::new(move |side: &mut dyn LaneSide| {
+        let job = Job::of(move |side: &mut dyn LaneSide| {
             // De tijd waarop hij loopt: de baan kan hem even na het zetten beginnen.
             let out = match time_at(millis()) {
                 Ok(now) => {
@@ -731,7 +731,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
         let domain = self.config.domain.clone();
         off.push(
             Lane::Data,
-            Box::new(move |side: &mut dyn LaneSide| {
+            Job::of(move |side: &mut dyn LaneSide| {
                 let mut out = Err(Error::State);
                 let opened = side.files(&domain, &mut |b, s| {
                     out = pending.upload(&mut DynStorage(b), &mut DynStore(s));
@@ -751,7 +751,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
         let domain = self.config.domain.clone();
         off.push(
             Lane::Data,
-            Box::new(move |side: &mut dyn LaneSide| {
+            Job::of(move |side: &mut dyn LaneSide| {
                 let mut out = Err(Error::State);
                 let opened = side.files(&domain, &mut |b, s| {
                     out = round.run(&mut DynStorage(b), &mut DynStore(s));

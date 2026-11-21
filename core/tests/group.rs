@@ -390,7 +390,7 @@ impl Lanes {
             loop {
                 let job = queue.borrow_mut().pop_front();
                 let Some(job) = job else { break };
-                job(&mut *self.side.borrow_mut());
+                job.run(&mut *self.side.borrow_mut());
             }
         }
     }

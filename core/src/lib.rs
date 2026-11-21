@@ -1,4 +1,13 @@
 //! Replica's Go-compatibele opslagformaat en herstelcontracten.
+//!
+//! Een host gebruikt één van twee niveaus: [`owner::Replica`] voor één
+//! database (met [`writer`] voor de lease), of [`group::Group`] voor meer
+//! databases onder één lease, bovenop `owner::Replica` (met [`lanes`],
+//! [`publications`] en [`follow`]). De modules eronder (`prepare`,
+//! `replication`, `capture`, `restore`, `compact`, `maintenance`, `tracking`,
+//! `manifest`, `segment`, ...) zijn de bouwstenen van die twee: publiek voor
+//! de toetsen, de Go-formaten en de proefapps, maar intern; hun vorm kan
+//! veranderen zonder dat een host die `owner` of `group` gebruikt iets merkt.
 #![no_std]
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]

@@ -15,12 +15,17 @@
 //! - [`Lane::Data`]: de uploads van de gecapturede pagina's en het onderhoud
 //!   (listings, manifesten, compactie).
 //!
-//! De host levert de banen ([`Offload`]); `replica_hopos::lanes` doet dat op
-//! HopOS met twee `applib::stacktask`s per eigenaarslot. Een [`Job`] krijgt de
-//! [`LaneSide`] van zijn baan: de lokale opslag en de store van die stack.
+//! De host levert alleen de stacks: [`Offload`] is zijn haak ("draai dit op
+//! baan X"), `replica_hopos::lanes` doet dat op HopOS met twee
+//! `applib::stacktask`s per eigenaarslot. Wat er loopt, is een [`Job`] van de
+//! groep, ondoorzichtig voor de host: hij geeft hem de [`LaneSide`] van zijn
+//! baan (de lokale opslag en de store van die stack) met [`Job::run`]. Zo kan
+//! de groep later anders uploaden (bijvoorbeeld async) zonder dat een host
+//! verandert.
 //! Wat een job met de eigenaar deelt, zijn `Rc<RefCell<..>>`'s die nooit over
 //! een store- of opslagcall heen geleend worden (het rustprotocol van
-//! [`crate::owner`]). [`crate::group::Group`] gebruikt dit.
+//! [`crate::owner`]). Alleen [`crate::group::Group`] maakt jobs; een host
+//! geeft hem zijn haak met `Group::with_offload`.
 use crate::Result;
 use crate::object::{Object, Parallel, Replies, Store, StoreError};
 use crate::writer::Backend;
@@ -36,9 +41,26 @@ pub enum Lane {
     /// De uploads van de gecapturede pagina's en het onderhoud.
     Data,
 }
-/// Store-werk buiten de stack van de eigenaar; het krijgt de [`LaneSide`]
-/// van zijn baan.
-pub type Job = Box<dyn FnOnce(&mut dyn LaneSide)>;
+/// Store-werk van een [`crate::group::Group`] buiten de stack van de eigenaar,
+/// ondoorzichtig voor de host: die draait hem met de [`LaneSide`] van zijn baan.
+pub struct Job(Work);
+/// Wat een [`Job`] doet.
+type Work = Box<dyn FnOnce(&mut dyn LaneSide)>;
+impl Job {
+    /// Werk van de groep zelf.
+    pub(crate) fn of(f: impl FnOnce(&mut dyn LaneSide) + 'static) -> Self {
+        Job(Box::new(f))
+    }
+    /// Een eigen job, alleen voor de toetsen van een host (zijn banen zonder groep).
+    #[doc(hidden)]
+    pub fn new(f: impl FnOnce(&mut dyn LaneSide) + 'static) -> Self {
+        Self::of(f)
+    }
+    /// Draait de job op de stack van de baan, met de kant van die baan.
+    pub fn run(self, side: &mut dyn LaneSide) {
+        (self.0)(side);
+    }
+}
 /// Waar het store-werk van een eigenaar loopt terwijl die verzoeken bedient.
 pub trait Offload {
     /// Zet `job` in de rij van `lane`; hij loopt na de jobs die er al stonden,
@@ -70,7 +92,7 @@ pub trait LaneSide {
     ) -> core::result::Result<(), StoreError>;
 }
 /// Een `dyn Storage` als een sized, voor de generieke stappen van deze crate.
-pub struct DynStorage<'a>(pub &'a mut dyn Storage);
+pub(crate) struct DynStorage<'a>(pub(crate) &'a mut dyn Storage);
 impl Storage for DynStorage<'_> {
     fn cooperate(&mut self) -> replica_sqlite::Result {
         self.0.cooperate()
@@ -110,7 +132,7 @@ impl Storage for DynStorage<'_> {
     }
 }
 /// Een `dyn Store` als een sized, voor de generieke stappen van deze crate.
-pub struct DynStore<'a>(pub &'a mut dyn Store);
+pub(crate) struct DynStore<'a>(pub(crate) &'a mut dyn Store);
 impl Store for DynStore<'_> {
     fn put(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError> {
         self.0.put(key, bytes)

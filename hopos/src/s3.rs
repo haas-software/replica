@@ -69,10 +69,33 @@ pub type Store<W> = replica_s3::S3<Transport, W>;
 /// De schrijverlease over dezelfde store.
 pub type Lease<'a, W> = replica_s3::Lease<'a, Transport, W>;
 
+/// Hoe een transport zijn verbindingen opent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dial {
+    /// Gewoon: is de netwerkpot van de app leeg, dan faalt de dial (geen
+    /// reserve, met opzet).
+    Normal,
+    /// Voor de schrijverlease ([`lease_store`]): een dial die bij een lege pot
+    /// ruimte maakt door een andere verbinding te sluiten. Die dial komt in
+    /// lean/applib (apart besloten); tot dan is dit [`Dial::Normal`], en is
+    /// [`dialer`] de enige plek die verandert.
+    Forced,
+}
+/// De TCP-dialer voor `dial`.
+fn dialer(dial: Dial) -> Dialer {
+    match dial {
+        // applib heeft nog geen geforceerde dial: beide gewoon.
+        Dial::Normal | Dial::Forced => Dialer::new(EXEC.get(), CONNECT),
+    }
+}
 /// Eén transport met een eigen [`Rng`] uit de control-page van de app. Zonder
 /// app (een hosttest) geeft de dialer geen entropie: elke `https://`-dial
 /// faalt dan vóór er een verbinding opengaat, met `NoEntropy`.
 pub fn transport() -> Transport {
+    transport_with(Dial::Normal)
+}
+/// Als [`transport`], met de dials van `dial`.
+pub fn transport_with(dial: Dial) -> Transport {
     let entropy: Entropic = match applib::app() {
         Some(app) => {
             let mut rng = Rng::open(app);
@@ -81,7 +104,7 @@ pub fn transport() -> Transport {
         None => Box::new(|| None),
     };
     let mut web: Web = WebDial::new(
-        Dialer::new(EXEC.get(), CONNECT),
+        dialer(dial),
         leantls::MOZILLA_ROOTS,
         unix_seconds as fn() -> Option<u64>,
         entropy,
@@ -136,4 +159,17 @@ pub fn store<W: Suspend>(endpoint: &Endpoint<'_>, wait: W) -> Result<Store<W>, S
         return Err(StoreError::Configuration);
     }
     replica_s3::S3::new(client(endpoint)?, transport, wait)
+}
+
+/// De store voor de schrijverlease alleen (`store.lease(key, ttl)`), met eigen
+/// verbindingen die [`Dial::Forced`] dialen: een vernieuwing moet ook door
+/// als het netwerk van de app vol zit. Eén stroom; zoals [`store`].
+pub fn lease_store<W: Suspend>(endpoint: &Endpoint<'_>, wait: W) -> Result<Store<W>, StoreError> {
+    if applib::app().is_none() {
+        return Err(StoreError::Configuration);
+    }
+    Ok(
+        replica_s3::S3::new(client(endpoint)?, || transport_with(Dial::Forced), wait)?
+            .streams(1, 0),
+    )
 }

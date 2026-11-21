@@ -22,10 +22,14 @@ elke database publiceert op zijn eigen moment.
 | `group::Group` | Prepare per database (lui), lease bijhouden, publiceren in rust, backoff, fencing, sluiten |
 | `group::release` | Lease terug bij het sluiten: na een transportfout nog twee keer, bij naam |
 | `writer::renew_or_reclaim` | Vernieuwen; voorbij de schrijfdeadline heroveren zolang niemand de lease nam |
-| `lanes` | `Offload`, `Lane`, `Job`, `LaneSide`: store-werk buiten de stack van de eigenaar |
+| `lanes` | `Offload` (de haak van de host: "draai dit op baan X"), `LaneSide`; een `Job` is ondoorzichtig, de host draait hem met `Job::run` |
 | `publications::Publications` | Gedeelde kijk op de capturenummers van de eigenaars |
 | `follow::Follow` | Een lezer zonder lease die de publicaties van de schrijver volgt |
 | `replica_hopos::lanes` | De banen op HopOS: `Lanes::run` per stack, `OwnerLanes` als `Offload` |
+| `replica_hopos::s3::lease_store` | De store van de lease met `Dial::Forced`: de plek voor de geforceerde dial van lean/applib (nu nog gewoon) |
+
+`group::Group` ligt bovenop `owner::Replica`; er is geen derde niveau. De
+modules eronder (`prepare`, `replication`, `restore`, ...) zijn intern.
 
 ## Inbouwen
 

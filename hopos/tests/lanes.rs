@@ -58,12 +58,12 @@ impl LaneSide for Side<'_> {
 }
 
 fn data(domain: &'static str) -> replica_core::lanes::Job {
-    Box::new(move |side: &mut dyn LaneSide| {
+    replica_core::lanes::Job::new(move |side: &mut dyn LaneSide| {
         side.files(domain, &mut |_, _| {}).unwrap();
     })
 }
 fn lease(key: &'static str) -> replica_core::lanes::Job {
-    Box::new(move |side: &mut dyn LaneSide| {
+    replica_core::lanes::Job::new(move |side: &mut dyn LaneSide| {
         side.lease(key, 30_000, &mut |_| {}).unwrap();
     })
 }
