@@ -65,8 +65,8 @@
 //! bestand één kaart: 8 B per pagina één keer per bestand in plaats van per
 //! eigenaar (Nagel `main.db`: 17,2 MB; meting 21 nov 2026). De ene schrijver
 //! werkt hem bij; de anderen zien tijdens zijn transactie de gecommitte staat
-//! (de oude ingangen van wat hij veranderde) en na zijn commit meteen de
-//! nieuwe. Er schrijft er maar één tegelijk, zoals het [`Storage`]-contract al
+//! (de oude ingangen van wat hij veranderde, bewaard zodra de `Maps` meer
+//! houders heeft) en na zijn commit meteen de nieuwe. Er schrijft er maar één tegelijk, zoals het [`Storage`]-contract al
 //! eist; een tweede krijgt `SQLITE_BUSY`. Sluit het laatste handvat op een
 //! bestand, dan gaat zijn kaart terug naar de heap.
 //!
@@ -687,12 +687,6 @@ impl Registry {
             .iter()
             .position(|k| k.as_ref().is_some_and(|k| k.listed && k.c.name() == name))
     }
-    fn is_shareable(&self, i: usize) -> bool {
-        self.cores
-            .get(i)
-            .and_then(Option::as_ref)
-            .is_some_and(Core::is_shareable)
-    }
     fn insert(&mut self, core: Core) -> Result<usize> {
         if let Some(free) = self.cores.iter().position(Option::is_none) {
             if let Some(slot) = self.cores.get_mut(free) {
@@ -763,14 +757,15 @@ impl Undo {
 /// Eén bestand in een [`Maps`]: zijn container en wie hem gebruikt.
 ///
 /// # Invariants
-/// Loopt er een transactie (`tx`) en zijn er andere eigenaren, dan is `undo`
-/// er en bevat hij de oude ingang van elke pagina onder `base.pages` die de
+/// Loopt er een transactie (`tx`) in een gedeelde [`Maps`], dan is `undo` er
+/// en bevat hij de oude ingang van elke pagina onder `base.pages` die de
 /// transactie veranderde: `base` plus `undo` plus de kaart is de gecommitte
 /// staat.
 struct Core {
     c: Container,
-    /// Vindbaar op naam; `false` voor een eigen kopie van één eigenaar die
-    /// opende terwijl een ander schreef zonder `undo`.
+    /// Vindbaar op naam; `false` na een `remove` terwijl een ander hem open
+    /// had: die houdt de kaart van het oude bestand, een nieuw bestand met deze
+    /// naam krijgt een eigen kern.
     listed: bool,
     /// Eigenaren met een open handvat.
     attached: u32,
@@ -786,10 +781,10 @@ struct Core {
 }
 
 impl Core {
-    fn new(c: Container, listed: bool) -> Self {
+    fn new(c: Container) -> Self {
         Self {
             c,
-            listed,
+            listed: true,
             attached: 0,
             tx: None,
             base: Base::default(),
@@ -801,11 +796,6 @@ impl Core {
     /// Ziet `me` de gecommitte staat (een ander schrijft) in plaats van de kaart?
     fn is_reader(&self, me: u32) -> bool {
         self.tx.is_some_and(|t| t != me)
-    }
-    /// Kan een andere eigenaar deze kern nu delen? Niet als een schrijver
-    /// ongecommitte writes zonder oude ingangen in de kaart heeft.
-    fn is_shareable(&self) -> bool {
-        self.tx.is_none() || self.undo.is_some()
     }
     /// Mag `me` dit bestand gebruiken?
     fn check(&self, me: u32) -> Result {
@@ -836,6 +826,8 @@ impl Core {
             if p >= self.base.pages {
                 return Ok(0);
             }
+            // Geen oude ingangen: de `Maps` was niet gedeeld toen de schrijver
+            // begon, en `me` kwam er midden in zijn transactie bij.
             if let Some(old) = self.undo.as_mut().ok_or(BUSY)?.find(page) {
                 return Ok(old);
             }
@@ -843,7 +835,8 @@ impl Core {
         Ok(self.c.map.get(p).copied().unwrap_or(0))
     }
     /// Begint (of vervolgt) de transactie van `me`; één schrijver tegelijk.
-    fn begin(&mut self, me: u32) -> Result {
+    /// `shared`: de `Maps` heeft meer houders, er kan een lezer bij komen.
+    fn begin(&mut self, me: u32, shared: bool) -> Result {
         self.check(me)?;
         match self.tx {
             Some(t) if t == me => Ok(()),
@@ -855,9 +848,11 @@ impl Core {
                     size: self.c.size,
                     page_size: self.c.page_size,
                 };
-                // Alleen als een ander meeleest: een herstel naar een gesloten
-                // database (één eigenaar) bewaart niets.
-                self.undo = (self.attached > 1).then(Undo::default);
+                // Oude ingangen zodra een ander kan meelezen, ook als hij pas
+                // tijdens de transactie opent: zo deelt elke eigenaar altijd de
+                // ene kaart. Kost 16 B per veranderde bestaande pagina, tot de
+                // commit; een herstel naar een leeg bestand bewaart niets.
+                self.undo = shared.then(Undo::default);
                 Ok(())
             }
         }
@@ -1003,6 +998,10 @@ impl<S: Storage> Compressed<S> {
     /// De kaarten van deze eigenaar.
     pub fn maps(&self) -> &Maps {
         &self.owner.maps
+    }
+    /// Heeft de `Maps` van deze eigenaar meer houders (andere eigenaren)?
+    fn is_shared(&self) -> bool {
+        Rc::strong_count(&self.owner.maps.0) > 1
     }
     /// De binnenste opslag.
     pub fn inner(&self) -> &S {
@@ -1714,13 +1713,12 @@ impl<S: Storage> Compressed<S> {
             }
             return Ok(Some(si));
         }
-        // Open in een andere eigenaar van deze `Maps`: dezelfde kaart, tenzij
-        // die nu ongecommitte writes zonder oude ingangen draagt.
+        // Open in een andere eigenaar van deze `Maps`: dezelfde kaart.
         let found = {
             let reg = self.owner.maps.0.try_borrow().map_err(|_| Error::MISUSE)?;
-            reg.find(name).map(|i| (i, reg.is_shareable(i)))
+            reg.find(name)
         };
-        if let Some((core, true)) = found {
+        if let Some(core) = found {
             let si = self.attach(core)?;
             if let Err(e) = self.revalidate(si, id) {
                 self.release(si);
@@ -1746,8 +1744,7 @@ impl<S: Storage> Compressed<S> {
             // Leeg zonder toestemming om te comprimeren: gewoon bestand.
             return Ok(None);
         }
-        // Een eigen kopie als een ander nu schrijft zonder oude ingangen; anders
-        // gedeeld, ook als een ander hem intussen (tijdens het laden) opnam.
+        // Nam een ander hem intussen (tijdens het laden) op, dan diens kaart.
         let core = {
             let mut reg = self
                 .owner
@@ -1755,11 +1752,9 @@ impl<S: Storage> Compressed<S> {
                 .0
                 .try_borrow_mut()
                 .map_err(|_| Error::MISUSE)?;
-            let listed = reg.find(name);
-            let theirs = listed.filter(|&i| reg.is_shareable(i));
-            match theirs {
+            match reg.find(name) {
                 Some(i) => i,
-                None => reg.insert(Core::new(c, listed.is_none()))?,
+                None => reg.insert(Core::new(c))?,
             }
         };
         self.attach(core).map(Some)
@@ -1942,7 +1937,8 @@ impl<S: Storage> Compressed<S> {
 
     fn write_container(&mut self, si: usize, id: FileId, offset: u64, src: &[u8]) -> Result {
         self.fresh(si, id)?;
-        let empty = self.with(si, |k, me| k.begin(me).map(|()| k.c.page_size == 0))??;
+        let shared = self.is_shared();
+        let empty = self.with(si, |k, me| k.begin(me, shared).map(|()| k.c.page_size == 0))??;
         if empty {
             self.init(si, id, offset, src)?;
         }
@@ -2085,11 +2081,13 @@ impl<S: Storage> Compressed<S> {
             if size == 0 {
                 return Ok(());
             }
-            self.with(si, |k, me| k.begin(me))??;
+            let shared = self.is_shared();
+            self.with(si, |k, me| k.begin(me, shared))??;
             self.init(si, id, 1, &[])?;
         }
+        let shared = self.is_shared();
         let (page_size, old) = self.with(si, |k, me| {
-            k.begin(me)?;
+            k.begin(me, shared)?;
             Ok((k.c.page_size, k.c.size))
         })??;
         if size >= old {
