@@ -60,14 +60,23 @@
 //!
 //! # Meerdere eigenaren van één map
 //!
-//! Twee [`Compressed`] op dezelfde map (de SQL-kant en de sync-kant van
-//! replica-core) houden elk hun eigen kaart. Een `open` van een bestand dat in
-//! deze eigenaar niet open is, leest de superblokken en speelt alleen de
-//! nieuwe logrecords bij (of laadt opnieuw na een checkpoint): het bestand is
-//! de enige waarheid. Er schrijft er maar één tegelijk, zoals het
-//! [`Storage`]-contract al eist.
+//! Eigenaren op dezelfde map (de SQL-kant en de sync-kant van replica-core,
+//! leessessies) die één [`Maps`] delen ([`Compressed::shared`]), delen per
+//! bestand één kaart: 8 B per pagina één keer per bestand in plaats van per
+//! eigenaar (Nagel `main.db`: 17,2 MB; meting 21 nov 2026). De ene schrijver
+//! werkt hem bij; de anderen zien tijdens zijn transactie de gecommitte staat
+//! (de oude ingangen van wat hij veranderde) en na zijn commit meteen de
+//! nieuwe. Er schrijft er maar één tegelijk, zoals het [`Storage`]-contract al
+//! eist; een tweede krijgt `SQLITE_BUSY`. Sluit het laatste handvat op een
+//! bestand, dan gaat zijn kaart terug naar de heap.
+//!
+//! Een `open` van een bestand dat in deze `Maps` niet open is, leest de
+//! superblokken, het snapshot en het log: het bestand is de enige waarheid.
+//! Een eigenaar met eigen kaarten ([`Compressed::new`]) is een `Maps` van één.
 use crate::{Error, FileId, OpenFlags, Result, Storage, lz};
+use alloc::rc::Rc;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::ffi::CStr;
 
 /// De eerste acht bytes van een container (en van elk superblok).
@@ -449,14 +458,15 @@ struct Writer {
     written: u64,
 }
 
-/// Eén containerbestand in deze eigenaar.
+/// Een gewijzigde-paginalijst die na de commit groter is dan dit, gaat terug
+/// naar de heap (32 KiB; een herstel liet hem op 33,5 MB staan, meting 21 nov 2026).
+const DIRTY_KEEP: usize = 4096;
+
+/// Eén containerbestand: de kaart, de segmentboekhouding en de lopende transactie.
 struct Container {
     name: [u8; 256],
     name_len: usize,
-    opens: u32,
-    /// De kaart in het geheugen hoort bij het bestand (anders: opnieuw laden).
-    valid: bool,
-    /// Een commit faalde halverwege; alles op dit bestand faalt tot heropenen.
+    /// Een commit faalde halverwege; de schrijver faalt tot hij het bestand sluit.
     broken: bool,
     /// Nul: nog geen enkele write (een nieuw, leeg bestand).
     page_size: u32,
@@ -499,8 +509,6 @@ impl Container {
         Ok(Self {
             name: buf,
             name_len: name.len(),
-            opens: 0,
-            valid: false,
             broken: false,
             page_size: 0,
             segment: SEGMENT,
@@ -541,7 +549,6 @@ impl Container {
         self.pending = false;
         self.log_end = 0;
         self.seq = 0;
-        self.valid = true;
     }
     fn seg_base(&self, i: u32) -> u64 {
         HEADER + u64::from(i) * u64::from(self.segment)
@@ -566,7 +573,322 @@ impl Container {
             log_cap: self.log_cap,
         }
     }
+    /// Heap van de kaart en van de rest (segmenten, gewijzigde pagina's).
+    fn heap(&self) -> (u64, u64) {
+        let segs = self
+            .writer
+            .as_ref()
+            .map_or(0, |w| w.segs.capacity() * core::mem::size_of::<Seg>());
+        let dirty = self.dirty.capacity() * core::mem::size_of::<(u32, u32)>();
+        ((self.map.capacity() * 8) as u64, (segs + dirty) as u64)
+    }
+    /// Na een commit: een kaart met veel lege capaciteit (na een herstel, een
+    /// grote groei of een krimp) en een grote gewijzigde-paginalijst terug naar
+    /// de heap. `before` is de paginatelling vóór de transactie.
+    fn trim(&mut self, before: usize) {
+        if self.dirty.capacity() > DIRTY_KEEP {
+            self.dirty = Vec::new();
+        }
+        let len = self.map.len();
+        let slack = self.map.capacity() - len;
+        // Gewone groei laat hoogstens een achtste speling (`grow`); meer is een
+        // herstel of een krimp.
+        if slack > len / 8 + 64 || (len > 2 * before && slack > 64) {
+            let mut fit = Vec::new();
+            // Lukt het niet, dan blijft de ruime kaart: geen fout, alleen geheugen.
+            if fit.try_reserve_exact(len).is_ok() {
+                fit.extend_from_slice(&self.map);
+                self.map = fit;
+            }
+        }
+    }
 }
+
+/// De kaarten van één opslagdomein, gedeeld door alle [`Compressed`] erop.
+///
+/// Eén kaart per bestand: de SQL-kant, de sync-kant en elke leessessie van
+/// dezelfde map lezen dezelfde kaart, en de ene schrijver werkt hem bij. Een
+/// bestand verdwijnt uit de `Maps` zodra zijn laatste handvat (van welke
+/// eigenaar ook) sluit. Geef één `Maps` alleen aan eigenaren op hetzelfde
+/// domein: de sleutel is de bestandsnaam.
+///
+/// Gedeeld eigendom (`Rc`) met reden: de eigenaren zijn opslagen van
+/// verschillende verbindingen op verschillende stacks. Een lening van het
+/// register overleeft nooit een aanroep van de binnenste opslag (die kan
+/// parkeren); [`Compressed`] leent alleen in `with`, dat geen opslag krijgt.
+#[derive(Clone, Default)]
+pub struct Maps(Rc<RefCell<Registry>>);
+
+/// Heap van de kaarten in een [`Maps`], voor toetsen en meetlatten.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Heap {
+    /// Bestanden met een kaart (open in minstens één eigenaar).
+    pub files: u64,
+    /// Bytes van de kaarten (capaciteit × 8).
+    pub map: u64,
+    /// Bytes van de rest: segmentboekhouding, gewijzigde pagina's en de
+    /// gecommitte staat voor lezers tijdens een transactie.
+    pub other: u64,
+}
+
+impl Maps {
+    /// Een leeg register.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Wat de kaarten nu kosten.
+    pub fn heap(&self) -> Heap {
+        let mut out = Heap::default();
+        if let Ok(reg) = self.0.try_borrow() {
+            for k in reg.cores.iter().flatten() {
+                let (map, other) = k.c.heap();
+                let undo = k.undo.as_ref().map_or(0, |u| {
+                    u.list.capacity() * core::mem::size_of::<(u32, u64)>()
+                });
+                out.files += 1;
+                out.map += map;
+                out.other += other + undo as u64;
+            }
+        }
+        out
+    }
+    fn owner(&self) -> u32 {
+        self.0.try_borrow_mut().map_or(0, |mut r| {
+            r.owners = r.owners.wrapping_add(1);
+            r.owners
+        })
+    }
+}
+
+impl core::fmt::Debug for Maps {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let h = self.heap();
+        f.debug_struct("Maps")
+            .field("files", &h.files)
+            .field("map", &h.map)
+            .finish()
+    }
+}
+
+/// Het register achter [`Maps`].
+#[derive(Default)]
+struct Registry {
+    /// Kernen op slot; een eigenaar houdt het slotnummer, dus een slot wordt
+    /// geleegd (`None`) maar nooit verschoven.
+    cores: Vec<Option<Core>>,
+    /// Laatst uitgegeven eigenaarnummer.
+    owners: u32,
+}
+
+impl Registry {
+    /// De vindbare kern met naam `name`.
+    fn find(&self, name: &[u8]) -> Option<usize> {
+        self.cores
+            .iter()
+            .position(|k| k.as_ref().is_some_and(|k| k.listed && k.c.name() == name))
+    }
+    fn is_shareable(&self, i: usize) -> bool {
+        self.cores
+            .get(i)
+            .and_then(Option::as_ref)
+            .is_some_and(Core::is_shareable)
+    }
+    fn insert(&mut self, core: Core) -> Result<usize> {
+        if let Some(free) = self.cores.iter().position(Option::is_none) {
+            if let Some(slot) = self.cores.get_mut(free) {
+                *slot = Some(core);
+            }
+            return Ok(free);
+        }
+        self.cores.try_reserve(1).map_err(|_| Error::MEMORY)?;
+        self.cores.push(Some(core));
+        Ok(self.cores.len() - 1)
+    }
+    /// Eigenaar `me` laat kern `i` los; de laatste geeft de kaart terug.
+    fn detach(&mut self, i: usize, me: u32) {
+        let Some(slot) = self.cores.get_mut(i) else {
+            return;
+        };
+        let Some(k) = slot.as_mut() else {
+            return;
+        };
+        k.attached = k.attached.saturating_sub(1);
+        if k.tx == Some(me) {
+            // Ongecommitte writes in de kaart: alleen het bestand weet nog wat geldt.
+            k.tx = None;
+            k.undo = None;
+            k.stale = true;
+            k.version = k.version.wrapping_add(1);
+        }
+        if k.attached == 0 {
+            *slot = None;
+        }
+    }
+}
+
+/// De gecommitte staat van vóór de lopende transactie, voor de andere eigenaren.
+#[derive(Clone, Copy, Default)]
+struct Base {
+    pages: usize,
+    size: u64,
+    page_size: u32,
+}
+
+/// De oude ingangen van pagina's die de lopende transactie veranderde.
+#[derive(Default)]
+struct Undo {
+    /// (pagina, oude ingang), in volgorde van wijzigen; per pagina telt de eerste.
+    list: Vec<(u32, u64)>,
+    sorted: bool,
+}
+
+impl Undo {
+    fn push(&mut self, page: u32, old: u64) -> Result {
+        self.list.try_reserve(1).map_err(|_| Error::MEMORY)?;
+        self.list.push((page, old));
+        self.sorted = false;
+        Ok(())
+    }
+    fn find(&mut self, page: u32) -> Option<u64> {
+        if !self.sorted {
+            // Stabiel: van dubbelen blijft de oudste vooraan.
+            self.list.sort_by_key(|e| e.0);
+            self.sorted = true;
+        }
+        let i = self.list.partition_point(|e| e.0 < page);
+        self.list.get(i).filter(|e| e.0 == page).map(|e| e.1)
+    }
+}
+
+/// Eén bestand in een [`Maps`]: zijn container en wie hem gebruikt.
+///
+/// # Invariants
+/// Loopt er een transactie (`tx`) en zijn er andere eigenaren, dan is `undo`
+/// er en bevat hij de oude ingang van elke pagina onder `base.pages` die de
+/// transactie veranderde: `base` plus `undo` plus de kaart is de gecommitte
+/// staat.
+struct Core {
+    c: Container,
+    /// Vindbaar op naam; `false` voor een eigen kopie van één eigenaar die
+    /// opende terwijl een ander schreef zonder `undo`.
+    listed: bool,
+    /// Eigenaren met een open handvat.
+    attached: u32,
+    /// De eigenaar met ongecommitte writes in de kaart.
+    tx: Option<u32>,
+    base: Base,
+    undo: Option<Undo>,
+    /// Hoogt op bij elke nieuwe gecommitte staat (een lezer ververst zijn paginabuffer).
+    version: u64,
+    /// De kaart volgt het bestand niet meer (een schrijver ging weg midden in
+    /// een transactie): de volgende toegang laadt opnieuw.
+    stale: bool,
+}
+
+impl Core {
+    fn new(c: Container, listed: bool) -> Self {
+        Self {
+            c,
+            listed,
+            attached: 0,
+            tx: None,
+            base: Base::default(),
+            undo: None,
+            version: 0,
+            stale: false,
+        }
+    }
+    /// Ziet `me` de gecommitte staat (een ander schrijft) in plaats van de kaart?
+    fn is_reader(&self, me: u32) -> bool {
+        self.tx.is_some_and(|t| t != me)
+    }
+    /// Kan een andere eigenaar deze kern nu delen? Niet als een schrijver
+    /// ongecommitte writes zonder oude ingangen in de kaart heeft.
+    fn is_shareable(&self) -> bool {
+        self.tx.is_none() || self.undo.is_some()
+    }
+    /// Mag `me` dit bestand gebruiken?
+    fn check(&self, me: u32) -> Result {
+        if self.stale || (self.c.broken && self.tx == Some(me)) {
+            Err(Error::IO)
+        } else {
+            Ok(())
+        }
+    }
+    fn size(&self, me: u32) -> u64 {
+        if self.is_reader(me) {
+            self.base.size
+        } else {
+            self.c.size
+        }
+    }
+    fn page_size(&self, me: u32) -> u32 {
+        if self.is_reader(me) {
+            self.base.page_size
+        } else {
+            self.c.page_size
+        }
+    }
+    /// De ingang van `page` zoals `me` hem ziet.
+    fn entry(&mut self, me: u32, page: u32) -> Result<u64> {
+        let p = page as usize;
+        if self.is_reader(me) {
+            if p >= self.base.pages {
+                return Ok(0);
+            }
+            if let Some(old) = self.undo.as_mut().ok_or(BUSY)?.find(page) {
+                return Ok(old);
+            }
+        }
+        Ok(self.c.map.get(p).copied().unwrap_or(0))
+    }
+    /// Begint (of vervolgt) de transactie van `me`; één schrijver tegelijk.
+    fn begin(&mut self, me: u32) -> Result {
+        self.check(me)?;
+        match self.tx {
+            Some(t) if t == me => Ok(()),
+            Some(_) => Err(BUSY),
+            None => {
+                self.tx = Some(me);
+                self.base = Base {
+                    pages: self.c.map.len(),
+                    size: self.c.size,
+                    page_size: self.c.page_size,
+                };
+                // Alleen als een ander meeleest: een herstel naar een gesloten
+                // database (één eigenaar) bewaart niets.
+                self.undo = (self.attached > 1).then(Undo::default);
+                Ok(())
+            }
+        }
+    }
+    /// Bewaart de gecommitte ingang van `page` vóór hij verandert.
+    fn remember(&mut self, page: u32) -> Result {
+        if (page as usize) < self.base.pages
+            && let Some(u) = self.undo.as_mut()
+        {
+            let old = self.c.map.get(page as usize).copied().unwrap_or(0);
+            u.push(page, old)?;
+        }
+        Ok(())
+    }
+    /// Zet `entry` als nieuwe ingang van `page` en boekt het oude slot af.
+    fn set_entry(&mut self, page: u32, entry: u64, sum: u32) -> Result {
+        self.remember(page)?;
+        set_entry(&mut self.c, page, entry, sum)
+    }
+    /// De transactie is gecommit: dit is de nieuwe gecommitte staat.
+    fn end(&mut self) {
+        let before = self.base.pages;
+        self.tx = None;
+        self.undo = None;
+        self.version = self.version.wrapping_add(1);
+        self.c.trim(before);
+    }
+}
+
+/// `SQLITE_BUSY`: een ander schrijft, of het bestand is nog open.
+const BUSY: Error = Error { code: 5 };
 
 /// Wat [`Compressed::stats`] over een container zegt.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -593,9 +915,9 @@ pub struct Stats {
 #[derive(Clone, Copy)]
 struct Handle {
     inner: FileId,
-    /// `Some(i)`: container `i`, anders gewoon doorgeven.
+    /// `Some(i)`: het bestand in slot `i` van [`Owner::files`], anders gewoon doorgeven.
     container: Option<usize>,
-    /// Het journal (`<naam>-journal`) van container `i`: zijn afronding is een commit.
+    /// Het journal (`<naam>-journal`) van slot `i`: zijn afronding is een commit.
     journal_of: Option<usize>,
 }
 
@@ -606,8 +928,33 @@ struct Work {
     stored: Vec<u8>,
     /// Een gedecodeerde pagina voor deelreads en read-modify-write.
     page: Vec<u8>,
-    /// Welke pagina `page` nu bevat (container, pagina).
-    cached: Option<(usize, u32)>,
+    /// Welke pagina `page` nu bevat (kern, pagina, versie van de kern).
+    cached: Option<(usize, u32, u64)>,
+}
+
+/// Een open bestand van deze eigenaar: zijn kern in de [`Maps`].
+#[derive(Clone, Copy)]
+struct Open {
+    core: usize,
+    opens: u32,
+}
+
+/// Wat één [`Compressed`] in zijn [`Maps`] heeft. `Drop` laat alles los.
+struct Owner {
+    maps: Maps,
+    me: u32,
+    /// Open bestanden op slot; een handvat houdt het slotnummer.
+    files: Vec<Option<Open>>,
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        if let Ok(mut reg) = self.maps.0.try_borrow_mut() {
+            for s in self.files.iter().flatten() {
+                reg.detach(s.core, self.me);
+            }
+        }
+    }
 }
 
 /// Transparante paginacompressie om `S` (zie de moduledocs).
@@ -620,9 +967,7 @@ pub struct Compressed<S: Storage> {
     inner: S,
     policy: Policy,
     handles: Vec<Option<Handle>>,
-    /// Containers by slot; a handle keeps its slot number, so a slot is emptied
-    /// (`None`) but never moved.
-    files: Vec<Option<Container>>,
+    owner: Owner,
     work: Work,
     /// `false` tijdens een commit die SQLite niet met `sync` vroeg (de afronding van
     /// het journal bij `synchronous=OFF`): het record zonder `sync`.
@@ -630,13 +975,22 @@ pub struct Compressed<S: Storage> {
 }
 
 impl<S: Storage> Compressed<S> {
-    /// `inner` met `policy` voor nieuwe bestanden.
+    /// `inner` met `policy` voor nieuwe bestanden, met eigen kaarten.
     pub fn new(inner: S, policy: Policy) -> Self {
+        Self::shared(inner, policy, &Maps::new())
+    }
+    /// Als [`Compressed::new`], met de kaarten van `maps`: alle eigenaren op
+    /// dezelfde `Maps` delen per bestand één kaart.
+    pub fn shared(inner: S, policy: Policy, maps: &Maps) -> Self {
         Self {
             inner,
             policy,
             handles: Vec::new(),
-            files: Vec::new(),
+            owner: Owner {
+                maps: maps.clone(),
+                me: maps.owner(),
+                files: Vec::new(),
+            },
             work: Work {
                 enc: None,
                 stored: Vec::new(),
@@ -645,6 +999,10 @@ impl<S: Storage> Compressed<S> {
             },
             durable: true,
         }
+    }
+    /// De kaarten van deze eigenaar.
+    pub fn maps(&self) -> &Maps {
+        &self.owner.maps
     }
     /// De binnenste opslag.
     pub fn inner(&self) -> &S {
@@ -671,49 +1029,71 @@ impl<S: Storage> Compressed<S> {
             .ok_or(Error::IO)
     }
 
-    fn container(&mut self, i: usize) -> Result<&mut Container> {
-        let c = self
+    /// Leent de kern van slot `si` voor `f`, met het nummer van deze eigenaar.
+    ///
+    /// `f` krijgt geen opslag (`self` is gedeeld geleend), dus geen lening van
+    /// het register overleeft een park in de binnenste opslag: de compiler
+    /// bewijst dat een andere eigenaar op een andere stack nooit een geleend
+    /// register treft.
+    fn with<R>(&self, si: usize, f: impl FnOnce(&mut Core, u32) -> R) -> Result<R> {
+        let slot = self
+            .owner
             .files
-            .get_mut(i)
+            .get(si)
+            .copied()
+            .flatten()
+            .ok_or(Error::IO)?;
+        let mut reg = self
+            .owner
+            .maps
+            .0
+            .try_borrow_mut()
+            .map_err(|_| Error::MISUSE)?;
+        let k = reg
+            .cores
+            .get_mut(slot.core)
             .and_then(Option::as_mut)
             .ok_or(Error::IO)?;
-        if c.broken { Err(Error::IO) } else { Ok(c) }
+        Ok(f(k, self.owner.me))
     }
 
     /// Statistiek van een open container, voor toetsen en meetprogramma's;
     /// `None` voor een gewoon bestand.
     pub fn stats(&mut self, id: FileId) -> Result<Option<Stats>> {
-        let Some(ci) = self.handle(id)?.container else {
+        let Some(si) = self.handle(id)?.container else {
             return Ok(None);
         };
-        let c = self.container(ci)?;
-        let page = c.page_size;
-        let live = c
-            .map
-            .iter()
-            .filter_map(|&e| slot_of(e, page))
-            .map(|s| u64::from(s.len))
-            .sum();
-        let mut out = Stats {
-            size: c.size,
-            physical: c.physical,
-            live,
-            page_size: c.page_size,
-            ..Stats::default()
-        };
-        if let Some(w) = &c.writer {
-            for g in &w.segs {
-                match g.usage {
-                    Use::Free => out.free_segments += 1,
-                    Use::Meta => out.meta_segments += 1,
-                    Use::Data => {
-                        out.data_segments += 1;
-                        out.written += u64::from(g.end);
+        self.with(si, |k, me| {
+            k.check(me)?;
+            let c = &k.c;
+            let page = c.page_size;
+            let live = c
+                .map
+                .iter()
+                .filter_map(|&e| slot_of(e, page))
+                .map(|s| u64::from(s.len))
+                .sum();
+            let mut out = Stats {
+                size: c.size,
+                physical: c.physical,
+                live,
+                page_size: c.page_size,
+                ..Stats::default()
+            };
+            if let Some(w) = &c.writer {
+                for g in &w.segs {
+                    match g.usage {
+                        Use::Free => out.free_segments += 1,
+                        Use::Meta => out.meta_segments += 1,
+                        Use::Data => {
+                            out.data_segments += 1;
+                            out.written += u64::from(g.end);
+                        }
                     }
                 }
             }
-        }
-        Ok(Some(out))
+            Ok(Some(out))
+        })?
     }
 
     fn buffers(&mut self, page_size: u32) -> Result {
@@ -769,21 +1149,20 @@ fn read_some<S: Storage>(inner: &mut S, id: FileId, mut off: u64, dst: &mut [u8]
     Ok(done)
 }
 
-/// Decodeert pagina `page` van `c` naar `out` (`page_size` bytes).
-fn load_page<S: Storage>(
+/// Decodeert de pagina met ingang `entry` naar `out` (`page_size` bytes).
+fn load_slot<S: Storage>(
     inner: &mut S,
     stored: &mut [u8],
-    c: &Container,
+    entry: u64,
+    page_size: u32,
     id: FileId,
-    page: u32,
     out: &mut [u8],
 ) -> Result {
-    let entry = c.map.get(page as usize).copied().unwrap_or(0);
-    let Some(slot) = slot_of(entry, c.page_size) else {
+    let Some(slot) = slot_of(entry, page_size) else {
         out.fill(0);
         return Ok(());
     };
-    if slot.len == c.page_size {
+    if slot.len == page_size {
         return read_exact(inner, id, slot.off, out);
     }
     let buf = stored.get_mut(..slot.len as usize).ok_or(CORRUPT)?;
@@ -817,66 +1196,93 @@ fn read_super<S: Storage>(inner: &mut S, id: FileId) -> Result<Option<(Super, u8
     }
 }
 
+/// Waar het log van een container staat en tot waar het gelezen is.
+#[derive(Clone, Copy)]
+struct LogAt {
+    salt: u64,
+    seq: u64,
+    log_off: u64,
+    log_cap: u64,
+    log_end: u64,
+}
+
+impl LogAt {
+    fn of(c: &Container) -> Self {
+        Self {
+            salt: c.salt,
+            seq: c.seq,
+            log_off: c.log_off,
+            log_cap: c.log_cap,
+            log_end: c.log_end,
+        }
+    }
+}
+
+/// Een gelezen logrecord: kop, ingangen en de positie erna.
+type Record = ([u8; RECORD_HEAD], Vec<u8>, u64);
+
+/// Het geldige logrecord op `pos` dat `seq` voortzet: kop, ingangen en de
+/// volgende positie; `None` als daar geen staat.
+fn read_record<S: Storage>(
+    inner: &mut S,
+    id: FileId,
+    at: LogAt,
+    pos: u64,
+    seq: u64,
+) -> Result<Option<Record>> {
+    let mut head = [0u8; RECORD_HEAD];
+    if pos + RECORD_HEAD as u64 > at.log_cap
+        || read_some(inner, id, at.log_off + pos, &mut head)? < RECORD_HEAD
+    {
+        return Ok(None);
+    }
+    let count = u64::from(get_u32(&head, 4));
+    let len = RECORD_HEAD as u64 + count * ENTRY as u64;
+    if get_u32(&head, 0) != RECORD_MAGIC
+        || get_u64(&head, 8) != at.salt
+        || get_u64(&head, 16) != seq + 1
+        || pos + len > at.log_cap
+    {
+        return Ok(None);
+    }
+    let n = usize::try_from(count * ENTRY as u64).map_err(|_| CORRUPT)?;
+    let mut body = Vec::new();
+    body.try_reserve_exact(n).map_err(|_| Error::MEMORY)?;
+    body.resize(n, 0);
+    if read_some(inner, id, at.log_off + pos + RECORD_HEAD as u64, &mut body)? < n {
+        return Ok(None);
+    }
+    let mut sealed = head;
+    put(&mut sealed, 40, &[0; 8]);
+    if sum(&[&sealed, &body]) != get_u64(&head, 40) {
+        return Ok(None);
+    }
+    Ok(Some((head, body, pos + align(len, SECTOR))))
+}
+
 /// Speelt geldige logrecords vanaf `c.log_end` bij; het aantal records.
 ///
-/// Met `verify_last` worden de slots van het laatste record eerst gecontroleerd:
-/// alleen dat record kan duurzaam zijn terwijl een slot van dezelfde commit
-/// het niet werd (een stroomstoring tijdens zijn `sync`). Klopt een slot niet,
-/// dan telt die commit niet; SQLite's hete journal maakt dat consistent, want
-/// de `sync` kwam nooit terug.
-fn replay<S: Storage>(
-    inner: &mut S,
-    c: &mut Container,
-    id: FileId,
-    verify_last: bool,
-) -> Result<u64> {
-    let mut head = [0u8; RECORD_HEAD];
+/// De slots van het laatste record worden eerst gecontroleerd: alleen dat
+/// record kan duurzaam zijn terwijl een slot van dezelfde commit het niet werd
+/// (een stroomstoring tijdens zijn `sync`). Klopt een slot niet, dan telt die
+/// commit niet; SQLite's hete journal maakt dat consistent, want de `sync`
+/// kwam nooit terug.
+fn replay<S: Storage>(inner: &mut S, c: &mut Container, id: FileId) -> Result<u64> {
     let mut applied = 0;
-    let mut held: Option<([u8; RECORD_HEAD], Vec<u8>, u64)> = None;
+    let mut held: Option<Record> = None;
+    let at = LogAt::of(c);
     let mut pos = c.log_end;
     let mut seq = c.seq;
-    while pos + RECORD_HEAD as u64 <= c.log_cap {
-        let at = c.log_off + pos;
-        if read_some(inner, id, at, &mut head)? < RECORD_HEAD {
-            break;
-        }
-        let count = u64::from(get_u32(&head, 4));
-        let len = RECORD_HEAD as u64 + count * ENTRY as u64;
-        if get_u32(&head, 0) != RECORD_MAGIC
-            || get_u64(&head, 8) != c.salt
-            || get_u64(&head, 16) != seq + 1
-            || pos + len > c.log_cap
-        {
-            break;
-        }
-        let n = usize::try_from(count * ENTRY as u64).map_err(|_| CORRUPT)?;
-        let mut body = Vec::new();
-        body.try_reserve_exact(n).map_err(|_| Error::MEMORY)?;
-        body.resize(n, 0);
-        if read_some(inner, id, at + RECORD_HEAD as u64, &mut body)? < n {
-            break;
-        }
-        let mut sealed = head;
-        put(&mut sealed, 40, &[0; 8]);
-        if sum(&[&sealed, &body]) != get_u64(&head, 40) {
-            break;
-        }
-        pos += align(len, SECTOR);
+    while let Some((head, body, next)) = read_record(inner, id, at, pos, seq)? {
+        pos = next;
         seq += 1;
-        if verify_last {
-            if let Some((h, b, end)) = held.take() {
-                apply(c, &h, &b)?;
-                c.log_end = end;
-                c.seq += 1;
-                applied += 1;
-            }
-            held = Some((head, body, pos));
-        } else {
-            apply(c, &head, &body)?;
-            c.log_end = pos;
+        if let Some((h, b, end)) = held.take() {
+            apply(c, &h, &b)?;
+            c.log_end = end;
             c.seq += 1;
             applied += 1;
         }
+        held = Some((head, body, pos));
     }
     if let Some((h, b, end)) = held
         && slots_intact(inner, c, id, &b)?
@@ -957,10 +1363,16 @@ fn check_entry(c: &Container, entry: u64) -> Result {
     Ok(())
 }
 
-/// Vergroot `v` faalbaar tot `n` nullen.
+/// Vergroot `v` faalbaar tot `n` nullen. Is er geen ruimte, dan komt er een
+/// achtste bij in plaats van een verdubbeling: de kaart van een groot bestand
+/// staat dan niet tot de helft leeg (Nagel `main.db`: 17 MB).
 fn grow(v: &mut Vec<u64>, n: usize) -> Result {
     if n > v.len() {
-        v.try_reserve(n - v.len()).map_err(|_| Error::MEMORY)?;
+        let need = n - v.len();
+        if need > v.capacity() - v.len() {
+            v.try_reserve_exact(need.max(v.len() / 8))
+                .map_err(|_| Error::MEMORY)?;
+        }
         v.resize(n, 0);
     }
     Ok(())
@@ -1015,14 +1427,14 @@ fn load<S: Storage>(inner: &mut S, c: &mut Container, id: FileId, sb: Super, act
     for &e in &c.map {
         check_entry(c, e)?;
     }
-    replay(inner, c, id, true)?;
+    replay(inner, c, id)?;
     c.fresh = false;
-    c.valid = true;
     Ok(())
 }
 
-/// Brengt een container in deze eigenaar bij met het bestand.
-fn refresh<S: Storage>(inner: &mut S, c: &mut Container, id: FileId) -> Result {
+/// Leest container `c` (nieuw, nog leeg) van het bestand: het bestand is de
+/// enige waarheid.
+fn load_file<S: Storage>(inner: &mut S, c: &mut Container, id: FileId) -> Result {
     c.physical = inner.size(id)?;
     if c.physical == 0 {
         c.reset_empty();
@@ -1033,23 +1445,33 @@ fn refresh<S: Storage>(inner: &mut S, c: &mut Container, id: FileId) -> Result {
             c.reset_empty();
             Ok(())
         }
-        Some((sb, active)) => {
-            if c.valid
-                && c.page_size != 0
-                && sb.file_id == c.file_id
-                && sb.generation == c.generation
-                && sb.salt == c.salt
-            {
-                if replay(inner, c, id, false)? > 0 {
-                    c.writer = None;
-                }
-                c.active = active;
-                Ok(())
-            } else {
-                load(inner, c, id, sb, active)
-            }
-        }
+        Some((sb, active)) => load(inner, c, id, sb, active),
     }
+}
+
+/// Wat een open kern van zijn bestand denkt te weten, om het na te kijken.
+#[derive(Clone, Copy)]
+struct Known {
+    page_size: u32,
+    file_id: u64,
+    generation: u64,
+    log: LogAt,
+}
+
+/// Staat het bestand nog waar de kern het kent? Een andere schrijver (buiten
+/// deze [`Maps`]) gaf een nieuw superblok of zette het log voort.
+fn is_current<S: Storage>(inner: &mut S, id: FileId, k: Known) -> Result<bool> {
+    let Some((sb, _)) = read_super(inner, id)? else {
+        return Ok(k.page_size == 0);
+    };
+    if k.page_size == 0
+        || sb.file_id != k.file_id
+        || sb.generation != k.generation
+        || sb.salt != k.log.salt
+    {
+        return Ok(false);
+    }
+    Ok(read_record(inner, id, k.log, k.log.log_end, k.log.seq)?.is_none())
 }
 
 /// Bouwt de segmentboekhouding uit de kaart (eerste write na laden).
@@ -1192,38 +1614,6 @@ fn set_entry(c: &mut Container, page: u32, entry: u64, sum: u32) -> Result {
     Ok(())
 }
 
-/// Comprimeert en schrijft één hele pagina.
-fn store<S: Storage>(
-    inner: &mut S,
-    enc: &mut lz::Encoder,
-    stored: &mut [u8],
-    c: &mut Container,
-    id: FileId,
-    page: u32,
-    data: &[u8],
-) -> Result {
-    if u64::from(page) >= MAX_PAGES {
-        return Err(Error::FULL);
-    }
-    if data.iter().all(|&b| b == 0) {
-        return set_entry(c, page, 0, 0);
-    }
-    // Alleen gecomprimeerd als het kleiner is dan de pagina en in de
-    // lengtecode past; anders onsamendrukbaar, rauw.
-    let limit = (c.page_size as usize - 1).min(RAW as usize - 1);
-    let (bytes, len) = match enc.compress(data, stored.get_mut(..limit).ok_or(Error::IO)?) {
-        Some(n) => (stored.get(..n).ok_or(Error::IO)?, n as u32),
-        None => (data, c.page_size),
-    };
-    let off = alloc(c, len)?;
-    inner.write(id, off, bytes)?;
-    c.physical = c.physical.max(off + u64::from(len));
-    if let Some(w) = c.writer.as_mut() {
-        w.written += u64::from(len);
-    }
-    set_entry(c, page, entry_of(off, len, c.page_size), check(bytes))
-}
-
 impl<S: Storage> Compressed<S> {
     fn new_handle(&mut self, h: Handle) -> Result<FileId> {
         let slot = match self.handles.iter().position(Option::is_none) {
@@ -1240,20 +1630,105 @@ impl<S: Storage> Compressed<S> {
         Ok(FileId(u32::try_from(slot).map_err(|_| Error::FULL)?))
     }
 
-    /// Opent of hergebruikt container `name` met handvat `id` van de binnenste opslag.
-    fn open_container(&mut self, name: &[u8], id: FileId, create: bool) -> Result<Option<usize>> {
-        let size = self.inner.size(id)?;
-        let ci = self
-            .files
-            .iter()
-            .position(|c| c.as_ref().is_some_and(|c| c.name() == name));
-        if let Some(i) = ci
-            && let Some(Some(c)) = self.files.get(i)
-            && c.opens > 0
-        {
-            // Al open in deze eigenaar: die kaart is de waarheid.
-            return Ok(Some(i));
+    /// Het slot van deze eigenaar met bestand `name`.
+    fn slot_named(&self, name: &[u8]) -> Option<usize> {
+        let reg = self.owner.maps.0.try_borrow().ok()?;
+        self.owner.files.iter().position(|s| {
+            s.is_some_and(|s| {
+                reg.cores
+                    .get(s.core)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|k| k.c.name() == name)
+            })
+        })
+    }
+
+    /// Neemt kern `core` op in een slot van deze eigenaar (met één open).
+    fn take_slot(&mut self, core: usize) -> Result<usize> {
+        self.work.cached = None;
+        let slot = Some(Open { core, opens: 1 });
+        if let Some(i) = self.owner.files.iter().position(Option::is_none) {
+            if let Some(s) = self.owner.files.get_mut(i) {
+                *s = slot;
+            }
+            return Ok(i);
         }
+        self.owner.files.try_reserve(1).map_err(|_| Error::MEMORY)?;
+        self.owner.files.push(slot);
+        Ok(self.owner.files.len() - 1)
+    }
+
+    /// Hecht deze eigenaar aan kern `core`; het slot.
+    fn attach(&mut self, core: usize) -> Result<usize> {
+        {
+            let mut reg = self
+                .owner
+                .maps
+                .0
+                .try_borrow_mut()
+                .map_err(|_| Error::MISUSE)?;
+            let k = reg
+                .cores
+                .get_mut(core)
+                .and_then(Option::as_mut)
+                .ok_or(Error::IO)?;
+            k.attached += 1;
+        }
+        match self.take_slot(core) {
+            Ok(si) => Ok(si),
+            Err(e) => {
+                if let Ok(mut reg) = self.owner.maps.0.try_borrow_mut() {
+                    reg.detach(core, self.owner.me);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Eén open minder op slot `si`; bij nul laat deze eigenaar de kern los.
+    fn release(&mut self, si: usize) {
+        let Some(Some(slot)) = self.owner.files.get_mut(si) else {
+            return;
+        };
+        slot.opens = slot.opens.saturating_sub(1);
+        if slot.opens > 0 {
+            return;
+        }
+        let core = slot.core;
+        if let Some(s) = self.owner.files.get_mut(si) {
+            *s = None;
+        }
+        self.work.cached = None;
+        if let Ok(mut reg) = self.owner.maps.0.try_borrow_mut() {
+            reg.detach(core, self.owner.me);
+        }
+    }
+
+    /// Opent container `name` met handvat `id` van de binnenste opslag (een
+    /// open erbij); `None` als het geen container is of wordt.
+    fn open_container(&mut self, name: &[u8], id: FileId, create: bool) -> Result<Option<usize>> {
+        // Al open in deze eigenaar: die kaart is de waarheid.
+        if let Some(si) = self.slot_named(name) {
+            if let Some(Some(s)) = self.owner.files.get_mut(si) {
+                s.opens += 1;
+            }
+            return Ok(Some(si));
+        }
+        // Open in een andere eigenaar van deze `Maps`: dezelfde kaart, tenzij
+        // die nu ongecommitte writes zonder oude ingangen draagt.
+        let found = {
+            let reg = self.owner.maps.0.try_borrow().map_err(|_| Error::MISUSE)?;
+            reg.find(name).map(|i| (i, reg.is_shareable(i)))
+        };
+        if let Some((core, true)) = found {
+            let si = self.attach(core)?;
+            if let Err(e) = self.revalidate(si, id) {
+                self.release(si);
+                return Err(e);
+            }
+            return Ok(Some(si));
+        }
+        let size = self.inner.size(id)?;
         let mut head = [0u8; 8];
         let got = if size > 0 {
             read_some(&mut self.inner, id, 0, &mut head)?
@@ -1263,58 +1738,85 @@ impl<S: Storage> Compressed<S> {
         let ours = got == 8 && head == MAGIC;
         let blank = size > 0 && head.iter().all(|&b| b == 0);
         if !(ours || (create && (size == 0 || blank))) {
-            if let Some(i) = ci {
-                if let Some(slot) = self.files.get_mut(i) {
-                    *slot = None;
-                }
-                self.work.cached = None;
-            }
             return Ok(None);
         }
-        let i = match ci {
-            Some(i) => i,
-            None => {
-                let c = Container::new(name)?;
-                match self.files.iter().position(Option::is_none) {
-                    Some(free) => {
-                        if let Some(slot) = self.files.get_mut(free) {
-                            *slot = Some(c);
-                        }
-                        free
-                    }
-                    None => {
-                        self.files.try_reserve(1).map_err(|_| Error::MEMORY)?;
-                        self.files.push(Some(c));
-                        self.files.len() - 1
-                    }
-                }
-            }
-        };
-        self.work.cached = None;
-        let c = self
-            .files
-            .get_mut(i)
-            .and_then(Option::as_mut)
-            .ok_or(Error::IO)?;
-        c.broken = false;
-        if let Err(e) = refresh(&mut self.inner, c, id) {
-            c.valid = false;
-            return Err(e);
-        }
+        let mut c = Container::new(name)?;
+        load_file(&mut self.inner, &mut c, id)?;
         if c.page_size == 0 && !create {
             // Leeg zonder toestemming om te comprimeren: gewoon bestand.
-            if let Some(slot) = self.files.get_mut(i) {
-                *slot = None;
-            }
             return Ok(None);
         }
-        Ok(Some(i))
+        // Een eigen kopie als een ander nu schrijft zonder oude ingangen; anders
+        // gedeeld, ook als een ander hem intussen (tijdens het laden) opnam.
+        let core = {
+            let mut reg = self
+                .owner
+                .maps
+                .0
+                .try_borrow_mut()
+                .map_err(|_| Error::MISUSE)?;
+            let listed = reg.find(name);
+            let theirs = listed.filter(|&i| reg.is_shareable(i));
+            match theirs {
+                Some(i) => i,
+                None => reg.insert(Core::new(c, listed.is_none()))?,
+            }
+        };
+        self.attach(core).map(Some)
+    }
+
+    /// Kijkt een kern die een andere eigenaar al open had na tegen het bestand,
+    /// en laadt opnieuw als een schrijver buiten deze `Maps` hem inhaalde.
+    fn revalidate(&mut self, si: usize, id: FileId) -> Result {
+        let known = self.with(si, |k, _| {
+            (k.tx.is_none() && !k.stale).then(|| Known {
+                page_size: k.c.page_size,
+                file_id: k.c.file_id,
+                generation: k.c.generation,
+                log: LogAt::of(&k.c),
+            })
+        })?;
+        let behind = match known {
+            Some(known) => !is_current(&mut self.inner, id, known)?,
+            None => false,
+        };
+        if behind {
+            self.reload(si, id)
+        } else {
+            self.fresh(si, id)
+        }
+    }
+
+    /// Laadt een kern die het bestand niet meer volgt opnieuw.
+    fn fresh(&mut self, si: usize, id: FileId) -> Result {
+        if self.with(si, |k, _| k.stale && k.tx.is_none())? {
+            self.reload(si, id)?;
+        }
+        Ok(())
+    }
+
+    /// Leest kern `si` opnieuw van het bestand, als intussen niemand hem verving
+    /// of erin schreef.
+    fn reload(&mut self, si: usize, id: FileId) -> Result {
+        let (mut c, version) = self.with(si, |k, _| {
+            Container::new(k.c.name()).map(|c| (c, k.version))
+        })??;
+        load_file(&mut self.inner, &mut c, id)?;
+        self.with(si, |k, _| {
+            if k.tx.is_none() && k.version == version {
+                k.c = c;
+                k.stale = false;
+                k.version = k.version.wrapping_add(1);
+            }
+        })?;
+        self.work.cached = None;
+        Ok(())
     }
 }
 
 impl<S: Storage> Compressed<S> {
     /// Maakt van een leeg bestand een container met paginamaat uit `src`.
-    fn init(&mut self, ci: usize, id: FileId, offset: u64, src: &[u8]) -> Result {
+    fn init(&mut self, si: usize, id: FileId, offset: u64, src: &[u8]) -> Result {
         let mut page_size = self.policy.page_size;
         if offset == 0 && src.len() >= 100 && src.get(..16) == Some(b"SQLite format 3\0") {
             let raw = u16::from_be_bytes([src[16], src[17]]);
@@ -1325,46 +1827,49 @@ impl<S: Storage> Compressed<S> {
         }
         let mut ids = [0u8; 16];
         self.inner.random(&mut ids)?;
-        let c = self.container(ci)?;
-        c.page_size = page_size;
-        c.segment = segment_for(page_size);
-        c.file_id = get_u64(&ids, 0);
-        c.salt = get_u64(&ids, 8);
-        c.generation = 1;
-        c.seq = 0;
-        c.active = 0;
-        c.fresh = true;
-        c.size = 0;
-        c.map.clear();
-        c.region_off = HEADER;
-        c.region_len = u64::from(c.segment);
-        c.snapshot_len = 0;
-        c.log_off = HEADER;
-        c.log_cap = c.region_len;
-        c.log_end = 0;
-        c.writer = None;
-        let mut sb = c.superblock();
-        sb.snapshot_sum = sum(&[]);
-        let bytes = sb.encode();
-        c.physical = c.physical.max(SB_LEN as u64);
+        let bytes = self.with(si, |k, _| {
+            let c = &mut k.c;
+            c.page_size = page_size;
+            c.segment = segment_for(page_size);
+            c.file_id = get_u64(&ids, 0);
+            c.salt = get_u64(&ids, 8);
+            c.generation = 1;
+            c.seq = 0;
+            c.active = 0;
+            c.fresh = true;
+            c.size = 0;
+            c.map.clear();
+            c.region_off = HEADER;
+            c.region_len = u64::from(c.segment);
+            c.snapshot_len = 0;
+            c.log_off = HEADER;
+            c.log_cap = c.region_len;
+            c.log_end = 0;
+            c.writer = None;
+            let mut sb = c.superblock();
+            sb.snapshot_sum = sum(&[]);
+            c.physical = c.physical.max(SB_LEN as u64);
+            sb.encode()
+        })?;
         // Superblok A van de lege staat; blok B volgt bij de eerste commit.
         self.inner.write(id, 0, &bytes)?;
-        let c = self.container(ci)?;
-        let mut segs = Vec::new();
-        segs.try_reserve_exact(1).map_err(|_| Error::MEMORY)?;
-        segs.push(Seg {
-            live: 0,
-            end: 0,
-            usage: Use::Meta,
-        });
-        c.writer = Some(Writer {
-            segs,
-            open: None,
-            wp: 0,
-            written: 0,
-        });
-        c.pending = true;
-        Ok(())
+        self.with(si, |k, _| {
+            let mut segs = Vec::new();
+            segs.try_reserve_exact(1).map_err(|_| Error::MEMORY)?;
+            segs.push(Seg {
+                live: 0,
+                end: 0,
+                usage: Use::Meta,
+            });
+            k.c.writer = Some(Writer {
+                segs,
+                open: None,
+                wp: 0,
+                written: 0,
+            });
+            k.c.pending = true;
+            Ok(())
+        })?
     }
 
     fn encoder(&mut self) -> Result {
@@ -1374,14 +1879,77 @@ impl<S: Storage> Compressed<S> {
         Ok(())
     }
 
-    fn write_container(&mut self, ci: usize, id: FileId, offset: u64, src: &[u8]) -> Result {
-        if self.container(ci)?.page_size == 0 {
-            self.init(ci, id, offset, src)?;
+    /// Comprimeert en schrijft één hele pagina.
+    fn store(&mut self, si: usize, id: FileId, page: u32, page_size: u32, data: &[u8]) -> Result {
+        if u64::from(page) >= MAX_PAGES {
+            return Err(Error::FULL);
         }
-        let page_size = self.container(ci)?.page_size;
+        if data.iter().all(|&b| b == 0) {
+            return self.with(si, |k, _| k.set_entry(page, 0, 0))?;
+        }
+        // Alleen gecomprimeerd als het kleiner is dan de pagina en in de
+        // lengtecode past; anders onsamendrukbaar, rauw.
+        let limit = (page_size as usize - 1).min(RAW as usize - 1);
+        let enc = self.work.enc.as_mut().ok_or(Error::MEMORY)?;
+        let stored = self.work.stored.get_mut(..limit).ok_or(Error::IO)?;
+        let len = match enc.compress(data, stored) {
+            Some(n) => n as u32,
+            None => page_size,
+        };
+        let off = self.with(si, |k, _| alloc(&mut k.c, len))??;
+        let bytes = if len == page_size {
+            data
+        } else {
+            self.work.stored.get(..len as usize).ok_or(Error::IO)?
+        };
+        self.inner.write(id, off, bytes)?;
+        let sum = check(bytes);
+        self.with(si, |k, _| {
+            k.c.physical = k.c.physical.max(off + u64::from(len));
+            if let Some(w) = k.c.writer.as_mut() {
+                w.written += u64::from(len);
+            }
+            k.set_entry(page, entry_of(off, len, page_size), sum)
+        })?
+    }
+
+    /// Vult `scratch` met pagina `page` zoals deze eigenaar hem ziet, nul voorbij
+    /// de logische maat.
+    fn load_page(&mut self, si: usize, id: FileId, page: u32, scratch: &mut [u8]) -> Result {
+        let (entry, size, page_size) = self.with(si, |k, me| {
+            Ok((k.entry(me, page)?, k.size(me), k.page_size(me)))
+        })??;
+        let p = u64::from(page_size);
+        if u64::from(page) * p >= size {
+            scratch.fill(0);
+            return Ok(());
+        }
+        load_slot(
+            &mut self.inner,
+            &mut self.work.stored,
+            entry,
+            page_size,
+            id,
+            scratch,
+        )?;
+        // Voorbij de logische maat is alles nul, ook na een eerdere krimp.
+        let visible = (size - u64::from(page) * p).min(p) as usize;
+        if let Some(t) = scratch.get_mut(visible..) {
+            t.fill(0);
+        }
+        Ok(())
+    }
+
+    fn write_container(&mut self, si: usize, id: FileId, offset: u64, src: &[u8]) -> Result {
+        self.fresh(si, id)?;
+        let empty = self.with(si, |k, me| k.begin(me).map(|()| k.c.page_size == 0))??;
+        if empty {
+            self.init(si, id, offset, src)?;
+        }
+        let page_size = self.with(si, |k, _| k.c.page_size)?;
         self.buffers(page_size)?;
         self.encoder()?;
-        build_writer(self.container(ci)?)?;
+        self.with(si, |k, _| build_writer(&mut k.c))??;
         let p = u64::from(page_size);
         let end = offset.checked_add(src.len() as u64).ok_or(Error::FULL)?;
         if pages_of(end, page_size) >= MAX_PAGES {
@@ -1395,57 +1963,63 @@ impl<S: Storage> Compressed<S> {
             let within = (at % p) as usize;
             let n = (page_size as usize - within).min(src.len() - pos);
             let piece = src.get(pos..pos + n).ok_or(Error::IO)?;
-            let Self {
-                inner, files, work, ..
-            } = self;
-            let c = files
-                .get_mut(ci)
-                .and_then(Option::as_mut)
-                .ok_or(Error::IO)?;
-            let enc = work.enc.as_mut().ok_or(Error::MEMORY)?;
             if n == page_size as usize {
-                store(inner, enc, &mut work.stored, c, id, page, piece)?;
+                self.store(si, id, page, page_size, piece)?;
             } else {
                 // Read-modify-write van een deel van een pagina.
-                let scratch = work.page.get_mut(..page_size as usize).ok_or(Error::IO)?;
-                if u64::from(page) * p < c.size {
-                    load_page(inner, &mut work.stored, c, id, page, scratch)?;
-                    // Voorbij de logische maat is alles nul, ook na een eerdere krimp.
-                    let visible = (c.size - u64::from(page) * p).min(p) as usize;
-                    if let Some(t) = scratch.get_mut(visible..) {
-                        t.fill(0);
-                    }
-                } else {
-                    scratch.fill(0);
-                }
-                scratch
-                    .get_mut(within..within + n)
-                    .ok_or(Error::IO)?
-                    .copy_from_slice(piece);
-                store(inner, enc, &mut work.stored, c, id, page, scratch)?;
+                let mut scratch = core::mem::take(&mut self.work.page);
+                let out = self.rmw(si, id, at, page_size, piece, &mut scratch);
+                self.work.page = scratch;
+                out?;
             }
             pos += n;
         }
-        let c = self.container(ci)?;
-        if end > c.size {
-            c.size = end;
-            grow(&mut c.map, pages_of(end, page_size) as usize)?;
-        }
-        c.pending = true;
-        Ok(())
+        self.with(si, |k, _| {
+            let c = &mut k.c;
+            if end > c.size {
+                c.size = end;
+                grow(&mut c.map, pages_of(end, page_size) as usize)?;
+            }
+            c.pending = true;
+            Ok(())
+        })?
+    }
+
+    /// Schrijft `piece` op logische offset `at`, binnen één pagina
+    /// (read-modify-write).
+    fn rmw(
+        &mut self,
+        si: usize,
+        id: FileId,
+        at: u64,
+        page_size: u32,
+        piece: &[u8],
+        buf: &mut [u8],
+    ) -> Result {
+        let p = u64::from(page_size);
+        let page = u32::try_from(at / p).map_err(|_| Error::FULL)?;
+        let within = (at % p) as usize;
+        let scratch = buf.get_mut(..page_size as usize).ok_or(Error::IO)?;
+        self.load_page(si, id, page, scratch)?;
+        scratch
+            .get_mut(within..within + piece.len())
+            .ok_or(Error::IO)?
+            .copy_from_slice(piece);
+        self.store(si, id, page, page_size, scratch)
     }
 
     fn read_container(
         &mut self,
-        ci: usize,
+        si: usize,
         id: FileId,
         offset: u64,
         dst: &mut [u8],
     ) -> Result<usize> {
-        let (size, page_size) = {
-            let c = self.container(ci)?;
-            (c.size, c.page_size)
-        };
+        self.fresh(si, id)?;
+        let (size, page_size) = self.with(si, |k, me| {
+            k.check(me)?;
+            Ok((k.size(me), k.page_size(me)))
+        })??;
         if offset >= size || page_size == 0 {
             return Ok(0);
         }
@@ -1458,19 +2032,44 @@ impl<S: Storage> Compressed<S> {
             let page = u32::try_from(at / p).map_err(|_| Error::IO)?;
             let within = (at % p) as usize;
             let n = (page_size as usize - within).min(total - pos);
-            let Self {
-                inner, files, work, ..
-            } = self;
-            let c = files.get(ci).and_then(Option::as_ref).ok_or(Error::IO)?;
+            let core = self
+                .owner
+                .files
+                .get(si)
+                .copied()
+                .flatten()
+                .ok_or(Error::IO)?
+                .core;
+            let (entry, version) =
+                self.with(si, |k, me| k.entry(me, page).map(|e| (e, k.version)))??;
             let out = dst.get_mut(pos..pos + n).ok_or(Error::IO)?;
             if n == page_size as usize {
-                load_page(inner, &mut work.stored, c, id, page, out)?;
+                load_slot(
+                    &mut self.inner,
+                    &mut self.work.stored,
+                    entry,
+                    page_size,
+                    id,
+                    out,
+                )?;
             } else {
-                let scratch = work.page.get_mut(..page_size as usize).ok_or(Error::IO)?;
-                if work.cached != Some((ci, page)) {
-                    work.cached = None;
-                    load_page(inner, &mut work.stored, c, id, page, scratch)?;
-                    work.cached = Some((ci, page));
+                let key = Some((core, page, version));
+                let scratch = self
+                    .work
+                    .page
+                    .get_mut(..page_size as usize)
+                    .ok_or(Error::IO)?;
+                if self.work.cached != key {
+                    self.work.cached = None;
+                    load_slot(
+                        &mut self.inner,
+                        &mut self.work.stored,
+                        entry,
+                        page_size,
+                        id,
+                        scratch,
+                    )?;
+                    self.work.cached = key;
                 }
                 out.copy_from_slice(scratch.get(within..within + n).ok_or(Error::IO)?);
             }
@@ -1479,27 +2078,32 @@ impl<S: Storage> Compressed<S> {
         Ok(total)
     }
 
-    fn truncate_container(&mut self, ci: usize, id: FileId, size: u64) -> Result {
-        let c = self.container(ci)?;
-        if c.page_size == 0 {
+    fn truncate_container(&mut self, si: usize, id: FileId, size: u64) -> Result {
+        self.fresh(si, id)?;
+        let page_size = self.with(si, |k, me| k.check(me).map(|()| k.c.page_size))??;
+        if page_size == 0 {
             if size == 0 {
                 return Ok(());
             }
-            self.init(ci, id, 1, &[])?;
+            self.with(si, |k, me| k.begin(me))??;
+            self.init(si, id, 1, &[])?;
         }
-        let c = self.container(ci)?;
-        if size >= c.size {
-            if size > c.size {
-                let page_size = c.page_size;
-                c.size = size;
-                grow(&mut c.map, pages_of(size, page_size) as usize)?;
-                c.pending = true;
+        let (page_size, old) = self.with(si, |k, me| {
+            k.begin(me)?;
+            Ok((k.c.page_size, k.c.size))
+        })??;
+        if size >= old {
+            if size > old {
+                self.with(si, |k, _| {
+                    k.c.size = size;
+                    k.c.pending = true;
+                    grow(&mut k.c.map, pages_of(size, page_size) as usize)
+                })??;
             }
             return Ok(());
         }
-        let page_size = c.page_size;
         self.work.cached = None;
-        build_writer(self.container(ci)?)?;
+        self.with(si, |k, _| build_writer(&mut k.c))??;
         let p = u64::from(page_size);
         let keep = pages_of(size, page_size);
         // Een halve laatste pagina: de staart wordt nul (een latere groei leest nul).
@@ -1508,52 +2112,67 @@ impl<S: Storage> Compressed<S> {
             let within = (size % p) as usize;
             self.buffers(page_size)?;
             self.encoder()?;
-            let Self {
-                inner, files, work, ..
-            } = self;
-            let c = files
-                .get_mut(ci)
-                .and_then(Option::as_mut)
-                .ok_or(Error::IO)?;
-            let scratch = work.page.get_mut(..page_size as usize).ok_or(Error::IO)?;
-            load_page(inner, &mut work.stored, c, id, last, scratch)?;
-            if let Some(t) = scratch.get_mut(within..) {
-                t.fill(0);
+            let mut buf = core::mem::take(&mut self.work.page);
+            let out = (|| {
+                let scratch = buf.get_mut(..page_size as usize).ok_or(Error::IO)?;
+                self.load_page(si, id, last, scratch)?;
+                if let Some(t) = scratch.get_mut(within..) {
+                    t.fill(0);
+                }
+                self.store(si, id, last, page_size, scratch)
+            })();
+            self.work.page = buf;
+            out?;
+        }
+        self.with(si, |k, _| {
+            let keep = keep as usize;
+            let len = k.c.map.len();
+            for p in keep..len {
+                if p < k.base.pages {
+                    k.remember(p as u32)?;
+                }
+                let e = k.c.map.get(p).copied().unwrap_or(0);
+                account(&mut k.c, e, false)?;
             }
-            let enc = work.enc.as_mut().ok_or(Error::MEMORY)?;
-            store(inner, enc, &mut work.stored, c, id, last, scratch)?;
-        }
-        let c = self.container(ci)?;
-        let gone: Vec<u64> = c
-            .map
-            .get(keep as usize..)
-            .map(<[u64]>::to_vec)
-            .unwrap_or_default();
-        for e in gone {
-            account(c, e, false)?;
-        }
-        c.map.truncate(keep as usize);
-        c.size = size;
-        c.trunc = Some(c.trunc.map_or(keep, |t| t.min(keep)));
-        c.pending = true;
-        Ok(())
+            let c = &mut k.c;
+            c.map.truncate(keep);
+            c.size = size;
+            c.trunc = Some(c.trunc.map_or(keep as u64, |t| t.min(keep as u64)));
+            c.pending = true;
+            Ok(())
+        })?
     }
 }
 
 impl<S: Storage> Compressed<S> {
-    /// Eén commit van container `ci` (zie de moduledocs).
-    fn commit(&mut self, ci: usize, id: FileId) -> Result {
-        let c = self.container(ci)?;
-        if !c.pending {
+    /// Eén commit van slot `si` (zie de moduledocs). Alleen de schrijver commit;
+    /// voor een ander is het een gewone `sync`.
+    fn commit(&mut self, si: usize, id: FileId) -> Result {
+        let ours = self.with(si, |k, me| {
+            if k.tx != Some(me) {
+                return Ok(false);
+            }
+            k.check(me)?;
+            if !k.c.pending {
+                // Begonnen maar niets veranderd: niets te committen.
+                k.end();
+                return Ok(false);
+            }
+            Ok(true)
+        })??;
+        if !ours {
             return self.inner.sync(id, 3);
         }
-        let out = self.commit_inner(ci, id);
-        if out.is_err()
-            && let Some(Some(c)) = self.files.get_mut(ci)
-        {
-            // Onbekend wat er duurzaam is: pas na heropenen verder.
-            c.broken = true;
-            c.valid = false;
+        let out = self.commit_inner(si, id);
+        if out.is_err() {
+            // Onbekend wat er duurzaam is: de schrijver faalt tot hij sluit, de
+            // anderen lezen de vorige gecommitte staat. Viel de fout na de
+            // commit (het afkappen van de staart), dan is er niets onbekends.
+            self.with(si, |k, me| {
+                if k.tx == Some(me) {
+                    k.c.broken = true;
+                }
+            })?;
         }
         out
     }
@@ -1565,12 +2184,10 @@ impl<S: Storage> Compressed<S> {
     /// duurzaam is het pas na een volgende `sync`, zoals SQLite bij `OFF` ook belooft.
     /// Een checkpoint blijft wel gesynct: het superblok mag nooit naar een half
     /// snapshot wijzen.
-    fn settle(&mut self, ci: usize) -> Result {
+    fn settle(&mut self, si: usize) -> Result {
         let pending = self
-            .files
-            .get(ci)
-            .and_then(Option::as_ref)
-            .is_some_and(|c| c.pending && !c.broken && c.opens > 0);
+            .with(si, |k, me| k.tx == Some(me) && k.c.pending && !k.c.broken)
+            .unwrap_or(false);
         if !pending {
             return Ok(());
         }
@@ -1578,329 +2195,222 @@ impl<S: Storage> Compressed<S> {
             .handles
             .iter()
             .flatten()
-            .find(|h| h.container == Some(ci))
+            .find(|h| h.container == Some(si))
             .map(|h| h.inner)
         else {
             return Ok(());
         };
         self.durable = false;
-        let out = self.commit(ci, id);
+        let out = self.commit(si, id);
         self.durable = true;
         out
     }
 
-    /// De container met open handvatten waarvan `name` het journal is.
+    /// Het slot van deze eigenaar waarvan `name` het journal is.
     fn journal_owner(&self, name: &[u8]) -> Option<usize> {
-        let base = name.strip_suffix(b"-journal")?;
-        self.files
-            .iter()
-            .position(|c| c.as_ref().is_some_and(|c| c.opens > 0 && c.name() == base))
+        self.slot_named(name.strip_suffix(b"-journal")?)
     }
 
-    fn commit_inner(&mut self, ci: usize, id: FileId) -> Result {
-        build_writer(self.container(ci)?)?;
-        self.clean(ci, id)?;
-        let c = self.container(ci)?;
-        if c.fresh {
-            return self.checkpoint(ci, id);
-        }
-        // De laatste write van een pagina telt: stabiel sorteren, dan per
-        // pagina de laatste houden.
-        c.dirty.sort_by_key(|&(p, _)| p);
-        let mut keep: Vec<(u32, u32)> = Vec::new();
-        keep.try_reserve_exact(c.dirty.len())
-            .map_err(|_| Error::MEMORY)?;
-        for &(p, s) in &c.dirty {
-            match keep.last_mut() {
-                Some(last) if last.0 == p => last.1 = s,
-                _ => keep.push((p, s)),
+    fn commit_inner(&mut self, si: usize, id: FileId) -> Result {
+        self.with(si, |k, _| build_writer(&mut k.c))??;
+        self.clean(si, id)?;
+        let record = self.with(si, |k, _| -> Result<Option<(Vec<u8>, u64)>> {
+            let c = &mut k.c;
+            if c.fresh {
+                return Ok(None);
             }
-        }
-        c.dirty = keep;
-        let count = c.dirty.len();
-        let len = RECORD_HEAD + count * ENTRY;
-        if (c.log_end + len as u64) > c.log_cap {
-            return self.checkpoint(ci, id);
-        }
-        let mut rec = Vec::new();
-        rec.try_reserve_exact(len).map_err(|_| Error::MEMORY)?;
-        rec.resize(len, 0);
-        put(&mut rec, 0, &RECORD_MAGIC.to_le_bytes());
-        put(&mut rec, 4, &(count as u32).to_le_bytes());
-        put(&mut rec, 8, &c.salt.to_le_bytes());
-        put(&mut rec, 16, &(c.seq + 1).to_le_bytes());
-        put(&mut rec, 24, &c.size.to_le_bytes());
-        put(&mut rec, 32, &c.trunc.unwrap_or(u64::MAX).to_le_bytes());
-        for (k, &(page, check)) in c.dirty.iter().enumerate() {
-            let at = RECORD_HEAD + k * ENTRY;
-            put(&mut rec, at, &page.to_le_bytes());
-            let e = c.map.get(page as usize).copied().unwrap_or(0);
-            put(&mut rec, at + 4, &e.to_le_bytes());
-            put(&mut rec, at + 12, &check.to_le_bytes());
-        }
-        let s = sum(&[&rec]);
-        put(&mut rec, 40, &s.to_le_bytes());
-        let at = c.log_off + c.log_end;
+            // De laatste write van een pagina telt: stabiel sorteren, dan per
+            // pagina de laatste houden.
+            c.dirty.sort_by_key(|&(p, _)| p);
+            let mut keep: Vec<(u32, u32)> = Vec::new();
+            keep.try_reserve_exact(c.dirty.len())
+                .map_err(|_| Error::MEMORY)?;
+            for &(p, s) in &c.dirty {
+                match keep.last_mut() {
+                    Some(last) if last.0 == p => last.1 = s,
+                    _ => keep.push((p, s)),
+                }
+            }
+            c.dirty = keep;
+            let count = c.dirty.len();
+            let len = RECORD_HEAD + count * ENTRY;
+            if (c.log_end + len as u64) > c.log_cap {
+                return Ok(None);
+            }
+            let mut rec = Vec::new();
+            rec.try_reserve_exact(len).map_err(|_| Error::MEMORY)?;
+            rec.resize(len, 0);
+            put(&mut rec, 0, &RECORD_MAGIC.to_le_bytes());
+            put(&mut rec, 4, &(count as u32).to_le_bytes());
+            put(&mut rec, 8, &c.salt.to_le_bytes());
+            put(&mut rec, 16, &(c.seq + 1).to_le_bytes());
+            put(&mut rec, 24, &c.size.to_le_bytes());
+            put(&mut rec, 32, &c.trunc.unwrap_or(u64::MAX).to_le_bytes());
+            for (k, &(page, check)) in c.dirty.iter().enumerate() {
+                let at = RECORD_HEAD + k * ENTRY;
+                put(&mut rec, at, &page.to_le_bytes());
+                let e = c.map.get(page as usize).copied().unwrap_or(0);
+                put(&mut rec, at + 4, &e.to_le_bytes());
+                put(&mut rec, at + 12, &check.to_le_bytes());
+            }
+            let s = sum(&[&rec]);
+            put(&mut rec, 40, &s.to_le_bytes());
+            Ok(Some((rec, c.log_off + c.log_end)))
+        })??;
+        let Some((rec, at)) = record else {
+            return self.checkpoint(si, id);
+        };
         self.inner.write(id, at, &rec)?;
         if self.durable {
             self.inner.sync(id, 3)?;
         }
-        let c = self.container(ci)?;
-        c.physical = c.physical.max(at + len as u64);
-        c.log_end += align(len as u64, SECTOR);
-        c.seq += 1;
-        self.after_commit(ci, id)
+        self.with(si, |k, _| {
+            let c = &mut k.c;
+            c.physical = c.physical.max(at + rec.len() as u64);
+            c.log_end += align(rec.len() as u64, SECTOR);
+            c.seq += 1;
+        })?;
+        self.after_commit(si, id)
     }
 
     /// Hele kaart als nieuw snapshot, dan het andere superblok.
-    fn checkpoint(&mut self, ci: usize, id: FileId) -> Result {
-        let c = self.container(ci)?;
-        let seg = u64::from(c.segment);
-        let pages = c.map.len() as u64;
-        let snapshot_len = pages * 8;
-        let snap = align(snapshot_len, SECTOR);
-        let log = align(snapshot_len / 2, SECTOR).clamp(MIN_LOG, MAX_LOG);
-        let region_len = align(snap + log, seg);
-        let k = (region_len / seg) as usize;
-        // De eerste commit mag zijn lege gebied hergebruiken: niets daarin
-        // telt (blok A beschrijft een lege staat met een ander zout).
-        let in_place = c.fresh && region_len <= c.region_len;
-        let old = (c.region_off, c.region_len);
-        let region_off = if in_place {
-            c.region_off
-        } else {
-            let w = c.writer.as_mut().ok_or(Error::MISUSE)?;
-            let open = w.open.map(|o| o as usize);
-            let mut run = 0usize;
-            let mut start = None;
-            for (i, g) in w.segs.iter().enumerate() {
-                if g.usage == Use::Free && Some(i) != open {
-                    run += 1;
-                    if run == k {
-                        start = Some(i + 1 - k);
-                        break;
-                    }
-                } else {
-                    run = 0;
-                }
-            }
-            let first = match start {
-                Some(s) => s,
-                None => {
-                    // Aan het eind, eventueel aansluitend op een vrije staart.
-                    let tail = w
-                        .segs
-                        .iter()
-                        .rev()
-                        .take_while(|g| g.usage == Use::Free)
-                        .count()
-                        .min(k);
-                    let tail = if open.is_some_and(|o| o + tail >= w.segs.len()) {
-                        0
-                    } else {
-                        tail
-                    };
-                    let s = w.segs.len() - tail;
-                    w.segs.try_reserve(k - tail).map_err(|_| Error::MEMORY)?;
-                    while w.segs.len() < s + k {
-                        w.segs.push(Seg {
-                            live: 0,
-                            end: 0,
-                            usage: Use::Free,
-                        });
-                    }
-                    s
-                }
-            };
-            for g in w.segs.iter_mut().skip(first).take(k) {
-                g.usage = Use::Meta;
-                g.live = 0;
-                g.end = 0;
-            }
-            HEADER + first as u64 * seg
-        };
+    fn checkpoint(&mut self, si: usize, id: FileId) -> Result {
+        let plan = self.with(si, |k, _| plan_checkpoint(&mut k.c))??;
         // Het snapshot, in stappen geschreven en gesomd.
         let mut s = Sum::new();
         let mut buf = Vec::new();
-        buf.try_reserve_exact(CHUNK.min(snapshot_len as usize).max(8))
+        buf.try_reserve_exact(CHUNK.min(plan.snapshot_len as usize).max(8))
             .map_err(|_| Error::MEMORY)?;
+        let pages = (plan.snapshot_len / 8) as usize;
         let mut at = 0usize;
-        while at < pages as usize {
-            let n = (CHUNK / 8).min(pages as usize - at);
+        while at < pages {
+            let n = (CHUNK / 8).min(pages - at);
             buf.clear();
-            let c = self.container(ci)?;
-            for &e in c.map.get(at..at + n).ok_or(Error::IO)? {
-                buf.extend_from_slice(&e.to_le_bytes());
-            }
+            self.with(si, |k, _| -> Result {
+                for &e in k.c.map.get(at..at + n).ok_or(Error::IO)? {
+                    buf.extend_from_slice(&e.to_le_bytes());
+                }
+                Ok(())
+            })??;
             s.update(&buf);
-            self.inner.write(id, region_off + at as u64 * 8, &buf)?;
+            self.inner
+                .write(id, plan.region_off + at as u64 * 8, &buf)?;
             at += n;
         }
         self.inner.sync(id, 3)?;
         let mut salt = [0u8; 8];
         self.inner.random(&mut salt)?;
-        let c = self.container(ci)?;
-        c.physical = c.physical.max(region_off + snapshot_len);
-        let mut sb = c.superblock();
-        sb.generation = c.generation + 1;
-        sb.salt = u64::from_le_bytes(salt);
-        sb.seq = c.seq + 1;
-        sb.region_off = region_off;
-        sb.region_len = region_len;
-        sb.snapshot_len = snapshot_len;
-        sb.snapshot_sum = s.finish();
-        sb.log_off = region_off + snap;
-        sb.log_cap = region_len - snap;
-        let target = if c.active == 0 { SLOT_B } else { 0 };
+        let (sb, target) = self.with(si, |k, _| {
+            let c = &mut k.c;
+            c.physical = c.physical.max(plan.region_off + plan.snapshot_len);
+            let snap = align(plan.snapshot_len, SECTOR);
+            let mut sb = c.superblock();
+            sb.generation = c.generation + 1;
+            sb.salt = u64::from_le_bytes(salt);
+            sb.seq = c.seq + 1;
+            sb.region_off = plan.region_off;
+            sb.region_len = plan.region_len;
+            sb.snapshot_len = plan.snapshot_len;
+            sb.snapshot_sum = s.finish();
+            sb.log_off = plan.region_off + snap;
+            sb.log_cap = plan.region_len - snap;
+            (sb, if c.active == 0 { SLOT_B } else { 0 })
+        })?;
         self.inner.write(id, target, &sb.encode())?;
         self.inner.sync(id, 3)?;
-        let c = self.container(ci)?;
-        c.generation = sb.generation;
-        c.salt = sb.salt;
-        c.seq = sb.seq;
-        c.active = if target == 0 { 0 } else { 1 };
-        c.region_off = sb.region_off;
-        c.region_len = sb.region_len;
-        c.snapshot_len = sb.snapshot_len;
-        c.log_off = sb.log_off;
-        c.log_cap = sb.log_cap;
-        c.log_end = 0;
-        c.fresh = false;
-        if !in_place {
-            let first = c.seg_of(old.0).ok_or(Error::IO)? as usize;
+        self.with(si, |k, _| {
+            let c = &mut k.c;
+            c.generation = sb.generation;
+            c.salt = sb.salt;
+            c.seq = sb.seq;
+            c.active = if target == 0 { 0 } else { 1 };
+            c.region_off = sb.region_off;
+            c.region_len = sb.region_len;
+            c.snapshot_len = sb.snapshot_len;
+            c.log_off = sb.log_off;
+            c.log_cap = sb.log_cap;
+            c.log_end = 0;
+            c.fresh = false;
+            if !plan.in_place {
+                let seg = u64::from(c.segment);
+                let first = c.seg_of(plan.old.0).ok_or(Error::IO)? as usize;
+                let w = c.writer.as_mut().ok_or(Error::MISUSE)?;
+                for g in w
+                    .segs
+                    .iter_mut()
+                    .skip(first)
+                    .take((plan.old.1 / seg) as usize)
+                {
+                    if g.usage == Use::Meta {
+                        g.usage = Use::Free;
+                        g.end = 0;
+                    }
+                }
+            }
+            Ok(())
+        })??;
+        self.after_commit(si, id)
+    }
+
+    /// Na een duurzame commit: de nieuwe gecommitte staat voor iedereen, lege
+    /// segmenten vrij, volgende writes op een nieuwe sector, eventueel een
+    /// kortere staart.
+    fn after_commit(&mut self, si: usize, id: FileId) -> Result {
+        let (target, physical) = self.with(si, |k, _| -> Result<(u64, u64)> {
+            let c = &mut k.c;
+            c.dirty.clear();
+            c.trunc = None;
+            c.pending = false;
+            let seg = u64::from(c.segment);
+            let meta_end = c.log_off + c.log_end;
             let w = c.writer.as_mut().ok_or(Error::MISUSE)?;
-            for g in w.segs.iter_mut().skip(first).take((old.1 / seg) as usize) {
-                if g.usage == Use::Meta {
+            w.written = 0;
+            for (i, g) in w.segs.iter_mut().enumerate() {
+                if g.usage == Use::Data && g.live == 0 && w.open != Some(i as u32) {
                     g.usage = Use::Free;
                     g.end = 0;
                 }
             }
-        }
-        self.after_commit(ci, id)
-    }
-
-    /// Na een duurzame commit: lege segmenten vrij, volgende writes op een
-    /// nieuwe sector, eventueel een kortere staart.
-    fn after_commit(&mut self, ci: usize, id: FileId) -> Result {
-        let c = self.container(ci)?;
-        c.dirty.clear();
-        c.trunc = None;
-        c.pending = false;
-        let seg = u64::from(c.segment);
-        let meta_end = c.log_off + c.log_end;
-        let w = c.writer.as_mut().ok_or(Error::MISUSE)?;
-        w.written = 0;
-        for (i, g) in w.segs.iter_mut().enumerate() {
-            if g.usage == Use::Data && g.live == 0 && w.open != Some(i as u32) {
-                g.usage = Use::Free;
-                g.end = 0;
+            if let Some(i) = w.open {
+                w.wp = align(w.wp, SECTOR);
+                if w.wp >= HEADER + (u64::from(i) + 1) * seg {
+                    w.open = None;
+                }
             }
-        }
-        if let Some(i) = w.open {
-            w.wp = align(w.wp, SECTOR);
-            if w.wp >= HEADER + (u64::from(i) + 1) * seg {
+            let mut target = HEADER.max(meta_end);
+            for (i, g) in w.segs.iter().enumerate() {
+                if g.usage == Use::Data {
+                    target = target.max(HEADER + i as u64 * seg + u64::from(g.end));
+                }
+            }
+            while w.segs.last().is_some_and(|g| g.usage == Use::Free) {
+                w.segs.pop();
+            }
+            if let Some(i) = w.open
+                && i as usize >= w.segs.len()
+            {
                 w.open = None;
             }
-        }
-        let mut target = HEADER.max(meta_end);
-        for (i, g) in w.segs.iter().enumerate() {
-            if g.usage == Use::Data {
-                target = target.max(HEADER + i as u64 * seg + u64::from(g.end));
-            }
-        }
-        while w.segs.last().is_some_and(|g| g.usage == Use::Free) {
-            w.segs.pop();
-        }
-        if let Some(i) = w.open
-            && i as usize >= w.segs.len()
-        {
-            w.open = None;
-        }
-        if target < c.physical {
+            let physical = c.physical;
+            k.end();
+            Ok((target, physical))
+        })??;
+        if target < physical {
             self.inner.truncate(id, target)?;
-            self.container(ci)?.physical = target;
+            self.with(si, |k, _| k.c.physical = target)?;
         }
         Ok(())
     }
 
     /// De schoonmaker: binnen een budget levende slots verplaatsen uit segmenten
     /// die vooral dood zijn, of uit de staart als er onderin veel vrij is.
-    fn clean(&mut self, ci: usize, id: FileId) -> Result {
-        let c = self.container(ci)?;
-        let seg = u64::from(c.segment);
-        let budget_start = {
-            let w = c.writer.as_ref().ok_or(Error::MISUSE)?;
-            // Twee keer wat deze transactie schreef houdt de schoonmaker bij;
-            // staat er onder het einde veel vrij (na VACUUM of een grote
-            // DELETE), dan krimpt het bestand met ruim 2 MiB per commit.
-            let last = w
-                .segs
-                .iter()
-                .rposition(|g| g.usage == Use::Data)
-                .unwrap_or(0);
-            let free = w
-                .segs
-                .iter()
-                .take(last)
-                .filter(|g| g.usage == Use::Free)
-                .count() as u64;
-            let floor = if free * 4 > last as u64 + 1 {
-                32 * seg
-            } else {
-                4 * seg
-            };
-            (2 * w.written).max(floor)
-        };
-        let mut budget = budget_start;
+    fn clean(&mut self, si: usize, id: FileId) -> Result {
+        let mut budget = self.with(si, |k, _| clean_budget(&k.c))??;
         for _ in 0..64 {
-            let c = self.container(ci)?;
-            let w = c.writer.as_mut().ok_or(Error::MISUSE)?;
-            let open = w.open;
-            let mut used = 0u64;
-            let mut live = 0u64;
-            let mut last_data = None;
-            for (i, g) in w.segs.iter().enumerate() {
-                if g.usage == Use::Data {
-                    used += u64::from(g.end);
-                    live += u64::from(g.live);
-                    last_data = Some(i);
-                }
-            }
-            let Some(last) = last_data else {
+            let Some((victim, seg)) = self.with(si, |k, _| pick_victim(&mut k.c))?? else {
                 return Ok(());
             };
-            let free_below = w
-                .segs
-                .iter()
-                .take(last)
-                .filter(|g| g.usage == Use::Free)
-                .count() as u64;
-            let dead = used - live;
-            let victim = if dead * 5 > used && dead > 4 * seg {
-                w.segs
-                    .iter()
-                    .enumerate()
-                    .filter(|&(i, g)| g.usage == Use::Data && Some(i as u32) != open && g.live > 0)
-                    .min_by_key(|&(_, g)| g.live)
-                    .map(|(i, _)| i)
-            } else if free_below * 10 > last as u64 + 1 && free_below > 4 {
-                // Krimpen: het hoogste segment naar beneden, via een open
-                // segment onder hem.
-                if open.is_some_and(|o| o as usize >= last) {
-                    w.open = None;
-                }
-                let lowest = w.segs.iter().position(|g| g.usage == Use::Free);
-                lowest.filter(|&l| l < last).map(|_| last)
-            } else {
-                None
-            };
-            let Some(victim) = victim else {
-                return Ok(());
-            };
-            if Some(victim as u32) == w.open {
-                return Ok(());
-            }
-            let moved = self.evacuate(ci, id, victim as u32)?;
+            let moved = self.evacuate(si, id, victim)?;
             budget = budget.saturating_sub(moved.max(seg / 4));
             if budget == 0 {
                 return Ok(());
@@ -1910,44 +2420,217 @@ impl<S: Storage> Compressed<S> {
     }
 
     /// Verplaatst alle levende slots van segment `victim` naar het open segment.
-    fn evacuate(&mut self, ci: usize, id: FileId, victim: u32) -> Result<u64> {
-        let (page_size, base, end) = {
-            let c = self.container(ci)?;
-            let b = c.seg_base(victim);
-            (c.page_size, b, b + u64::from(c.segment))
-        };
+    fn evacuate(&mut self, si: usize, id: FileId, victim: u32) -> Result<u64> {
+        let (page_size, base, end) = self.with(si, |k, _| {
+            let b = k.c.seg_base(victim);
+            (k.c.page_size, b, b + u64::from(k.c.segment))
+        })?;
         self.buffers(page_size)?;
         let mut moved = 0u64;
-        let count = self.container(ci)?.map.len();
-        for page in 0..count {
-            let Self {
-                inner, files, work, ..
-            } = self;
-            let c = files
-                .get_mut(ci)
-                .and_then(Option::as_mut)
-                .ok_or(Error::IO)?;
-            let e = c.map.get(page).copied().unwrap_or(0);
-            let Some(s) = slot_of(e, page_size) else {
-                continue;
+        let mut from = 0usize;
+        loop {
+            // De volgende pagina met een slot in het segment, in één lening.
+            let next = self.with(si, |k, _| {
+                let map = &k.c.map;
+                (from..map.len()).find_map(|p| {
+                    let s = slot_of(map.get(p).copied().unwrap_or(0), page_size)?;
+                    (s.off >= base && s.off < end).then_some((p, s))
+                })
+            })?;
+            let Some((page, s)) = next else {
+                break;
             };
-            if s.off < base || s.off >= end {
-                continue;
-            }
-            let buf = work.stored.get_mut(..s.len as usize).ok_or(Error::IO)?;
-            read_exact(inner, id, s.off, buf)?;
-            let off = alloc(c, s.len)?;
-            if c.seg_of(off) == Some(victim) {
-                return Err(Error::IO);
-            }
-            inner.write(id, off, buf)?;
-            c.physical = c.physical.max(off + u64::from(s.len));
+            let buf = self
+                .work
+                .stored
+                .get_mut(..s.len as usize)
+                .ok_or(Error::IO)?;
+            read_exact(&mut self.inner, id, s.off, buf)?;
+            let off = self.with(si, |k, _| {
+                let off = alloc(&mut k.c, s.len)?;
+                if k.c.seg_of(off) == Some(victim) {
+                    return Err(Error::IO);
+                }
+                Ok(off)
+            })??;
+            let buf = self.work.stored.get(..s.len as usize).ok_or(Error::IO)?;
+            self.inner.write(id, off, buf)?;
             let sum = check(buf);
-            set_entry(c, page as u32, entry_of(off, s.len, page_size), sum)?;
+            self.with(si, |k, _| {
+                k.c.physical = k.c.physical.max(off + u64::from(s.len));
+                k.set_entry(page as u32, entry_of(off, s.len, page_size), sum)
+            })??;
             moved += u64::from(s.len);
+            from = page + 1;
         }
         Ok(moved)
     }
+}
+
+/// Waar een checkpoint zijn nieuwe metadatagebied legt.
+#[derive(Clone, Copy)]
+struct Plan {
+    region_off: u64,
+    region_len: u64,
+    snapshot_len: u64,
+    /// Het lege gebied van de eerste commit hergebruikt.
+    in_place: bool,
+    /// Het oude gebied (offset, lengte).
+    old: (u64, u64),
+}
+
+/// Kiest het metadatagebied van een checkpoint en zet zijn segmenten op `Meta`.
+fn plan_checkpoint(c: &mut Container) -> Result<Plan> {
+    let seg = u64::from(c.segment);
+    let pages = c.map.len() as u64;
+    let snapshot_len = pages * 8;
+    let snap = align(snapshot_len, SECTOR);
+    let log = align(snapshot_len / 2, SECTOR).clamp(MIN_LOG, MAX_LOG);
+    let region_len = align(snap + log, seg);
+    let k = (region_len / seg) as usize;
+    // De eerste commit mag zijn lege gebied hergebruiken: niets daarin
+    // telt (blok A beschrijft een lege staat met een ander zout).
+    let in_place = c.fresh && region_len <= c.region_len;
+    let old = (c.region_off, c.region_len);
+    let region_off = if in_place {
+        c.region_off
+    } else {
+        let w = c.writer.as_mut().ok_or(Error::MISUSE)?;
+        let open = w.open.map(|o| o as usize);
+        let mut run = 0usize;
+        let mut start = None;
+        for (i, g) in w.segs.iter().enumerate() {
+            if g.usage == Use::Free && Some(i) != open {
+                run += 1;
+                if run == k {
+                    start = Some(i + 1 - k);
+                    break;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        let first = match start {
+            Some(s) => s,
+            None => {
+                // Aan het eind, eventueel aansluitend op een vrije staart.
+                let tail = w
+                    .segs
+                    .iter()
+                    .rev()
+                    .take_while(|g| g.usage == Use::Free)
+                    .count()
+                    .min(k);
+                let tail = if open.is_some_and(|o| o + tail >= w.segs.len()) {
+                    0
+                } else {
+                    tail
+                };
+                let s = w.segs.len() - tail;
+                w.segs.try_reserve(k - tail).map_err(|_| Error::MEMORY)?;
+                while w.segs.len() < s + k {
+                    w.segs.push(Seg {
+                        live: 0,
+                        end: 0,
+                        usage: Use::Free,
+                    });
+                }
+                s
+            }
+        };
+        for g in w.segs.iter_mut().skip(first).take(k) {
+            g.usage = Use::Meta;
+            g.live = 0;
+            g.end = 0;
+        }
+        HEADER + first as u64 * seg
+    };
+    Ok(Plan {
+        region_off,
+        region_len,
+        snapshot_len,
+        in_place,
+        old,
+    })
+}
+
+/// Het budget van de schoonmaker voor deze commit.
+fn clean_budget(c: &Container) -> Result<u64> {
+    let seg = u64::from(c.segment);
+    let w = c.writer.as_ref().ok_or(Error::MISUSE)?;
+    // Twee keer wat deze transactie schreef houdt de schoonmaker bij;
+    // staat er onder het einde veel vrij (na VACUUM of een grote
+    // DELETE), dan krimpt het bestand met ruim 2 MiB per commit.
+    let last = w
+        .segs
+        .iter()
+        .rposition(|g| g.usage == Use::Data)
+        .unwrap_or(0);
+    let free = w
+        .segs
+        .iter()
+        .take(last)
+        .filter(|g| g.usage == Use::Free)
+        .count() as u64;
+    let floor = if free * 4 > last as u64 + 1 {
+        32 * seg
+    } else {
+        4 * seg
+    };
+    Ok((2 * w.written).max(floor))
+}
+
+/// Het volgende segment voor de schoonmaker en de segmentmaat; `None` als er
+/// niets te doen is.
+fn pick_victim(c: &mut Container) -> Result<Option<(u32, u64)>> {
+    let seg = u64::from(c.segment);
+    let w = c.writer.as_mut().ok_or(Error::MISUSE)?;
+    let open = w.open;
+    let mut used = 0u64;
+    let mut live = 0u64;
+    let mut last_data = None;
+    for (i, g) in w.segs.iter().enumerate() {
+        if g.usage == Use::Data {
+            used += u64::from(g.end);
+            live += u64::from(g.live);
+            last_data = Some(i);
+        }
+    }
+    let Some(last) = last_data else {
+        return Ok(None);
+    };
+    let free_below = w
+        .segs
+        .iter()
+        .take(last)
+        .filter(|g| g.usage == Use::Free)
+        .count() as u64;
+    let dead = used - live;
+    let victim = if dead * 5 > used && dead > 4 * seg {
+        w.segs
+            .iter()
+            .enumerate()
+            .filter(|&(i, g)| g.usage == Use::Data && Some(i as u32) != open && g.live > 0)
+            .min_by_key(|&(_, g)| g.live)
+            .map(|(i, _)| i)
+    } else if free_below * 10 > last as u64 + 1 && free_below > 4 {
+        // Krimpen: het hoogste segment naar beneden, via een open
+        // segment onder hem.
+        if open.is_some_and(|o| o as usize >= last) {
+            w.open = None;
+        }
+        let lowest = w.segs.iter().position(|g| g.usage == Use::Free);
+        lowest.filter(|&l| l < last).map(|_| last)
+    } else {
+        None
+    };
+    let Some(victim) = victim else {
+        return Ok(None);
+    };
+    if Some(victim as u32) == w.open {
+        return Ok(None);
+    }
+    Ok(Some((victim as u32, seg)))
 }
 
 impl<S: Storage> Storage for Compressed<S> {
@@ -1970,11 +2653,6 @@ impl<S: Storage> Storage for Compressed<S> {
                 }
             }
         };
-        if let Some(ci) = container
-            && let Some(Some(c)) = self.files.get_mut(ci)
-        {
-            c.opens += 1;
-        }
         let journal_of = if container.is_none() {
             self.journal_owner(bytes)
         } else {
@@ -1987,10 +2665,8 @@ impl<S: Storage> Storage for Compressed<S> {
         }) {
             Ok(h) => Ok(h),
             Err(e) => {
-                if let Some(ci) = container
-                    && let Some(Some(c)) = self.files.get_mut(ci)
-                {
-                    c.opens -= 1;
+                if let Some(si) = container {
+                    self.release(si);
                 }
                 let _ = self.inner.close(id);
                 Err(e)
@@ -2003,26 +2679,25 @@ impl<S: Storage> Storage for Compressed<S> {
             *s = None;
         }
         let mut out = Ok(());
-        if let Some(ci) = h.container
-            && let Some(Some(c)) = self.files.get_mut(ci)
-        {
-            c.opens = c.opens.saturating_sub(1);
-            if c.opens == 0 {
-                if c.broken {
-                    c.broken = false;
-                    c.valid = false;
-                } else if c.pending {
-                    // Ook zonder sync van SQLite (synchronous=OFF, VACUUM INTO)
-                    // is het bestand na sluiten compleet.
-                    out = self.commit(ci, h.inner);
-                    if let Some(Some(c)) = self.files.get_mut(ci)
-                        && c.broken
-                    {
-                        c.broken = false;
-                        c.valid = false;
-                    }
-                }
+        if let Some(si) = h.container {
+            let last = self
+                .owner
+                .files
+                .get(si)
+                .copied()
+                .flatten()
+                .is_some_and(|s| s.opens == 1);
+            let pending = last
+                && self
+                    .with(si, |k, me| k.tx == Some(me) && k.c.pending && !k.c.broken)
+                    .unwrap_or(false);
+            if pending {
+                // Ook zonder sync van SQLite (synchronous=OFF, VACUUM INTO)
+                // is het bestand na sluiten compleet.
+                out = self.commit(si, h.inner);
             }
+            // Na een mislukte commit leest de volgende opener het bestand opnieuw.
+            self.release(si);
         }
         let closed = self.inner.close(h.inner);
         out.and(closed)
@@ -2031,7 +2706,7 @@ impl<S: Storage> Storage for Compressed<S> {
         let h = self.handle(file)?;
         match h.container {
             None => self.inner.read(h.inner, offset, dst),
-            Some(ci) => self.read_container(ci, h.inner, offset, dst),
+            Some(si) => self.read_container(si, h.inner, offset, dst),
         }
     }
     fn write(&mut self, file: FileId, offset: u64, src: &[u8]) -> Result {
@@ -2040,15 +2715,15 @@ impl<S: Storage> Storage for Compressed<S> {
             None => {
                 self.inner.write(h.inner, offset, src)?;
                 // SQLite wist de journalkop: de transactie is af.
-                if let Some(ci) = h.journal_of
+                if let Some(si) = h.journal_of
                     && offset == 0
                     && src.iter().all(|&b| b == 0)
                 {
-                    self.settle(ci)?;
+                    self.settle(si)?;
                 }
                 Ok(())
             }
-            Some(ci) => self.write_container(ci, h.inner, offset, src),
+            Some(si) => self.write_container(si, h.inner, offset, src),
         }
     }
     fn truncate(&mut self, file: FileId, size: u64) -> Result {
@@ -2056,46 +2731,50 @@ impl<S: Storage> Storage for Compressed<S> {
         match h.container {
             None => {
                 self.inner.truncate(h.inner, size)?;
-                if let Some(ci) = h.journal_of
+                if let Some(si) = h.journal_of
                     && size == 0
                 {
-                    self.settle(ci)?;
+                    self.settle(si)?;
                 }
                 Ok(())
             }
-            Some(ci) => self.truncate_container(ci, h.inner, size),
+            Some(si) => self.truncate_container(si, h.inner, size),
         }
     }
     fn sync(&mut self, file: FileId, flags: i32) -> Result {
         let h = self.handle(file)?;
         match h.container {
             None => self.inner.sync(h.inner, flags),
-            Some(ci) => self.commit(ci, h.inner),
+            Some(si) => self.commit(si, h.inner),
         }
     }
     fn size(&mut self, file: FileId) -> Result<u64> {
         let h = self.handle(file)?;
         match h.container {
             None => self.inner.size(h.inner),
-            Some(ci) => Ok(self.container(ci)?.size),
+            Some(si) => {
+                self.fresh(si, h.inner)?;
+                self.with(si, |k, me| k.check(me).map(|()| k.size(me)))?
+            }
         }
     }
     fn remove(&mut self, name: &CStr, sync_directory: bool) -> Result {
         let bytes = name.to_bytes();
-        if let Some(slot) = self
-            .files
-            .iter_mut()
-            .find(|c| c.as_ref().is_some_and(|c| c.name() == bytes))
+        if self.slot_named(bytes).is_some() {
+            return Err(BUSY);
+        }
+        // Open bij een andere eigenaar: die houdt zijn kaart van het oude
+        // bestand (zoals zijn handvat), een nieuw bestand met deze naam krijgt
+        // een eigen kern.
+        if let Ok(mut reg) = self.owner.maps.0.try_borrow_mut()
+            && let Some(i) = reg.find(bytes)
+            && let Some(Some(k)) = reg.cores.get_mut(i)
         {
-            if slot.as_ref().is_some_and(|c| c.opens > 0) {
-                return Err(Error { code: 5 });
-            }
-            *slot = None;
-            self.work.cached = None;
+            k.listed = false;
         }
         self.inner.remove(name, sync_directory)?;
-        if let Some(ci) = self.journal_owner(bytes) {
-            self.settle(ci)?;
+        if let Some(si) = self.journal_owner(bytes) {
+            self.settle(si)?;
         }
         Ok(())
     }

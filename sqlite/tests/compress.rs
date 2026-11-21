@@ -10,8 +10,8 @@
     clippy::indexing_slicing
 )]
 mod support;
-use replica_sqlite::compress::{self, Compressed, Format, Policy};
-use replica_sqlite::{Connection, Engine, Storage, Value};
+use replica_sqlite::compress::{self, Compressed, Format, Heap, Maps, Policy};
+use replica_sqlite::{Connection, Engine, OpenFlags, Storage, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{CStr, CString};
 use std::hash::{Hash, Hasher};
@@ -816,4 +816,240 @@ fn power_cut_at_every_write_and_sync_of_a_commit() {
             assert!(outcomes[0] > 0 && outcomes[1] > 0, "{}", sc.name);
         }
     });
+}
+
+/// Alle bytes van een open handvat.
+fn read_all(c: &mut Compressed<Vol>, id: replica_sqlite::FileId) -> Vec<u8> {
+    let n = c.size(id).unwrap() as usize;
+    let mut v = vec![0u8; n];
+    let mut at = 0;
+    while at < n {
+        let got = c.read(id, at as u64, &mut v[at..]).unwrap();
+        assert!(got > 0);
+        at += got;
+    }
+    v
+}
+
+/// `n` samendrukbare pagina's van `page` bytes, elk met nummer en merk.
+fn pages(n: usize, page: usize, mark: u8) -> Vec<u8> {
+    let mut v = vec![mark; n * page];
+    for (i, p) in v.chunks_mut(page).enumerate() {
+        p[..8].copy_from_slice(&(i as u64).to_le_bytes());
+    }
+    v
+}
+
+#[test]
+fn owners_on_one_maps_share_one_map_and_give_it_back() {
+    with_engine(|engine| {
+        let d = disk(51);
+        let maps = Maps::new();
+        let mut rng = Rng(8);
+        let mut sql = Compressed::shared(Vol::new(&d), Policy::compressed(), &maps);
+        let mut others: Vec<Compressed<Vol>> = (0..3)
+            .map(|_| Compressed::shared(Vol::new(&d), Policy::compressed(), &maps))
+            .collect();
+        let mut db = engine.open_with(c"main.db", &mut sql).unwrap();
+        exec(&mut db, "PRAGMA page_size=4096");
+        exec(&mut db, SCHEMA);
+        exec(&mut db, "BEGIN");
+        for id in 0..3000 {
+            let b = body(&mut rng, 1500);
+            run(
+                &mut db,
+                c"INSERT INTO docs(id, kind, body) VALUES(?1, 'a', ?2)",
+                &[Value::Integer(id), Value::Text(&b)],
+            );
+        }
+        exec(&mut db, "COMMIT");
+        // Wat één kaart kost: een eigenaar met eigen kaarten.
+        let single = {
+            let mut alone = Compressed::new(Vol::new(&d), Policy::compressed());
+            let id = alone.open(c"main.db", OpenFlags(2)).unwrap();
+            let h = alone.maps().heap();
+            alone.close(id).unwrap();
+            assert_eq!(alone.maps().heap(), Heap::default(), "closed: no map");
+            h.map
+        };
+        assert!(single > 4096, "{single}");
+        let ids: Vec<_> = others
+            .iter_mut()
+            .map(|o| o.open(c"main.db", OpenFlags(2)).unwrap())
+            .collect();
+        let h = maps.heap();
+        eprintln!("4 owners: {h:?}, one map {single}");
+        assert_eq!(h.files, 1);
+        assert!(h.map <= single + single / 8 + 512, "{h:?} vs {single}");
+        // De commits van de schrijver zien de open handvatten meteen, zonder
+        // opnieuw te openen; en SQLite op een andere eigenaar ziet dezelfde rijen.
+        for round in 0..20 {
+            exec(&mut db, "BEGIN");
+            for _ in 0..1 + rng.below(if round % 7 == 0 { 300 } else { 5 }) {
+                let n = 100 + rng.below(3000) as usize;
+                let b = body(&mut rng, n);
+                run(
+                    &mut db,
+                    c"INSERT OR REPLACE INTO docs(id, kind, body) VALUES(?1, 'a', ?2)",
+                    &[Value::Integer(rng.below(5000) as i64), Value::Text(&b)],
+                );
+            }
+            if round == 10 {
+                exec(&mut db, "DELETE FROM docs WHERE id % 3 = 0");
+            }
+            exec(&mut db, "COMMIT");
+            let want = logical(
+                &mut Compressed::new(Vol::new(&d), Policy::compressed()),
+                c"main.db",
+            );
+            for (o, &id) in others.iter_mut().zip(&ids) {
+                assert_eq!(read_all(o, id), want, "round {round}");
+            }
+            let mut other = engine.open_with(c"main.db", &mut others[0]).unwrap();
+            assert_eq!(digest(&mut other), digest(&mut db), "round {round}");
+            drop(other);
+            assert_eq!(maps.heap().files, 1);
+        }
+        integrity(&mut db);
+        drop(db);
+        assert_eq!(maps.heap().files, 1, "still open in the others");
+        for (o, id) in others.iter_mut().zip(ids) {
+            o.close(id).unwrap();
+        }
+        assert_eq!(maps.heap(), Heap::default(), "last handle closed");
+    });
+}
+
+#[test]
+fn readers_see_the_committed_state_while_one_writes() {
+    let d = disk(53);
+    let maps = Maps::new();
+    let page = 4096;
+    let pol = Policy {
+        create: true,
+        page_size: page as u32,
+    };
+    let mut w = Compressed::shared(Vol::new(&d), pol, &maps);
+    let mut r = Compressed::shared(Vol::new(&d), pol, &maps);
+    let wid = w.open(c"t.db", OpenFlags(6)).unwrap();
+    let v0 = pages(40, page, 1);
+    w.write(wid, 0, &v0).unwrap();
+    w.sync(wid, 3).unwrap();
+    let rid = r.open(c"t.db", OpenFlags(2)).unwrap();
+    assert_eq!(read_all(&mut r, rid), v0);
+    // Ongecommit: pagina's overschreven, het bestand langer, een deelwrite.
+    let mut v1 = v0.clone();
+    let p2 = pages(7, page, 2);
+    w.write(wid, 3 * page as u64, &p2).unwrap();
+    v1[3 * page..10 * page].copy_from_slice(&p2);
+    let p3 = pages(5, page, 3);
+    w.write(wid, 40 * page as u64, &p3).unwrap();
+    v1.extend_from_slice(&p3);
+    w.write(wid, 20 * page as u64 + 100, b"partial").unwrap();
+    v1[20 * page + 100..20 * page + 107].copy_from_slice(b"partial");
+    assert_eq!(read_all(&mut w, wid), v1, "the writer sees its own writes");
+    assert_eq!(read_all(&mut r, rid), v0, "a reader sees the commit");
+    // Eén schrijver tegelijk.
+    assert_eq!(r.write(rid, 0, &[9; 4096]).unwrap_err().code, 5);
+    w.sync(wid, 3).unwrap();
+    assert_eq!(read_all(&mut r, rid), v1, "after the commit, at once");
+    // Krimpen: tot de commit de oude staat.
+    let cut = 10 * page + 7;
+    w.truncate(wid, cut as u64).unwrap();
+    w.write(wid, 2 * page as u64, &pages(1, page, 4)).unwrap();
+    assert_eq!(read_all(&mut r, rid), v1);
+    w.sync(wid, 3).unwrap();
+    let mut v2 = v1[..cut].to_vec();
+    v2[2 * page..3 * page].copy_from_slice(&pages(1, page, 4));
+    assert_eq!(read_all(&mut r, rid), v2);
+    // Wie opent terwijl een ander schrijft zonder meelezers, krijgt een eigen
+    // kopie van de gecommitte staat.
+    r.close(rid).unwrap();
+    w.write(wid, 0, &pages(2, page, 5)).unwrap();
+    let mut late = Compressed::shared(Vol::new(&d), pol, &maps);
+    let lid = late.open(c"t.db", OpenFlags(2)).unwrap();
+    assert_eq!(read_all(&mut late, lid), v2);
+    assert_eq!(maps.heap().files, 2);
+    w.sync(wid, 3).unwrap();
+    late.close(lid).unwrap();
+    assert_eq!(maps.heap().files, 1);
+    // Een nieuwe opener deelt weer en ziet de laatste commit.
+    let rid = r.open(c"t.db", OpenFlags(2)).unwrap();
+    let mut v3 = v2.clone();
+    v3[..2 * page].copy_from_slice(&pages(2, page, 5));
+    assert_eq!(read_all(&mut r, rid), v3);
+    assert_eq!(maps.heap().files, 1);
+    r.close(rid).unwrap();
+    w.close(wid).unwrap();
+    assert_eq!(maps.heap(), Heap::default());
+}
+
+#[test]
+fn a_restore_leaves_a_tight_map() {
+    // Zoals replica-core's herstel: het hele bestand in één transactie in
+    // stukken van 64 KiB, dan `sync`. De kaart groeide van nul.
+    let d = disk(55);
+    let maps = Maps::new();
+    let page = 512;
+    let pol = Policy {
+        create: true,
+        page_size: page as u32,
+    };
+    let mut cs = Compressed::shared(Vol::new(&d), pol, &maps);
+    let id = cs.open(c"main.db", OpenFlags(6)).unwrap();
+    let n = 40_000;
+    let data = pages(n, page, 7);
+    for chunk in data.chunks(65536).enumerate() {
+        cs.write(id, (chunk.0 * 65536) as u64, chunk.1).unwrap();
+    }
+    cs.truncate(id, data.len() as u64).unwrap();
+    cs.sync(id, 3).unwrap();
+    let h = maps.heap();
+    eprintln!("after restore of {n} pages: {h:?}");
+    assert_eq!(h.files, 1);
+    assert_eq!(h.map, n as u64 * 8, "map fits the pages");
+    assert!(h.other < 64 << 10, "dirty list given back: {h:?}");
+    assert_eq!(read_all(&mut cs, id), data);
+    cs.close(id).unwrap();
+    assert_eq!(maps.heap(), Heap::default());
+}
+
+#[test]
+fn a_writer_gone_mid_transaction_leaves_readers_the_file() {
+    let d = disk(57);
+    let maps = Maps::new();
+    let page = 4096;
+    let pol = Policy {
+        create: true,
+        page_size: page as u32,
+    };
+    let mut r = Compressed::shared(Vol::new(&d), pol, &maps);
+    let v0 = pages(12, page, 1);
+    {
+        let mut w = Compressed::shared(Vol::new(&d), pol, &maps);
+        let wid = w.open(c"t.db", OpenFlags(6)).unwrap();
+        w.write(wid, 0, &v0).unwrap();
+        w.sync(wid, 3).unwrap();
+        let rid = r.open(c"t.db", OpenFlags(2)).unwrap();
+        w.write(wid, 0, &pages(12, page, 2)).unwrap();
+        w.truncate(wid, 3 * page as u64).unwrap();
+        assert_eq!(read_all(&mut r, rid), v0);
+        r.close(rid).unwrap();
+        let rid = r.open(c"t.db", OpenFlags(2)).unwrap();
+        assert_eq!(read_all(&mut r, rid), v0, "reopened during the write");
+        // `w` gaat weg zonder commit; zijn writes staan nog in de kaart.
+        drop(w);
+        assert_eq!(read_all(&mut r, rid), v0, "the file, read again");
+        r.write(rid, 0, &pages(1, page, 3)).unwrap();
+        r.sync(rid, 3).unwrap();
+        r.close(rid).unwrap();
+    }
+    let mut v1 = v0.clone();
+    v1[..page].copy_from_slice(&pages(1, page, 3));
+    assert_eq!(
+        logical(&mut Compressed::new(Vol::new(&d), pol), c"t.db"),
+        v1,
+        "the reader could write after the writer left"
+    );
+    assert_eq!(maps.heap(), Heap::default());
 }
