@@ -119,6 +119,32 @@ geciteerde ETags (Hetzner, Ceph) en voor een Bunny-ghost.
    ook terwijl opslag of netwerk wacht. Een derde TTL vóór het verlopen
    weigeren VFS, sync en manifestpublicatie hard; verlies sluit de eigenaar.
    Een andere node neemt pas na het verlopen over, met een hogere generatie.
+   **Schrijfdeadline en call-budget.** Een schrijver schrijft tot tweederde
+   van de TTL na zijn laatste bevestigde renew; een ander neemt pas na de hele
+   TTL over. De check staat vlak vóór elke PUT en DELETE, dus de PUT zelf moet
+   in het resterende derde passen: **het budget van één store-call (connect,
+   TLS, upload, antwoord) is kleiner dan TTL/3 min het klokverschil tussen de
+   nodes**. Bij een TTL van 15 s en 1 s klokverschil is dat minder dan 4 s per
+   call; een segment van 4 MiB moet daar ook in passen. Een call die toch
+   langer duurt (een proxy die het verzoek vasthoudt) kan landen na een
+   overname; daarvoor is het fencing hieronder.
+
+   **Fencing in de store.** Elk manifest draagt het fencing-token van zijn
+   schrijver (`lease_generation`, de generatie van de lease; Go en oudere
+   versies schrijven het niet en lezen eroverheen). De raw-sleutel bevat
+   `at`, dus een late PUT van de oude schrijver is een tweede manifest met
+   dezelfde sequence: `object::layout` houdt dan het hoogste token en laat het
+   andere als afval staan, in plaats van `Corrupt`. Vaste sleutels (snapshot,
+   vensters) gaan met `Store::put_new` (`If-None-Match: *`); bestaat de sleutel
+   al met een hoger token, dan is dat `LeaseLost`. Het onderhoud kijkt vóór
+   elke PUT en DELETE naar de deadline en leest vóór elke reeks DELETEs de
+   lease in de store (`Maintenance::run(b, store, |s| s.lease(key, ttl).read())`);
+   is die niet meer van deze schrijver, dan stopt de ronde. Zette een oude
+   schrijver current nog op zijn nieuwe generatie, dan zet het onderhoud van
+   de houder hem terug (lager token in die snapshot). Het inline onderhoud
+   (zonder `background_maintenance`) heeft geen lease-lezer en kijkt alleen
+   naar de deadline.
+
 2. Voer `prepare::run` uit **vóór** SQLite opent. De callback controleert een
    eventuele scratch-restore met echte SQLite `PRAGMA integrity_check`.
 3. Gebruik uitsluitend `prepared.tracking.wrap(&mut storage, &mut marker)`

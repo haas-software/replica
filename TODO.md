@@ -8,10 +8,18 @@ weegt niet op tegen uren downtime.
 
 1. **Hostapp: lease vernieuwen.** De hostapp roept `Replica::renew` aan, ook
    tijdens uploads (via `begin`/`finish`).
-2. **Overname begint een nieuwe generatie.** Na een overname nooit doorgaan in
-   de generatie van de vorige schrijver: een zombie die nog een PUT afmaakt,
-   schrijft dan in een generatie die niet meer `current` is. `current`
-   voorwaardelijk zetten (`If-Match`).
+2. **Overname en een late PUT.** Gedaan zonder nieuwe generatie (een
+   snapshot van gigabytes per overname is te duur): het fencing-token in elk
+   manifest, het hoogste wint bij een dubbele sequence; `put_new` voor vaste
+   sleutels; het onderhoud bevestigt de lease vóór het weggooien en zet een
+   late current van een oude schrijver terug. Wat blijft: tussen de late
+   current-PUT en de volgende onderhoudsronde wijst current naar de generatie
+   van de oude schrijver (een herstel of herstart in die minuut neemt die).
+   Dicht is pas `current` met `If-Match` op de ETag die de schrijver bij het
+   begin van zijn snapshot las; dat vraagt een versie-GET en een
+   voorwaardelijke PUT in `Store`. En `replication::resolve` ziet twee
+   manifesten op zijn onzekere sequence nog als `Corrupt` (dan een
+   reparatiesnapshot); het zou het token van de schrijver moeten kennen.
 3. **Volgen.** Een lezer past nieuwe manifesten incrementeel toe op zijn
    lokale kopie (de file change counter op pagina 1 maakt SQLite's cache
    ongeldig); een nieuwe generatie in `current` geeft een volledige restore.
