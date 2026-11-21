@@ -25,8 +25,12 @@ pub const STREAMS: usize = 16;
 pub const STREAM_BYTES: u64 = 64 << 20;
 /// De bytes van één stroom in een ronde: één deel van 4 MiB.
 pub const PART_BYTES: u64 = 4 << 20;
-/// Stromen van de hele app samen, over alle stores ([`Gate`]).
-pub const APP_STREAMS: usize = 8;
+/// Stromen van de hele app samen, over alle stores ([`Gate`]). Gemeten 21-11
+/// (replica-plan §4.2, EasyFlor op QEMU, een herstel van 304 MiB met 40
+/// pollers): 4, 8 en 16 stromen elk 41 tot 43 s; met een draad van 10 ms 272,
+/// 264 en 301 s; nergens een mislukte leasevernieuwing. Het kleinste aantal
+/// binnen 20 % van het snelste.
+pub const APP_STREAMS: usize = 4;
 /// Bytes van de rondes van de hele app samen: [`APP_STREAMS`] delen.
 pub const APP_STREAM_BYTES: u64 = APP_STREAMS as u64 * PART_BYTES;
 /// Bits van de bytes in [`Gate::used`]; de stromen staan erboven.
