@@ -48,15 +48,15 @@ use crate::{
     Error, Result,
     capture::Plan,
     local::{self, Name},
-    maintenance::{self, Budget, Report, Schedule},
+    maintenance::{self, Budget, Fence, Report, Schedule},
     marker::{LocalMarker, Marker},
-    object::Store,
+    object::{Store, StoreError},
     prepare::{self, Reason},
     replication::{self, Batch, Staged, Uploaded},
     string,
     time::Time,
     tracking::{Tracked, Tracking, sqlite_error},
-    writer::{Backend, Writer, renew_shared},
+    writer::{Backend, LeaseState, Writer, discovery, renew_shared},
 };
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -189,8 +189,10 @@ pub struct Replica {
 /// Een onderhoudsbeurt als losse taak: alleen de store (en willekeur voor
 /// poging-id's), nooit SQLite, marker of tracking. De frontier is bij
 /// [`Replica::maintenance_begin`] al duurzaam vastgelegd; commits die
-/// intussen landen, vallen erbuiten.
+/// intussen landen, vallen erbuiten. Vóór elke PUT en DELETE kijkt hij naar
+/// de gedeelde lease: na de deadline stopt hij met [`Error::LeaseLost`].
 pub struct Maintenance {
+    writer: Rc<RefCell<Writer>>,
     namespace: String,
     generation: String,
     sequence: u64,
@@ -201,8 +203,19 @@ pub struct Maintenance {
     retention: u64,
 }
 impl Maintenance {
-    /// Compactie, uitdunnen en verlopen generaties; mag lang duren.
-    pub fn run<B: Storage, S: Store>(&self, b: &mut B, store: &mut S) -> Result<Synced> {
+    /// Compactie, uitdunnen en verlopen generaties; mag lang duren. Elke PUT
+    /// en DELETE alleen binnen de deadline van de lease, gemeten op de klok
+    /// van `b` vlak ervoor; vóór elke reeks DELETEs leest `lease` de lease in
+    /// de store (S3: `|s| s.lease(key, ttl).read()`), en die moet nog van
+    /// deze schrijver zijn (eigenaar en generatie). Een onbereikbare lease
+    /// stopt de ronde als transportfout: wat blijft staan, is hoogstens afval.
+    pub fn run<B: Storage, S: Store>(
+        &self,
+        b: &mut B,
+        store: &mut S,
+        mut lease: impl FnMut(&mut S) -> discovery::Result<(LeaseState, String)>,
+    ) -> Result<Synced> {
+        let mut fence = Leased::new(&self.writer, Some(&mut lease))?;
         let schedule = Schedule::new(&self.levels)?;
         let maintenance = maintenance::run_sealed(
             b,
@@ -217,13 +230,16 @@ impl Maintenance {
                 pages: self.budget.0,
                 segment_bytes: self.budget.1,
             },
+            &mut fence,
         )?;
         let expired_objects = maintenance::generations(
+            b,
             store,
             &self.namespace,
             &self.generation,
             self.now,
             self.retention,
+            &mut fence,
         )?;
         Ok(Synced {
             published: false,
@@ -331,6 +347,49 @@ fn fence<B: Storage>(writer: &RefCell<Writer>, b: &mut B) -> Result<i64> {
         return Err(Error::LeaseLost);
     }
     Ok(deadline)
+}
+/// Een lease-lezer in de store, voor [`Leased`].
+type ReadLease<'a, S> = &'a mut dyn FnMut(&mut S) -> discovery::Result<(LeaseState, String)>;
+/// De [`Fence`] van het onderhoud: de gedeelde lease van deze eigenaar.
+struct Leased<'a, S> {
+    writer: &'a RefCell<Writer>,
+    token: u64,
+    /// Bevestigt de lease in de store vóór een reeks DELETEs; inline niet.
+    read: Option<ReadLease<'a, S>>,
+}
+impl<'a, S> Leased<'a, S> {
+    fn new(writer: &'a RefCell<Writer>, read: Option<ReadLease<'a, S>>) -> Result<Self> {
+        let token = writer.try_borrow().map_err(|_| Error::Busy)?.generation();
+        Ok(Self {
+            writer,
+            token,
+            read,
+        })
+    }
+}
+impl<B: Storage, S> Fence<B, S> for Leased<'_, S> {
+    fn token(&self) -> u64 {
+        self.token
+    }
+    fn write(&mut self, b: &mut B) -> Result {
+        fence(self.writer, b).map(|_| ())
+    }
+    fn deletes(&mut self, b: &mut B, store: &mut S) -> Result {
+        fence(self.writer, b)?;
+        let Some(read) = self.read.as_mut() else {
+            return Ok(());
+        };
+        let read = read(store);
+        let w = self.writer.try_borrow().map_err(|_| Error::Busy)?;
+        match read {
+            Ok((state, _)) if state.owner == w.owner() && state.generation == w.generation() => {
+                Ok(())
+            }
+            Err(discovery::Error::Unreachable) => Err(Error::Object(StoreError::Transport)),
+            // Een andere houder, of geen lease meer: niet van ons.
+            Ok(_) | Err(_) => Err(Error::LeaseLost),
+        }
+    }
 }
 /// SQLITE_BUSY: de gedeelde staat is geleend (zie het rustprotocol).
 const BUSY: replica_sqlite::Error = replica_sqlite::Error { code: 5 };
@@ -818,6 +877,7 @@ impl Replica {
         levels.extend_from_slice(self.config.schedule.levels());
         self.maintaining = true;
         Ok(Some(Maintenance {
+            writer: Rc::clone(&self.writer),
             namespace: string(&self.config.namespace)?,
             generation: string(&st.marker.value.generation)?,
             sequence: st.marker.value.sequence,
@@ -968,11 +1028,20 @@ impl Replica {
         // De upload kan lang duren; het manifest gaat alleen uit onder een
         // geldige lease, gemeten nu en niet bij het begin van de beurt.
         self.fence(b)?;
-        if let Err(e) =
-            pending
-                .batch
-                .finish(b, store, uploaded, &mut st.marker, &mut st.tracking, now)
-        {
+        let lease = self
+            .writer
+            .try_borrow()
+            .map_err(|_| Error::Busy)?
+            .generation();
+        if let Err(e) = pending.batch.finish(
+            b,
+            store,
+            uploaded,
+            &mut st.marker,
+            &mut st.tracking,
+            now,
+            lease,
+        ) {
             return Err(self.archive_error(st, b, e));
         }
         Batch::clear_pending(b, self.config.path)?;
@@ -1000,6 +1069,11 @@ impl Replica {
                 .is_none_or(|last| now.seconds() - last.seconds() >= 60)
         {
             self.maintenance_at = Some(now);
+            // Inline is er geen lease-lezer: alleen de deadline. Een host die
+            // de lease vóór de deletes in de store wil bevestigen, gebruikt
+            // `background_maintenance` en [`Maintenance::run`].
+            let writer = Rc::clone(&self.writer);
+            let mut fence = Leased::<S>::new(&writer, None)?;
             result.maintenance = match maintenance::run(
                 b,
                 store,
@@ -1011,16 +1085,19 @@ impl Replica {
                     pages: self.config.pages,
                     segment_bytes: self.config.segment_bytes,
                 },
+                &mut fence,
             ) {
                 Ok(report) => report,
                 Err(e) => return Err(self.archive_error(st, b, e)),
             };
             result.expired_objects = match maintenance::generations(
+                b,
                 store,
                 &self.config.namespace,
                 &st.marker.value.generation,
                 now,
                 self.config.retention,
+                &mut fence,
             ) {
                 Ok(removed) => removed,
                 Err(e) => return Err(self.archive_error(st, b, e)),

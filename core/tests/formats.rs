@@ -345,3 +345,75 @@ fn production_database_pages_are_bounded_by_owner_not_old_four_gib_limit() {
     assert!(pages.contains(page as u32));
     assert!(pages.add((1 << 24) + 1).is_err());
 }
+#[test]
+fn lease_token_is_an_extra_field_that_go_manifests_lack() {
+    // Go's fixtures hebben geen token: nul, en dezelfde bytes terug.
+    for fixture in [MAN, WIN] {
+        let m = Manifest::decode(fixture, PREFIX).unwrap();
+        assert_eq!(m.lease, 0);
+        assert_eq!(m.encode(PREFIX).unwrap(), fixture);
+    }
+    // Met token: precies Go's bytes plus één veld achteraan. Een lezer die
+    // onbekende velden negeert (Go's `encoding/json`, een oudere Rust) leest
+    // dus hetzelfde manifest.
+    let mut m = Manifest::decode(MAN, PREFIX).unwrap();
+    m.lease = 7;
+    let bytes = m.encode(PREFIX).unwrap();
+    let mut expected = MAN[..MAN.len() - 1].to_vec();
+    expected.extend_from_slice(b",\"lease_generation\":7}");
+    assert_eq!(bytes, expected);
+    let back = Manifest::decode(&bytes, PREFIX).unwrap();
+    assert_eq!(back, m);
+    let mut without = back;
+    without.lease = 0;
+    assert_eq!(without, Manifest::decode(MAN, PREFIX).unwrap());
+}
+#[test]
+fn duplicate_raw_sequence_keeps_the_highest_lease_token() {
+    let start = Manifest::decode(MAN, PREFIX).unwrap().at;
+    let token = |seq, seconds, lease| {
+        let mut m = raw(seq, start.seconds() + seconds);
+        m.lease = lease;
+        m
+    };
+    let snapshot = || Manifest::decode(MAN, PREFIX).unwrap();
+    // De nieuwe schrijver (2) publiceerde 2 en 3; de late 2 van de oude (1) valt af.
+    let l = Layout::new(
+        snapshot(),
+        vec![token(2, 5, 1), token(2, 3, 2), token(3, 4, 2)],
+        PREFIX,
+    )
+    .unwrap();
+    let plan: Vec<(u64, u64)> = l
+        .plan(None)
+        .unwrap()
+        .iter()
+        .map(|m| (m.sequence, m.lease))
+        .collect();
+    assert_eq!(plan, [(1, 0), (2, 2), (3, 2)]);
+    assert_eq!(l.commits().len(), 2);
+    // Een token wint ook van onbekend (Go of een oudere versie).
+    let l = Layout::new(snapshot(), vec![token(2, 1, 0), token(2, 2, 3)], PREFIX).unwrap();
+    assert_eq!(l.commits()[0].lease, 3);
+    // Gelijke tokens zijn geen fencing maar schade.
+    for lease in [0, 2] {
+        assert_eq!(
+            Layout::new(
+                snapshot(),
+                vec![token(2, 1, lease), token(2, 2, lease)],
+                PREFIX
+            )
+            .err(),
+            Some(Error::Corrupt)
+        );
+    }
+    assert_eq!(
+        Layout::new(
+            snapshot(),
+            vec![token(2, 1, 1), token(2, 2, 2), token(2, 3, 2)],
+            PREFIX
+        )
+        .err(),
+        Some(Error::Corrupt)
+    );
+}

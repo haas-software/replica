@@ -20,6 +20,8 @@ pub enum StoreError {
     Cancelled,
     /// Verplichte configuratie of een betrouwbare klok ontbreekt.
     Configuration,
+    /// [`Store::put_new`]: de sleutel bestaat al (S3: 412 op `If-None-Match: *`).
+    Exists,
 }
 impl From<StoreError> for Error {
     fn from(e: StoreError) -> Self {
@@ -51,6 +53,12 @@ pub type Replies = Vec<core::result::Result<Vec<u8>, StoreError>>;
 pub trait Store {
     /// Vervangt één volledig object; onderdelen krijgen per poging verse sleutels.
     fn put(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError>;
+    /// Maakt één volledig object alleen aan als de sleutel nog niet bestaat,
+    /// in één atomaire stap in de backend (S3: `If-None-Match: *`, zoals de
+    /// lease). Bestaat hij al, dan [`StoreError::Exists`] en blijft het oude
+    /// object staan. Nooit nadoen met een GET vóór de PUT: dan is het weer
+    /// eerst kijken, dan doen, en precies dat gat sluit deze aanroep.
+    fn put_new(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError>;
     /// Weiger bodies boven `limit` vóór ze in hun geheel worden gealloceerd.
     fn get(&mut self, key: &str, limit: usize) -> core::result::Result<Vec<u8>, StoreError>;
     /// Hoeveel [`Store::get_all`] tegelijk mag ophalen; standaard één.
@@ -264,14 +272,36 @@ pub(crate) fn read_manifest<S: Store>(store: &mut S, key: &str, prefix: &str) ->
 /// Publiceert het manifest nadat de aanroeper alle onderdelen heeft bevestigd.
 /// Verloren PUT-antwoorden worden alleen met exact gelijk teruggelezen bytes opgelost.
 /// De lokale marker moet vóór deze aanroep de onzekere sequence bewaren.
+///
+/// Eerst alleen aanmaken ([`Store::put_new`]). Staat de sleutel er al, dan
+/// beslist het fencing-token ([`Manifest::lease`]): een hoger token is van een
+/// nieuwere schrijver en dan is dit [`Error::LeaseLost`]; een gelijk of lager
+/// token (onze eigen eerdere poging, zoals een snapshot die opnieuw gaat
+/// omdat current nog niet stond) wordt vervangen. Zo overschrijft een oude
+/// schrijver nooit een vaste sleutel (`snapshot`, een venster) van een nieuwe.
 pub fn publish<S: Store>(store: &mut S, key: &str, manifest: &Manifest, prefix: &str) -> Result {
     let bytes = manifest.encode(prefix)?;
-    match store.put(key, &bytes) {
-        Ok(()) => Ok(()),
-        Err(original) => match store.get(key, bytes.len()) {
-            Ok(found) if found == bytes => Ok(()),
-            _ => Err(original.into()),
+    let original = match store.put_new(key, &bytes) {
+        Ok(()) => return Ok(()),
+        Err(StoreError::Exists) => match store.get(key, crate::manifest::MAX_MANIFEST_BYTES) {
+            Ok(found) if found == bytes => return Ok(()),
+            Ok(found) => {
+                let lease = Manifest::decode(&found, prefix).map_or(0, |m| m.lease);
+                if lease > manifest.lease {
+                    return Err(Error::LeaseLost);
+                }
+                match store.put(key, &bytes) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => e,
+                }
+            }
+            Err(e) => return Err(e.into()),
         },
+        Err(e) => e,
+    };
+    match store.get(key, bytes.len()) {
+        Ok(found) if found == bytes => Ok(()),
+        _ => Err(original.into()),
     }
 }
 /// Gevalideerde kopie van een sleutel, bruikbaar bij een aparte publicatiefase.

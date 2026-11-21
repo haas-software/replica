@@ -9,7 +9,7 @@ use replica_core::{
     object, replication, restore, segment,
     time::Time,
 };
-use support::{Bucket, Fs};
+use support::{Bucket, Fs, Open};
 const NS: &str = "replica/test";
 const GENERATION: &str = "20260930T123456Z-abcdef";
 fn at(n: i64) -> Time {
@@ -33,6 +33,7 @@ fn part(store: &mut Bucket, prefix: &str, seq: u64, size: u64, pages: &[(u32, &[
         start: Time::ZERO,
         end: Time::ZERO,
         parts: vec![p],
+        lease: 0,
     }
 }
 fn fixture() -> (Fs, Bucket, LocalMarker, Manifest, Manifest, String, String) {
@@ -82,8 +83,16 @@ fn window() -> Window {
 #[test]
 fn merged_segment_matches_go_and_retains_truncation_history() {
     let (mut fs, mut store, mut marker, m2, m3, _, _) = fixture();
-    let merged =
-        compact::merge(&mut fs, &mut store, NS, &mut marker, window(), &[&m2, &m3]).unwrap();
+    let merged = compact::merge(
+        &mut fs,
+        &mut store,
+        NS,
+        &mut marker,
+        window(),
+        &[&m2, &m3],
+        &mut Open(0),
+    )
+    .unwrap();
     assert_eq!(merged.min_size, 512);
     assert_eq!(merged.sequence, 3);
     assert_eq!(merged.parts.len(), 1);
@@ -110,8 +119,16 @@ fn a_compressed_input_makes_a_compressed_merge_with_the_same_pages() {
     m3.parts[0].size = packed.len() as u64;
     m3.parts[0].hash = leancrypto::sha256::Sha256::digest(&packed);
     store.data.insert(key, packed);
-    let merged =
-        compact::merge(&mut fs, &mut store, NS, &mut marker, window(), &[&m2, &m3]).unwrap();
+    let merged = compact::merge(
+        &mut fs,
+        &mut store,
+        NS,
+        &mut marker,
+        window(),
+        &[&m2, &m3],
+        &mut Open(0),
+    )
+    .unwrap();
     let out = &store.data[&merged.parts[0].key];
     assert_eq!(&out[..8], b"SPINSEG2");
     let seg = segment::Segment::decode(out).unwrap();
@@ -135,8 +152,16 @@ fn parallel_downloads_merge_to_the_same_go_segment() {
         requests: 8,
         bytes: u64::MAX,
     });
-    let merged =
-        compact::merge(&mut fs, &mut store, NS, &mut marker, window(), &[&m2, &m3]).unwrap();
+    let merged = compact::merge(
+        &mut fs,
+        &mut store,
+        NS,
+        &mut marker,
+        window(),
+        &[&m2, &m3],
+        &mut Open(0),
+    )
+    .unwrap();
     assert_eq!(
         store.data[&merged.parts[0].key],
         include_bytes!("fixtures/compact.bin")
@@ -151,13 +176,35 @@ fn gap_or_unpublished_replacement_never_removes_raw_history() {
     let (mut fs, mut store, mut marker, m2, mut m3, key2, key3) = fixture();
     m3.first = 4;
     m3.sequence = 4;
-    assert!(compact::merge(&mut fs, &mut store, NS, &mut marker, window(), &[&m2, &m3]).is_err());
+    assert!(
+        compact::merge(
+            &mut fs,
+            &mut store,
+            NS,
+            &mut marker,
+            window(),
+            &[&m2, &m3],
+            &mut Open(0)
+        )
+        .is_err()
+    );
     assert!(store.data.contains_key(&key2) && store.data.contains_key(&key3));
     m3.first = 3;
     m3.sequence = 3;
     store.fail_put_match = Some("/complete".into());
     store.fail_before_put = true;
-    assert!(compact::merge(&mut fs, &mut store, NS, &mut marker, window(), &[&m2, &m3]).is_err());
+    assert!(
+        compact::merge(
+            &mut fs,
+            &mut store,
+            NS,
+            &mut marker,
+            window(),
+            &[&m2, &m3],
+            &mut Open(0)
+        )
+        .is_err()
+    );
     assert!(store.data.contains_key(&key2) && store.data.contains_key(&key3));
     assert_eq!(marker.value.sealed_at, at(10));
 }
@@ -166,8 +213,16 @@ fn gap_or_unpublished_replacement_never_removes_raw_history() {
 fn pruning_accepts_large_old_and_replacement_manifests() {
     for (large_old, large_replacement) in [(true, false), (false, true), (true, true)] {
         let (mut fs, mut store, mut marker, mut old, m3, key, _) = fixture();
-        let mut replacement =
-            compact::merge(&mut fs, &mut store, NS, &mut marker, window(), &[&old, &m3]).unwrap();
+        let mut replacement = compact::merge(
+            &mut fs,
+            &mut store,
+            NS,
+            &mut marker,
+            window(),
+            &[&old, &m3],
+            &mut Open(0),
+        )
+        .unwrap();
         let prefix = replication::generation_prefix(NS, GENERATION).unwrap();
         for (large, manifest) in [(large_old, &mut old), (large_replacement, &mut replacement)] {
             if large {
@@ -197,7 +252,16 @@ fn pruning_accepts_large_old_and_replacement_manifests() {
             replacement_key.clone(),
             replacement.encode(&prefix).unwrap(),
         );
-        compact::prune(&mut store, &key, &old, &replacement, &[&replacement, &m3]).unwrap();
+        compact::prune(
+            &mut fs,
+            &mut store,
+            &key,
+            &old,
+            &replacement,
+            &[&replacement, &m3],
+            &mut Open(0),
+        )
+        .unwrap();
         assert!(!store.data.contains_key(&key));
         assert!(store.data.contains_key(&replacement_key));
         let layout = object::layout(&mut store, &prefix).unwrap();
@@ -225,11 +289,35 @@ fn pruning_accepts_large_old_and_replacement_manifests() {
 fn failed_delete_always_restores_through_confirmed_window() {
     for fail in 1..=4 {
         let (mut fs, mut store, mut marker, m2, m3, key2, key3) = fixture();
-        let merged =
-            compact::merge(&mut fs, &mut store, NS, &mut marker, window(), &[&m2, &m3]).unwrap();
+        let merged = compact::merge(
+            &mut fs,
+            &mut store,
+            NS,
+            &mut marker,
+            window(),
+            &[&m2, &m3],
+            &mut Open(0),
+        )
+        .unwrap();
         store.fail_delete = Some(fail);
-        let _ = compact::prune(&mut store, &key2, &m2, &merged, &[&merged, &m3]);
-        let _ = compact::prune(&mut store, &key3, &m3, &merged, &[&merged]);
+        let _ = compact::prune(
+            &mut fs,
+            &mut store,
+            &key2,
+            &m2,
+            &merged,
+            &[&merged, &m3],
+            &mut Open(0),
+        );
+        let _ = compact::prune(
+            &mut fs,
+            &mut store,
+            &key3,
+            &m3,
+            &merged,
+            &[&merged],
+            &mut Open(0),
+        );
         let prefix = replication::generation_prefix(NS, GENERATION).unwrap();
         let layout = object::layout(&mut store, &prefix).unwrap();
         let mut target = Fs::default();

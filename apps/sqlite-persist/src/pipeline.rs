@@ -155,6 +155,12 @@ impl Store for Bucket {
         self.objects.push(Entry { key, bytes });
         Ok(())
     }
+    fn put_new(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError> {
+        if self.objects.iter().any(|o| o.key == key) {
+            return Err(StoreError::Exists);
+        }
+        self.put(key, bytes)
+    }
     fn get(&mut self, key: &str, limit: usize) -> core::result::Result<Vec<u8>, StoreError> {
         let o = self
             .objects

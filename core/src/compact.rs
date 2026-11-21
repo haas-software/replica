@@ -1,6 +1,7 @@
 //! Gehele, aaneengesloten vensters samenvoegen; krimpgeschiedenis blijft behouden.
 use crate::{
     Error, Result, hash,
+    maintenance::Fence,
     manifest::{MAX_PARTS, Manifest, Part},
     marker::{self, LocalMarker},
     object::{self, Store},
@@ -27,13 +28,18 @@ pub struct Window {
 }
 /// Houdt per pagina alleen het nummer van het laatste bronsegment bij; de data
 /// wordt in een tweede pass nogmaals gehasht en met één segment tegelijk gelezen.
-pub fn merge<B: Storage, S: Store>(
+///
+/// `fence` ([`Fence::write`]) loopt vóór elke PUT (segmenten en het venster);
+/// een fout (in de eigenaar [`Error::LeaseLost`]) stopt de compactie daar.
+/// Het venster krijgt zijn token ([`Fence::token`]).
+pub fn merge<B: Storage, S: Store, F: Fence<B, S>>(
     b: &mut B,
     store: &mut S,
     namespace: &str,
     local: &mut LocalMarker,
     window: Window,
     inputs: &[&Manifest],
+    fence: &mut F,
 ) -> Result<Manifest> {
     if !local.value.complete || local.value.uncertain != 0 {
         return Err(Error::State);
@@ -52,12 +58,15 @@ pub fn merge<B: Storage, S: Store>(
         local.value.sealed_at,
         window,
         inputs,
+        fence,
     )
 }
 /// Zoals [`merge`], voor een venster dat al binnen de duurzame frontier
 /// `sealed_at` valt: raakt de marker niet, alleen de store (en `b` voor de
 /// willekeur van een poging-id). Zo kan het naast de eigenaar draaien.
-pub fn merge_sealed<B: Storage, S: Store>(
+/// `fence` zoals bij [`merge`].
+#[allow(clippy::too_many_arguments)]
+pub fn merge_sealed<B: Storage, S: Store, F: Fence<B, S>>(
     b: &mut B,
     store: &mut S,
     namespace: &str,
@@ -65,6 +74,7 @@ pub fn merge_sealed<B: Storage, S: Store>(
     sealed_at: Time,
     window: Window,
     inputs: &[&Manifest],
+    fence: &mut F,
 ) -> Result<Manifest> {
     let Window {
         level,
@@ -183,12 +193,12 @@ pub fn merge_sealed<B: Storage, S: Store>(
             output.data.resize(at + page_size as usize, 0);
             data.read(&mut output.data[at..])?;
             if output.numbers.len() >= segment_pages {
-                output.flush(store)?;
+                output.flush(b, store, fence)?;
             }
         }
     }
     if !output.numbers.is_empty() || output.parts.is_empty() {
-        output.flush(store)?;
+        output.flush(b, store, fence)?;
     }
     let last = inputs.last().ok_or(Error::State)?;
     let manifest = Manifest {
@@ -200,8 +210,10 @@ pub fn merge_sealed<B: Storage, S: Store>(
         start,
         end,
         parts: output.parts,
+        lease: fence.token(),
     };
     let key = window_key(&prefix, level, start, end)?;
+    fence.write(b)?;
     object::publish(store, &key, &manifest, &prefix)?;
     Ok(manifest)
 }
@@ -216,7 +228,12 @@ struct Output<'a> {
     compress: bool,
 }
 impl Output<'_> {
-    fn flush<S: Store>(&mut self, store: &mut S) -> Result {
+    fn flush<B: Storage, S: Store, F: Fence<B, S>>(
+        &mut self,
+        b: &mut B,
+        store: &mut S,
+        fence: &mut F,
+    ) -> Result {
         if self.parts.len() >= MAX_PARTS {
             return Err(Error::Limit);
         }
@@ -241,6 +258,7 @@ impl Output<'_> {
             core::str::from_utf8(&name).map_err(|_| Error::State)?,
         )?;
         crate::grow(&mut self.parts, 1, MAX_PARTS)?;
+        fence.write(b)?;
         store.put(&key, &bytes)?;
         self.parts.push(Part {
             key,
@@ -276,12 +294,17 @@ pub fn window_key(prefix: &str, level: u32, start: Time, end: Time) -> Result<St
 }
 /// Verwijder zichtbaarheid vóór data, uitsluitend na een bevestigd dekkend venster.
 /// `live` bevat alle overblijvende manifesten; gedeelde onderdelen blijven staan.
-pub fn prune<S: Store>(
+/// Vóór de DELETEs bevestigt `fence` de lease in de store ([`Fence::deletes`]),
+/// en vóór elke DELETE de deadline ([`Fence::write`]): een schrijver die zijn
+/// lease halverwege verliest, laat de rest staan (hoogstens wezen, nooit gaten).
+pub fn prune<B: Storage, S: Store, F: Fence<B, S>>(
+    b: &mut B,
     store: &mut S,
     key: &str,
     old: &Manifest,
     replacement: &Manifest,
     live: &[&Manifest],
+    fence: &mut F,
 ) -> Result {
     // Het object moet zelf nog terugleesbaar zijn; alleen een in-memory manifest
     // is geen bewijs dat een vorige (mogelijk mislukte) PUT echt is gepubliceerd.
@@ -318,6 +341,8 @@ pub fn prune<S: Store>(
         return Err(Error::Corrupt);
     }
     // Geen kandidaatdelen weggooien wanneer de caller de vervanger uit live vergat.
+    fence.deletes(b, store)?;
+    fence.write(b)?;
     store.delete(key)?;
     for part in &old.parts {
         if replacement.parts.iter().any(|p| p.key == part.key)
@@ -327,6 +352,7 @@ pub fn prune<S: Store>(
         {
             continue;
         }
+        fence.write(b)?;
         store.delete(&part.key)?;
     }
     Ok(())

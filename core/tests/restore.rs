@@ -36,6 +36,7 @@ fn manifest(
         start: Time::ZERO,
         end: Time::ZERO,
         parts: vec![part],
+        lease: 0,
     }
 }
 fn baseline() -> (Bucket, Layout) {

@@ -102,6 +102,9 @@ impl Store for FaultStore {
     fn put(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError> {
         self.call("put", key, |b| b.put(key, bytes))
     }
+    fn put_new(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError> {
+        self.call("put", key, |b| b.put_new(key, bytes))
+    }
     fn get(&mut self, key: &str, limit: usize) -> core::result::Result<Vec<u8>, StoreError> {
         self.call("get", key, |b| b.get(key, limit))
     }

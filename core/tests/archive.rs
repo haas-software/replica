@@ -38,6 +38,7 @@ fn fixture() -> (Bucket, Marker) {
             start: Time::ZERO,
             end: Time::ZERO,
             parts: vec![part],
+            lease: 0,
         };
         let key = if seq == 1 {
             format!("{prefix}snapshot")
@@ -157,6 +158,9 @@ fn catalog_uses_generation_prefixes_instead_of_listing_all_data_objects() {
     impl Store for Inventory {
         fn put(&mut self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
             self.0.put(key, bytes)
+        }
+        fn put_new(&mut self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
+            self.0.put_new(key, bytes)
         }
         fn get(&mut self, key: &str, limit: usize) -> Result<Vec<u8>, StoreError> {
             self.0.get(key, limit)

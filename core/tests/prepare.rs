@@ -66,6 +66,7 @@ fn remote(store: &mut Bucket, generation: &str, seq: u64, value: u8) {
         start: Time::ZERO,
         end: Time::ZERO,
         parts: vec![part],
+        lease: 0,
     };
     let key = if seq == 1 {
         format!("{prefix}snapshot")
@@ -247,7 +248,8 @@ fn snapshot_fallback_keeps_local_writes_and_can_retry_an_unknown_commit() {
                         NS,
                         &mut prepared.marker,
                         &mut prepared.tracking,
-                        at(21)
+                        at(21),
+                        0,
                     )
                     .is_err()
                 );
@@ -282,6 +284,7 @@ fn snapshot_fallback_keeps_local_writes_and_can_retry_an_unknown_commit() {
                     &mut prepared.marker,
                     &mut prepared.tracking,
                     at(22),
+                    0,
                 )
                 .unwrap();
                 assert!(prepared.marker.value.complete && prepared.marker.value.clean);

@@ -2,10 +2,23 @@
 use replica_core::{
     object::{Object, Parallel, Replies, Store, StoreError},
     time::Time,
-    writer::{MemBackend, Role, Writer, claim},
+    writer::{LeaseState, MemBackend, Role, Writer, claim},
 };
 use replica_sqlite::{Error, FileId, OpenFlags, Result, Storage};
 use std::{collections::BTreeMap, ffi::CStr};
+/// Een schrijver zonder lease-einde: elke PUT en DELETE mag, met dit token.
+pub(crate) struct Open(pub u64);
+impl<B, S> replica_core::maintenance::Fence<B, S> for Open {
+    fn token(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &mut B) -> replica_core::Result {
+        Ok(())
+    }
+    fn deletes(&mut self, _: &mut B, _: &mut S) -> replica_core::Result {
+        Ok(())
+    }
+}
 #[derive(Clone, Default)]
 pub(crate) struct Bucket {
     pub data: BTreeMap<String, Vec<u8>>,
@@ -52,6 +65,12 @@ impl Store for Bucket {
         } else {
             Ok(())
         }
+    }
+    fn put_new(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError> {
+        if self.data.contains_key(key) {
+            return Err(StoreError::Exists);
+        }
+        self.put(key, bytes)
     }
     fn get(&mut self, key: &str, limit: usize) -> core::result::Result<Vec<u8>, StoreError> {
         if let Some(e) = self.get_error {
@@ -264,6 +283,18 @@ impl Storage for Fs {
     fn unix_millis(&mut self) -> Result<i64> {
         Ok(1_790_765_296_000 + self.clock.get())
     }
+}
+/// De lease zoals de store hem van deze eigenaar teruggeeft, voor
+/// [`replica_core::owner::Maintenance::run`].
+pub(crate) fn lease_of<S>(
+    r: &replica_core::owner::Replica,
+) -> impl FnMut(&mut S) -> replica_core::writer::discovery::Result<(LeaseState, String)> + use<S> {
+    let state = LeaseState {
+        generation: r.writer().generation(),
+        expires_at: u64::MAX,
+        owner: r.writer().owner().to_string(),
+    };
+    move |_| Ok((state.clone(), "etag".to_string()))
 }
 /// Een schrijver met een lease die de hele toets geldt; eigen entropie, zodat
 /// de generatienamen van de toets niet verschuiven.

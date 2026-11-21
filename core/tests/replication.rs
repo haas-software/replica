@@ -84,6 +84,7 @@ fn unknown_large_snapshot_and_increment_commits_can_be_resolved() {
             start: Time::ZERO,
             end: Time::ZERO,
             parts,
+            lease: 0,
         };
         let key = if snapshot {
             format!("{prefix}snapshot")
@@ -142,7 +143,15 @@ fn native_sqlite_replication_pipeline_with_concurrent_changes_and_unknown_commit
     Batch::capture(&mut fs, Name::new("db").unwrap(), &tracking, &marker, 65536)
         .unwrap()
         .unwrap()
-        .publish(&mut fs, &mut store, NS, &mut marker, &mut tracking, now(1))
+        .publish(
+            &mut fs,
+            &mut store,
+            NS,
+            &mut marker,
+            &mut tracking,
+            now(1),
+            0,
+        )
         .unwrap();
     assert!(marker.value.complete && marker.value.clean);
     assert_eq!(marker.value.sequence, 1);
@@ -170,14 +179,30 @@ fn native_sqlite_replication_pipeline_with_concurrent_changes_and_unknown_commit
         c"INSERT INTO item(label) VALUES('third')",
     );
     batch
-        .publish(&mut fs, &mut store, NS, &mut marker, &mut tracking, now(2))
+        .publish(
+            &mut fs,
+            &mut store,
+            NS,
+            &mut marker,
+            &mut tracking,
+            now(2),
+            0,
+        )
         .unwrap();
     assert!(!marker.value.clean);
     assert!(!tracking.pending().unwrap().is_empty());
     Batch::capture(&mut fs, Name::new("db").unwrap(), &tracking, &marker, 65536)
         .unwrap()
         .unwrap()
-        .publish(&mut fs, &mut store, NS, &mut marker, &mut tracking, now(3))
+        .publish(
+            &mut fs,
+            &mut store,
+            NS,
+            &mut marker,
+            &mut tracking,
+            now(3),
+            0,
+        )
         .unwrap();
     assert!(marker.value.clean);
     for before in [false, true] {
@@ -203,7 +228,8 @@ fn native_sqlite_replication_pipeline_with_concurrent_changes_and_unknown_commit
                     NS,
                     &mut marker,
                     &mut tracking,
-                    now(4 + seq as i64)
+                    now(4 + seq as i64),
+                    0,
                 )
                 .is_err()
         );
@@ -229,6 +255,7 @@ fn native_sqlite_replication_pipeline_with_concurrent_changes_and_unknown_commit
                 &mut marker,
                 &mut tracking,
                 now(20 + seq as i64),
+                0,
             )
             .unwrap();
     }
@@ -327,7 +354,15 @@ fn bounded_snapshot_segments_and_counter_failure_never_partially_advance_marker(
         Batch::capture(&mut fs, Name::new("db").unwrap(), &tracking, &marker, 65536)
             .unwrap()
             .unwrap()
-            .publish(&mut fs, &mut store, NS, &mut marker, &mut tracking, now(1)),
+            .publish(
+                &mut fs,
+                &mut store,
+                NS,
+                &mut marker,
+                &mut tracking,
+                now(1),
+                0
+            ),
         Err(Error::Limit)
     ));
     assert_eq!(marker.value.sequence, 0);
@@ -345,7 +380,15 @@ fn bounded_snapshot_segments_and_counter_failure_never_partially_advance_marker(
         Batch::capture(&mut fs, Name::new("db").unwrap(), &tracking, &marker, 65536)
             .unwrap()
             .unwrap()
-            .publish(&mut fs, &mut store, NS, &mut marker, &mut tracking, now(2))
+            .publish(
+                &mut fs,
+                &mut store,
+                NS,
+                &mut marker,
+                &mut tracking,
+                now(2),
+                0
+            )
             .is_err()
     );
     marker.value.bytes = i64::MAX as u64;

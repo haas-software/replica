@@ -144,6 +144,23 @@ impl Store for Dir {
         let path = self.path(key)?;
         self.replace(&path, bytes)
     }
+    /// Een tijdelijk bestand, `fsync`, dan een harde link op de sleutel: de
+    /// link faalt als de naam al bestaat, in één stap van het bestandssysteem.
+    fn put_new(&mut self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        let path = self.path(key)?;
+        let temp = self.root.join(temp_name("new-"));
+        let written = File::create(&temp)
+            .and_then(|mut f| f.write_all(bytes).and_then(|()| sync(&f, self.durable)))
+            .and_then(|()| fs::hard_link(&temp, &path));
+        let _ = fs::remove_file(&temp);
+        match written {
+            Ok(()) => File::open(&self.root)
+                .and_then(|d| sync(&d, self.durable))
+                .map_err(|_| StoreError::Transport),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(StoreError::Exists),
+            Err(_) => Err(StoreError::Transport),
+        }
+    }
     fn get(&mut self, key: &str, limit: usize) -> Result<Vec<u8>, StoreError> {
         let path = self.path(key)?;
         let size = fs::metadata(&path).map_err(|e| io(&e))?.len();

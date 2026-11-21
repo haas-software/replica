@@ -282,6 +282,9 @@ impl Batch {
     }
     /// Manifest laatst, met de marker duurzaam vóór die onbekende PUT, en
     /// daarna de bevestiging van de tracking. Kort, en op de eigenaar.
+    /// `lease` is het fencing-token van de schrijver
+    /// (`writer::Writer::generation`), zie [`Manifest::lease`]; nul is onbekend.
+    #[allow(clippy::too_many_arguments)]
     pub fn finish<B: Storage, S: Store>(
         self,
         b: &mut B,
@@ -290,6 +293,7 @@ impl Batch {
         local: &mut LocalMarker,
         tracking: &mut Tracking,
         now: Time,
+        lease: u64,
     ) -> Result {
         self.check(local)?;
         if uploaded.batch_id != self.id {
@@ -318,6 +322,7 @@ impl Batch {
             start: Time::ZERO,
             end: Time::ZERO,
             parts,
+            lease,
         };
         let key = if self.capture.snapshot {
             object::key(&prefix, "snapshot")?
@@ -368,7 +373,8 @@ impl Batch {
     }
     /// Onderdelen eerst, manifest laatst, in één beurt op de eigenaar: stage,
     /// upload en finish. SQL mag tussen capture en deze call schrijven; die
-    /// pagina's blijven dirty.
+    /// pagina's blijven dirty. `lease` zoals bij [`Batch::finish`].
+    #[allow(clippy::too_many_arguments)]
     pub fn publish<B: Storage, S: Store>(
         self,
         b: &mut B,
@@ -377,10 +383,11 @@ impl Batch {
         local: &mut LocalMarker,
         tracking: &mut Tracking,
         now: Time,
+        lease: u64,
     ) -> Result {
         let staged = self.stage(b, namespace, local, now)?;
         let uploaded = self.upload(b, store, &staged)?;
-        self.finish(b, store, uploaded, local, tracking, now)
+        self.finish(b, store, uploaded, local, tracking, now, lease)
     }
 }
 /// De objectsleutels van één publicatiepoging, gekozen vóór de upload van de delen.

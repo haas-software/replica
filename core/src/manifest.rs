@@ -46,7 +46,15 @@ pub struct Manifest {
     pub end: Time,
     /// In deze volgorde toe te passen onderdelen.
     pub parts: Vec<Part>,
+    /// Het fencing-token van de schrijver: de generatie van zijn lease
+    /// (`writer::Writer::generation`). Nul is onbekend: Go en oudere versies
+    /// schrijven het veld niet, en een lezer zonder dit veld negeert het.
+    /// Bij twee raw-commits met dezelfde sequence wint het hoogste token
+    /// ([`Layout::new`]); de andere is afval van een schrijver die zijn lease kwijt was.
+    pub lease: u64,
 }
+/// De JSON-sleutel van [`Manifest::lease`]; alleen geschreven als hij niet nul is.
+const LEASE: &str = "lease_generation";
 pub(crate) fn json_error(e: hop_types::Error) -> Error {
     match e {
         hop_types::Error::OutOfMemory => Error::Memory,
@@ -175,6 +183,10 @@ impl Manifest {
             start: timestamp(o, "start", true)?,
             end: timestamp(o, "end", true)?,
             parts,
+            lease: match o.get(LEASE) {
+                Some(_) => uint(o, LEASE)?,
+                None => 0,
+            },
         };
         m.validate(prefix)?;
         Ok(m)
@@ -216,6 +228,10 @@ impl Manifest {
             parts.push(Value::Object(o));
         }
         o.push("parts", Value::Array(parts)).map_err(json_error)?;
+        // Achteraan en alleen als hij er is: zonder token dezelfde bytes als Go.
+        if self.lease != 0 {
+            o.push(LEASE, Value::uint(self.lease)).map_err(json_error)?;
+        }
         let text = json::to_string(&Value::Object(o)).map_err(json_error)?;
         if text.len() > MAX_MANIFEST_BYTES {
             return Err(Error::Limit);
@@ -257,7 +273,13 @@ impl Layout {
             .unwrap_or(Time::ZERO)
     }
     /// Controleert manifestrollen, dubbele raw-sequences en de snapshotbasis.
-    pub fn new(snapshot: Manifest, commits: Vec<Manifest>, prefix: &str) -> Result<Self> {
+    ///
+    /// Twee raw-commits met dezelfde sequence: het hoogste [`Manifest::lease`]
+    /// wint en de andere valt weg. Zo'n tweede commit is de late PUT van een
+    /// schrijver die zijn lease verloor terwijl de nieuwe houder verderging
+    /// (de sleutel bevat `at`, dus `put_new` houdt hem niet tegen). Gelijke
+    /// tokens (ook twee keer onbekend) zijn geen fencing maar schade: `Corrupt`.
+    pub fn new(snapshot: Manifest, mut commits: Vec<Manifest>, prefix: &str) -> Result<Self> {
         snapshot.validate(prefix)?;
         if snapshot.level != 0 || snapshot.first != 1 || snapshot.sequence != 1 {
             return Err(Error::Corrupt);
@@ -265,6 +287,24 @@ impl Layout {
         if commits.len() > MAX_COMMITS {
             return Err(Error::Limit);
         }
+        // Raw per sequence, hoogste token eerst; de rest van zo'n groep valt af.
+        commits.sort_unstable_by(|a, b| {
+            (a.level, a.sequence, b.lease).cmp(&(b.level, b.sequence, a.lease))
+        });
+        let mut top: Option<(u64, u64)> = None;
+        commits.retain(|m| {
+            if m.level != 0 {
+                return true;
+            }
+            match top {
+                // Een gelijk token blijft staan en geeft hieronder `Corrupt`.
+                Some((sequence, lease)) if sequence == m.sequence => lease == m.lease,
+                _ => {
+                    top = Some((m.sequence, m.lease));
+                    true
+                }
+            }
+        });
         let mut raw = Vec::new();
         reserve(&mut raw, commits.len())?;
         for m in &commits {

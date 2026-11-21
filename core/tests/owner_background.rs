@@ -84,7 +84,7 @@ fn maintenance_runs_beside_the_owner_and_the_archive_stays_exact() {
     );
     assert!(r.begin(&mut fs, &mut bucket, at(5020)).unwrap().is_none());
     // De taak raakt alleen de store; hier draait hij gewoon in de test.
-    let result = job.run(&mut fs, &mut bucket);
+    let result = job.run(&mut fs, &mut bucket, support::lease_of(&r));
     let synced = r.maintenance_finish(&mut fs, result).unwrap();
     assert!(synced.maintenance.merged >= 1, "{synced:?}");
     // Binnen een minuut geen nieuw onderhoud; de write van tijdens de taak gaat mee.

@@ -10,7 +10,7 @@ use replica_core::{
     object, replication, restore, segment,
     time::Time,
 };
-use support::{Bucket, Fs};
+use support::{Bucket, Fs, Open};
 const NS: &str = "replica/test";
 const GEN: &str = "20260930T120000Z-abcdef";
 fn at(n: i64) -> Time {
@@ -39,6 +39,7 @@ fn manifest(store: &mut Bucket, seq: u64, t: Time, size: u64, pages: &[(u32, &[u
         start: Time::ZERO,
         end: Time::ZERO,
         parts: vec![part],
+        lease: 0,
     };
     let key = if seq == 1 {
         format!("{prefix}snapshot")
@@ -197,6 +198,7 @@ fn multilevel_retention_and_every_failed_delete_preserve_restore() {
                 pages: 100,
                 segment_bytes: 65536,
             },
+            &mut Open(0),
         );
         if fail == 0 {
             assert_eq!(
@@ -222,6 +224,7 @@ fn multilevel_retention_and_every_failed_delete_preserve_restore() {
                 pages: 100,
                 segment_bytes: 65536,
             },
+            &mut Open(0),
         )
         .unwrap();
         assert_restore(&mut bucket);
@@ -255,14 +258,34 @@ fn generation_gc_never_deletes_dependencies_after_failed_metadata_delete() {
         let keep = old_objects(&mut bucket, GEN, true);
         let old = old_objects(&mut bucket, "20260801T000000Z-old", true);
         bucket.fail_delete = Some(fail);
-        assert!(maintenance::generations(&mut bucket, NS, GEN, at(0), 86400).is_err());
+        assert!(
+            maintenance::generations(
+                &mut Fs::default(),
+                &mut bucket,
+                NS,
+                GEN,
+                at(0),
+                86400,
+                &mut Open(0)
+            )
+            .is_err()
+        );
         assert!(keep.iter().all(|k| bucket.data.contains_key(k)));
         for key in old.iter().skip(fail - 1) {
             assert!(bucket.data.contains_key(key));
         }
         assert_eq!(bucket.deleted, old[..fail]);
         bucket.fail_delete = None;
-        maintenance::generations(&mut bucket, NS, GEN, at(0), 86400).unwrap();
+        maintenance::generations(
+            &mut Fs::default(),
+            &mut bucket,
+            NS,
+            GEN,
+            at(0),
+            86400,
+            &mut Open(0),
+        )
+        .unwrap();
         assert!(old.iter().all(|k| !bucket.data.contains_key(k)));
     }
 }
@@ -284,14 +307,31 @@ fn gc_preserves_current_unknown_recent_and_complete_within_retention() {
     keep.push(unknown);
     let abandoned = old_objects(&mut bucket, "20260928T000000Z-abandoned", false);
     assert_eq!(
-        maintenance::generations(&mut bucket, NS, GEN, at(0), 30 * 86400).unwrap(),
+        maintenance::generations(
+            &mut Fs::default(),
+            &mut bucket,
+            NS,
+            GEN,
+            at(0),
+            30 * 86400,
+            &mut Open(0)
+        )
+        .unwrap(),
         2
     );
     assert!(abandoned.iter().all(|k| !bucket.data.contains_key(k)));
     assert!(keep.iter().all(|k| bucket.data.contains_key(k)));
     let count = bucket.deleted.len();
     assert!(matches!(
-        maintenance::generations(&mut bucket, NS, "20260928T000000Z-complete", at(0), 1),
+        maintenance::generations(
+            &mut Fs::default(),
+            &mut bucket,
+            NS,
+            "20260928T000000Z-complete",
+            at(0),
+            1,
+            &mut Open(0)
+        ),
         Err(Error::Unproven)
     ));
     assert_eq!(bucket.deleted.len(), count);
@@ -322,7 +362,15 @@ fn interrupted_generation_batches_finish_metadata_before_deleting_data() {
             let mut failed = false;
             let mut done = false;
             for _ in 0..16 {
-                let result = maintenance::generations(&mut bucket, NS, GEN, at(0), 86400);
+                let result = maintenance::generations(
+                    &mut Fs::default(),
+                    &mut bucket,
+                    NS,
+                    GEN,
+                    at(0),
+                    86400,
+                    &mut Open(0),
+                );
                 assert!(keep.iter().all(|key| bucket.data.contains_key(key)));
                 if bucket
                     .data

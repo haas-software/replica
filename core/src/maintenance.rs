@@ -10,6 +10,20 @@ use crate::{
 };
 use alloc::vec::Vec;
 use replica_sqlite::Storage;
+/// De schrijver achter een lange ronde (compactie, uitdunnen, verlopen
+/// generaties): zijn fencing-token en wat hij vraagt vóór hij schrijft of
+/// weggooit. Een ronde duurt lang; een schrijver die halverwege zijn lease
+/// verliest, stopt op die plek ([`Error::LeaseLost`] in de eigenaar).
+pub trait Fence<B, S> {
+    /// Het token voor de manifesten van deze ronde ([`Manifest::lease`]).
+    fn token(&self) -> u64;
+    /// Vóór elke PUT en elke DELETE: mag deze schrijver nog, op de klok van `b`?
+    fn write(&mut self, b: &mut B) -> Result;
+    /// Vóór elke reeks DELETEs: de lease in de store bevestigen, een
+    /// round-trip en geen klok (Neon doet dat met zijn generaties). Een
+    /// gelekt object is veilig, een te vroeg verwijderd niet.
+    fn deletes(&mut self, b: &mut B, store: &mut S) -> Result;
+}
 /// Eén niveau: gehele seconden, vensters oplopend en onderling deelbaar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Level {
@@ -168,7 +182,11 @@ pub struct Budget {
 }
 /// Eén actorronde; de app plant dit hoogstens eens per minuut en bewaart het tijdstip
 /// ook na een fout, zodat een onbereikbare bucket geen hot retrylus veroorzaakt.
-pub fn run<B: Storage, S: Store>(
+///
+/// `fence` ([`Fence`]) loopt vóór elke PUT en DELETE van de ronde, en
+/// bevestigt de lease in de store vóór elke reeks DELETEs.
+#[allow(clippy::too_many_arguments)]
+pub fn run<B: Storage, S: Store, F: Fence<B, S>>(
     b: &mut B,
     store: &mut S,
     namespace: &str,
@@ -176,6 +194,7 @@ pub fn run<B: Storage, S: Store>(
     schedule: &Schedule,
     now: Time,
     budget: Budget,
+    fence: &mut F,
 ) -> Result<Report> {
     if now.seconds() < 1_577_836_800 {
         return Err(Error::State);
@@ -191,14 +210,18 @@ pub fn run<B: Storage, S: Store>(
         schedule,
         now,
         budget,
-        |b, store, window, inputs| compact::merge(b, store, namespace, local, window, inputs),
+        fence,
+        |b, store, fence, window, inputs| {
+            compact::merge(b, store, namespace, local, window, inputs, fence)
+        },
     )
 }
 /// Zoals [`run`], als taak naast de eigenaar: de frontier `sealed_at` is al
 /// duurzaam vastgelegd (en ligt op of na `now`), de marker wordt niet geraakt,
 /// en commits die intussen landen horen erbij (`sequence` is een ondergrens).
+/// `fence` zoals bij [`run`].
 #[allow(clippy::too_many_arguments)]
-pub fn run_sealed<B: Storage, S: Store>(
+pub fn run_sealed<B: Storage, S: Store, F: Fence<B, S>>(
     b: &mut B,
     store: &mut S,
     namespace: &str,
@@ -208,6 +231,7 @@ pub fn run_sealed<B: Storage, S: Store>(
     schedule: &Schedule,
     now: Time,
     budget: Budget,
+    fence: &mut F,
 ) -> Result<Report> {
     // Elk verstreken venster eindigt op een hele seconde, uiterlijk `now`.
     if now.seconds() < 1_577_836_800 || sealed_at.seconds() < now.seconds() {
@@ -222,13 +246,16 @@ pub fn run_sealed<B: Storage, S: Store>(
         schedule,
         now,
         budget,
-        |b, store, window, inputs| {
-            compact::merge_sealed(b, store, namespace, generation, sealed_at, window, inputs)
+        fence,
+        |b, store, fence, window, inputs| {
+            compact::merge_sealed(
+                b, store, namespace, generation, sealed_at, window, inputs, fence,
+            )
         },
     )
 }
 #[allow(clippy::too_many_arguments)]
-fn run_with<B: Storage, S: Store>(
+fn run_with<B: Storage, S: Store, F: Fence<B, S>>(
     b: &mut B,
     store: &mut S,
     namespace: &str,
@@ -237,7 +264,8 @@ fn run_with<B: Storage, S: Store>(
     schedule: &Schedule,
     now: Time,
     budget: Budget,
-    mut merge: impl FnMut(&mut B, &mut S, Window, &[&Manifest]) -> Result<Manifest>,
+    fence: &mut F,
+    mut merge: impl FnMut(&mut B, &mut S, &mut F, Window, &[&Manifest]) -> Result<Manifest>,
 ) -> Result<Report> {
     let prefix = replication::generation_prefix(namespace, generation)?;
     let mut layout = object::layout(store, &prefix)?;
@@ -267,6 +295,7 @@ fn run_with<B: Storage, S: Store>(
             let manifest = merge(
                 b,
                 store,
+                fence,
                 Window {
                     level,
                     start,
@@ -315,19 +344,28 @@ fn run_with<B: Storage, S: Store>(
         // Alleen overblijvende referenties beschermen delen; het te verwijderen
         // manifest zelf mag zijn eigen cleanup niet verhinderen.
         live.retain(|m| !core::ptr::eq(*m, old));
-        compact::prune(store, &key, old, replacement, &live)?;
+        compact::prune(b, store, &key, old, replacement, &live, fence)?;
         report.pruned += 1;
     }
     Ok(report)
 }
 /// Verwijdert verlopen generaties in volgorde snapshot -> manifesten -> data.
 /// Iedere fout stopt vóór verdere dependencies verdwijnen. Current wordt nooit gepruned.
-pub fn generations<S: Store>(
+/// `fence` zoals bij [`run`]: de lease in de store vóór elke reeks DELETEs.
+///
+/// Wijst current niet naar `keep`, dan is dat alleen goed te maken als de
+/// snapshot van die andere generatie een lager token heeft dan deze
+/// schrijver: dan zette een oude schrijver hem nog, na de overname (zijn
+/// generatievernieuwing was onderweg). Deze ronde zet current dan terug.
+/// Anders [`Error::Unproven`], zoals altijd.
+pub fn generations<B: Storage, S: Store, F: Fence<B, S>>(
+    b: &mut B,
     store: &mut S,
     namespace: &str,
     keep: &str,
     now: Time,
     retention_seconds: u64,
+    fence: &mut F,
 ) -> Result<usize> {
     if now.seconds() < 1_577_836_800
         || retention_seconds == 0
@@ -336,13 +374,24 @@ pub fn generations<S: Store>(
         return Err(Error::State);
     }
     marker::generation_time(keep)?;
-    let current = object::committed(store, &object::key(namespace, "/current")?, 255)?;
-    if core::str::from_utf8(&current)
+    let pointer = object::key(namespace, "/current")?;
+    let current = object::committed(store, &pointer, 255)?;
+    let current = core::str::from_utf8(&current)
         .map_err(|_| Error::Corrupt)?
-        .trim()
-        != keep
-    {
-        return Err(Error::Unproven);
+        .trim();
+    if current != keep {
+        // Onleesbaar of zonder token: geen bewijs, dus niets aanraken.
+        let lease = replication::generation_prefix(namespace, current)
+            .and_then(|prefix| {
+                object::read_manifest(store, &object::key(&prefix, "snapshot")?, &prefix)
+            })
+            .map_or(0, |m| m.lease);
+        if lease == 0 || lease >= fence.token() {
+            return Err(Error::Unproven);
+        }
+        fence.deletes(b, store)?;
+        fence.write(b)?;
+        store.put(&pointer, keep.as_bytes())?;
     }
     let prefix = object::key(namespace, "/generations/")?;
     // Data segments can number in the millions; only generation prefixes belong
@@ -385,6 +434,8 @@ pub fn generations<S: Store>(
         // Remove the restoration entry point first, then manifests, then data.
         // Failed metadata deletion must never remove its dependencies.
         if complete {
+            fence.deletes(b, store)?;
+            fence.write(b)?;
             store.delete(&snapshot)?;
             removed += 1;
         }
@@ -401,10 +452,12 @@ pub fn generations<S: Store>(
                 if batch.len() > DELETE_BUDGET - removed {
                     return Err(Error::Limit);
                 }
+                fence.deletes(b, store)?;
                 for entry in batch {
                     if entry.key.len() > 1024 || !entry.key.starts_with(&batch_prefix) {
                         return Err(Error::Corrupt);
                     }
+                    fence.write(b)?;
                     store.delete(&entry.key)?;
                     removed += 1;
                 }

@@ -344,6 +344,30 @@ impl<T: Transport, W: Suspend> Store for S3<T, W> {
             }
         }
     }
+    /// `If-None-Match: *`, zoals de aanmaak van de lease: 412 (of 409) is
+    /// [`StoreError::Exists`], het bestaande object blijft staan.
+    fn put_new(&mut self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.ready()?;
+        if bytes.len() > replica_core::segment::MAX_BYTES {
+            return Err(StoreError::Limit);
+        }
+        let options = leans3::PutOptions {
+            if_none_match: "*",
+            ..leans3::PutOptions::default()
+        };
+        match self
+            .wait
+            .wait(self.client.put(&mut self.transport, key, bytes, &options))
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(leans3::Error::PreconditionFailed)) => Err(StoreError::Exists),
+            Ok(Err(e)) => Err(map(e)),
+            Err(_) => {
+                self.poisoned = true;
+                Err(StoreError::Cancelled)
+            }
+        }
+    }
     fn parallel(&self) -> Parallel {
         Parallel {
             requests: self.streams,

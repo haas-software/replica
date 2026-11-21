@@ -242,7 +242,7 @@ fn sync_runs_between_statements_while_the_vfs_stays_open() {
             // Het onderhoud als losse taak, met SQL ertussen.
             if let Some(job) = r.maintenance_begin(&mut sync_side, at(t + 3)).unwrap() {
                 round(&mut db, n * 100_000);
-                let result = job.run(&mut sync_side, &mut bucket);
+                let result = job.run(&mut sync_side, &mut bucket, support::lease_of(&r));
                 r.maintenance_finish(&mut sync_side, result).unwrap();
             }
         }
