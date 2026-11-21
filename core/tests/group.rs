@@ -23,7 +23,7 @@ use replica_core::{
     follow::{self, Follow, Outcome},
     group::{self, Bucket, Config, Group, Report, Standing, Ticking},
     host::{Dir, DirLease},
-    lanes::{Job, Lane, LaneSide, Offload},
+    lanes::{Job, Lane, LaneSide, LaneStore, Offload},
     local::Name,
     object::{Object, Parallel, Replies, Store, StoreError},
     writer::{self, Backend, Held, LeaseState, Role, Writer, discovery},
@@ -146,6 +146,10 @@ impl Store for Faulty {
     fn put(&mut self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
         self.call()?;
         self.dir.put(key, bytes)
+    }
+    fn put_new(&mut self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.call()?;
+        self.dir.put_new(key, bytes)
     }
     fn get(&mut self, key: &str, limit: usize) -> Result<Vec<u8>, StoreError> {
         self.call()?;
@@ -367,7 +371,7 @@ impl LaneSide for Side {
     fn files(
         &mut self,
         domain: &str,
-        f: &mut dyn FnMut(&mut dyn Storage, &mut dyn Store),
+        f: &mut dyn FnMut(&mut dyn Storage, &mut dyn LaneStore),
     ) -> replica_core::Result {
         let mut dir = Local::volatile(self.local.join(domain))?;
         f(&mut dir, &mut self.bucket);
@@ -522,6 +526,16 @@ fn a_capture_on_its_way_confirms_no_later_write_and_the_owner_never_waits_for_s3
     assert_eq!(group.standing(), Standing::Valid);
     assert_eq!(group.writer().borrow().generation(), generation);
     exec(&mut db, "INSERT INTO t VALUES (3)");
+    // Een onderhoudsbeurt op de databaan bevestigt de lease in de store vóór
+    // hij weggooit (`Maintenance::run` met de lease-lezer van de baan).
+    for _ in 0..6 {
+        advance(15_000);
+        group.keep_lease();
+        group.rest().unwrap();
+        lanes.run_all();
+    }
+    group.rest().unwrap();
+    assert!(!lines.has("failed"), "{:?}", lines.since(0));
     drop(db);
     drop(vfs);
     group.flush().unwrap();

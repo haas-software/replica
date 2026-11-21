@@ -27,8 +27,9 @@
 //! [`crate::owner`]). Alleen [`crate::group::Group`] maakt jobs; een host
 //! geeft hem zijn haak met `Group::with_offload`.
 use crate::Result;
+use crate::group::Bucket;
 use crate::object::{Object, Parallel, Replies, Store, StoreError};
-use crate::writer::Backend;
+use crate::writer::{Backend, LeaseState, discovery};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::ffi::CStr;
 use replica_sqlite::{FileId, OpenFlags, Storage};
@@ -75,13 +76,26 @@ pub trait Offload {
     /// `true`: de banen zijn leeg.
     fn settle(&self, ms: u64) -> bool;
 }
+/// De store van een baan: een [`Store`] die ook de lease kan lezen (het
+/// onderhoud bevestigt de lease vóór het weggooit). Elke [`Bucket`] is er een.
+pub trait LaneStore: Store {
+    /// Leest de lease op `key` in deze store.
+    fn read_lease(&mut self, key: &str, ttl_ms: u64) -> discovery::Result<(LeaseState, String)>;
+}
+impl<S: Bucket> LaneStore for S {
+    fn read_lease(&mut self, key: &str, ttl_ms: u64) -> discovery::Result<(LeaseState, String)> {
+        self.lease(key, ttl_ms)
+            .map_err(|_| discovery::Error::Unreachable)?
+            .read()
+    }
+}
 /// Wat een [`Job`] op zijn baan krijgt: de lokale opslag en de store van die stack.
 pub trait LaneSide {
     /// Roept `f` aan met een opslag op de lokale map van `domain` en de store.
     fn files(
         &mut self,
         domain: &str,
-        f: &mut dyn FnMut(&mut dyn Storage, &mut dyn Store),
+        f: &mut dyn FnMut(&mut dyn Storage, &mut dyn LaneStore),
     ) -> Result;
     /// Roept `f` aan met de schrijverlease op `key` in de store.
     fn lease(
@@ -131,11 +145,14 @@ impl Storage for DynStorage<'_> {
         self.0.unix_millis()
     }
 }
-/// Een `dyn Store` als een sized, voor de generieke stappen van deze crate.
-pub(crate) struct DynStore<'a>(pub(crate) &'a mut dyn Store);
+/// Een `dyn LaneStore` als een sized, voor de generieke stappen van deze crate.
+pub(crate) struct DynStore<'a>(pub(crate) &'a mut dyn LaneStore);
 impl Store for DynStore<'_> {
     fn put(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError> {
         self.0.put(key, bytes)
+    }
+    fn put_new(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError> {
+        self.0.put_new(key, bytes)
     }
     fn get(&mut self, key: &str, limit: usize) -> core::result::Result<Vec<u8>, StoreError> {
         self.0.get(key, limit)

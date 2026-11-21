@@ -12,8 +12,8 @@ use core::{
     time::Duration,
 };
 use replica_core::{
-    lanes::{Lane, LaneSide, Offload},
-    object::{Store, StoreError},
+    lanes::{Lane, LaneSide, LaneStore, Offload},
+    object::StoreError,
     writer::Backend,
 };
 use replica_hopos::lanes::{Lanes, OwnerLanes};
@@ -30,7 +30,7 @@ impl LaneSide for Side<'_> {
     fn files(
         &mut self,
         domain: &str,
-        _f: &mut dyn FnMut(&mut dyn Storage, &mut dyn Store),
+        _f: &mut dyn FnMut(&mut dyn Storage, &mut dyn LaneStore),
     ) -> replica_core::Result {
         if domain == "hang" {
             let release = self.release;

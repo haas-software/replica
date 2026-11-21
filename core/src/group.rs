@@ -289,6 +289,10 @@ impl<S: Bucket> Store for Renewing<'_, S> {
         self.renew();
         self.store.borrow_mut().put(key, bytes)
     }
+    fn put_new(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError> {
+        self.renew();
+        self.store.borrow_mut().put_new(key, bytes)
+    }
     fn get(&mut self, key: &str, limit: usize) -> core::result::Result<Vec<u8>, StoreError> {
         self.renew();
         self.store.borrow_mut().get(key, limit)
@@ -749,12 +753,18 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
         let slot: Slot<Landed> = Rc::new(RefCell::new(None));
         let back = slot.clone();
         let domain = self.config.domain.clone();
+        let (key, ttl) = (self.config.lease_key(), self.config.ttl_ms);
         off.push(
             Lane::Data,
             Job::of(move |side: &mut dyn LaneSide| {
                 let mut out = Err(Error::State);
                 let opened = side.files(&domain, &mut |b, s| {
-                    out = round.run(&mut DynStorage(b), &mut DynStore(s));
+                    // Vóór het weggooien bevestigt het onderhoud de lease in de store.
+                    out = round.run(
+                        &mut DynStorage(b),
+                        &mut DynStore(s),
+                        |s: &mut DynStore<'_>| s.0.read_lease(&key, ttl),
+                    );
                 });
                 if opened.is_err() {
                     out = Err(Error::Storage(replica_sqlite::Error::CANNOT_OPEN));

@@ -22,7 +22,7 @@ elke database publiceert op zijn eigen moment.
 | `group::Group` | Prepare per database (lui), lease bijhouden, publiceren in rust, backoff, fencing, sluiten |
 | `group::release` | Lease terug bij het sluiten: na een transportfout nog twee keer, bij naam |
 | `writer::renew_or_reclaim` | Vernieuwen; voorbij de schrijfdeadline heroveren zolang niemand de lease nam |
-| `lanes` | `Offload` (de haak van de host: "draai dit op baan X"), `LaneSide`; een `Job` is ondoorzichtig, de host draait hem met `Job::run` |
+| `lanes` | `Offload` (de haak van de host: "draai dit op baan X"), `LaneSide`/`LaneStore` (de store van een baan kan de lease lezen: het onderhoud bevestigt hem vóór het weggooit); een `Job` is ondoorzichtig, de host draait hem met `Job::run` |
 | `publications::Publications` | Gedeelde kijk op de capturenummers van de eigenaars |
 | `follow::Follow` | Een lezer zonder lease die de publicaties van de schrijver volgt |
 | `replica_hopos::lanes` | De banen op HopOS: `Lanes::run` per stack, `OwnerLanes` als `Offload` |
