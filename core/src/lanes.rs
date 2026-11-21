@@ -163,6 +163,9 @@ impl Store for DynStore<'_> {
     fn get_all(&mut self, keys: &[(&str, usize)]) -> core::result::Result<Replies, StoreError> {
         self.0.get_all(keys)
     }
+    fn rest(&mut self) {
+        self.0.rest();
+    }
     fn delete(&mut self, key: &str) -> core::result::Result<(), StoreError> {
         self.0.delete(key)
     }

@@ -652,7 +652,16 @@ fn every_plain_call_ends_the_round() {
     let (w, mut s) = counted(gate, &count);
     let keys = [("g/a", 10), ("g/b", 10)];
     let list = b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>".to_vec();
-    for call in ["get", "list", "list_batch", "directories", "delete"] {
+    for call in [
+        "get",
+        "list",
+        "list_batch",
+        "directories",
+        "delete",
+        "put",
+        "put_new",
+        "rest",
+    ] {
         segments(&w, 2);
         s.get_all(&keys).unwrap();
         assert_eq!(count.open.get(), 2, "{call}");
@@ -673,6 +682,15 @@ fn every_plain_call_ends_the_round() {
                 reply(&w, 200, list.clone(), None);
                 s.directories("g/", 10).unwrap();
             }
+            "put" | "put_new" => {
+                reply(&w, 200, Vec::new(), Some(0));
+                if call == "put" {
+                    s.put("g/c", b"c").unwrap();
+                } else {
+                    s.put_new("g/c", b"c").unwrap();
+                }
+            }
+            "rest" => Store::rest(&mut s),
             _ => {
                 reply(&w, 204, Vec::new(), Some(0));
                 s.delete("g/a").unwrap();

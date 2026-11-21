@@ -80,6 +80,11 @@ pub trait Store {
         }
         Ok(out)
     }
+    /// Het einde van een reeks [`Store::get_all`]-rondes: een store die er
+    /// extra verbindingen voor opende, laat ze nu vallen in plaats van te
+    /// wachten op zijn volgende call. [`crate::restore::stage`] roept dit aan
+    /// zodra een herstel klaar is (ook als het faalt). Standaard niets.
+    fn rest(&mut self) {}
     /// Duurzaam verwijderen; afwezig mag succes zijn.
     fn delete(&mut self, key: &str) -> core::result::Result<(), StoreError>;
     /// Alle pagina's onder deze prefix, maximaal `limit` objecten; nooit stil afkappen.

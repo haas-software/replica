@@ -36,6 +36,8 @@ pub(crate) struct Bucket {
     pub parallel: Option<Parallel>,
     /// Iedere ronde van `get_all`: de sleutels en hun grenzen.
     pub rounds: Vec<Vec<(String, usize)>>,
+    /// Hoe vaak [`Store::rest`] kwam.
+    pub rests: usize,
 }
 impl Store for Bucket {
     fn parallel(&self) -> Parallel {
@@ -49,6 +51,9 @@ impl Store for Bucket {
         self.rounds
             .push(keys.iter().map(|&(k, l)| (k.to_string(), l)).collect());
         Ok(keys.iter().map(|&(k, l)| self.get(k, l)).collect())
+    }
+    fn rest(&mut self) {
+        self.rests += 1;
     }
     fn put(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError> {
         let fail = self.put_reply_lost

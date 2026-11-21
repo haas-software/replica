@@ -83,6 +83,17 @@ fn invalid_late_part_and_coverage_leave_destination_untouched() {
     ));
 }
 #[test]
+fn a_restore_ends_with_rest_also_when_it_fails() {
+    let dest = Name::new("db").unwrap();
+    let mut fs = Fs::default();
+    let (mut bucket, layout) = baseline();
+    restore::stage(&mut fs, &mut bucket, &layout, None, dest, 100).unwrap();
+    assert_eq!(bucket.rests, 1);
+    bucket.get_error = Some(StoreError::Transport);
+    assert!(restore::stage(&mut fs, &mut bucket, &layout, None, dest, 100).is_err());
+    assert_eq!(bucket.rests, 2);
+}
+#[test]
 fn compacted_shrink_then_growth_does_not_resurrect_old_page() {
     let mut bucket = Bucket::default();
     let snapshot = manifest(

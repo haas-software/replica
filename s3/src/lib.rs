@@ -192,7 +192,8 @@ impl<T: Transport, W: Suspend> S3<T, W> {
     /// Het einde van de rondes: de extra verbindingen vallen (dicht) en wat
     /// de store van de [`Gate`] had, gaat terug. Elke call die geen
     /// `get_all` is (PUT, GET, LIST, DELETE) doet dit zelf, de lease niet;
-    /// een host roept het aan na een herstel waar niets op volgt.
+    /// core's `restore::stage` roept het aan via `Store::rest` zodra een
+    /// herstel klaar is, zodat niemand op de volgende call wacht.
     pub fn rest(&mut self) {
         self.extra.clear();
         self.permit.give_all();
@@ -656,6 +657,10 @@ impl<T: Transport, W: Suspend> Store for S3<T, W> {
             }
         }
         Ok(out)
+    }
+    /// Zie [`S3::rest`].
+    fn rest(&mut self) {
+        S3::rest(self);
     }
     fn get(&mut self, key: &str, limit: usize) -> Result<Vec<u8>, StoreError> {
         self.rest();

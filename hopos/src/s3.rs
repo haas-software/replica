@@ -176,13 +176,11 @@ pub fn lease_store<W: Suspend>(endpoint: &Endpoint<'_>, wait: W) -> Result<Store
     if applib::app().is_none() {
         return Err(StoreError::Configuration);
     }
-    Ok(
-        replica_s3::S3::new(
-            client(endpoint)?,
-            || transport_with(Dial::Forced),
-            wait,
-            &GATE,
-        )?
-            .streams(1, 0),
-    )
+    Ok(replica_s3::S3::new(
+        client(endpoint)?,
+        || transport_with(Dial::Forced),
+        wait,
+        &GATE,
+    )?
+    .streams(1, 0))
 }

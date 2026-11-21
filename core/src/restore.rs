@@ -33,8 +33,23 @@ pub struct Staged {
 /// De verificatiecallback heeft de complete scratchdatabase goedgekeurd.
 pub struct Verified(Staged);
 /// Kopieert een consistent herstelplan met een expliciet maximumpaginabudget.
-/// De aanroeper is de exclusieve eigenaar; SQLite moet gesloten zijn.
+/// De aanroeper is de exclusieve eigenaar; SQLite moet gesloten zijn. Aan het
+/// einde, ook bij een fout, krijgt de store [`Store::rest`]: de extra
+/// verbindingen van de rondes vallen dan meteen.
 pub fn stage<B: Storage, S: Store>(
+    b: &mut B,
+    store: &mut S,
+    layout: &Layout,
+    at: Option<Time>,
+    destination: Name,
+    page_limit: u32,
+) -> Result<Staged> {
+    let staged = fill(b, store, layout, at, destination, page_limit);
+    store.rest();
+    staged
+}
+/// [`stage`] zonder het [`Store::rest`] aan het einde.
+fn fill<B: Storage, S: Store>(
     b: &mut B,
     store: &mut S,
     layout: &Layout,

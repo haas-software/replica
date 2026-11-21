@@ -329,6 +329,9 @@ impl<S: Bucket> Store for Renewing<'_, S> {
         self.renew();
         self.store.borrow_mut().get_all(keys)
     }
+    fn rest(&mut self) {
+        self.store.borrow_mut().rest();
+    }
     fn delete(&mut self, key: &str) -> core::result::Result<(), StoreError> {
         self.renew();
         self.store.borrow_mut().delete(key)
