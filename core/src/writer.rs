@@ -259,13 +259,20 @@ impl Writer {
 /// kort en geen enkele loopt over de I/O van `lease` heen. Voor een host die
 /// de lease naast de eigenaar vernieuwt (tussen de PUT's van een upload, of
 /// op een eigen taak); [`Error::Busy`] als iemand de Writer op dat moment leent.
-pub fn renew_shared<L: Backend>(writer: &RefCell<Writer>, lease: &mut L, now: Time) -> Result {
+pub fn renew_shared<L: Backend + ?Sized>(
+    writer: &RefCell<Writer>,
+    lease: &mut L,
+    now: Time,
+) -> Result {
     let borrow = || writer.try_borrow_mut().map_err(|_| Error::Busy);
     let Some(renewal) = borrow()?.renew_request(now)? else {
         return Ok(());
     };
     let written = lease.write(&renewal.prev, &renewal.state);
-    match borrow()?.renew_commit(&renewal, written)? {
+    // Eerst binden: in de `match` zelf leefde de lening van `renew_commit`
+    // door tot het eind, en was de herovering hieronder altijd `Busy`.
+    let renewed = borrow()?.renew_commit(&renewal, written)?;
+    match renewed {
         Renewed::Done => Ok(()),
         Renewed::Reclaim => {
             let read = lease.read();
@@ -278,6 +285,117 @@ pub fn renew_shared<L: Backend>(writer: &RefCell<Writer>, lease: &mut L, now: Ti
                 None => Ok(()),
             }
         }
+    }
+}
+/// Als [`renew_shared`], maar een schrijver voorbij zijn schrijfdeadline is
+/// niet meteen verloren: zolang niemand de lease overnam, leest dit de lease
+/// en schrijft hem opnieuw, voorwaardelijk op de gelezen handle, alleen als
+/// hij nog deze eigenaar en generatie noemt. De schrijver gaat dan door met
+/// hetzelfde fencing-token.
+///
+/// [`Writer::renew_request`] markeert de schrijver blijvend verloren zodra
+/// zijn deadline (twee derde lease na de laatste vernieuwing) voorbij is,
+/// zonder de store te vragen. Een store die 20 s niet antwoordde, kostte zo
+/// de eigenaar (EasyFlor op de M4, 19-11-2026: `LeaseLost` direct na twee
+/// transportfouten, dan fencing en minutenlang heropenen). Een andere
+/// eigenaar of generatie in de lease, of een voorwaardelijke schrijf die
+/// verliest, is wel blijvend [`Error::LeaseLost`]; tot de lease verloopt kan
+/// geen ander hem nemen, en daarna ziet deze herovering dat.
+///
+/// `Busy` als iemand de Writer leent; de Writer wordt alleen tussen de
+/// store-calls geleend, nooit eroverheen, zodat een VFS zijn deadline altijd
+/// kan lezen. Mag zonder rust lopen, op elke stack.
+pub fn renew_or_reclaim<L: Backend + ?Sized>(
+    writer: &RefCell<Writer>,
+    lease: &mut L,
+    now: Time,
+) -> Result {
+    let valid = {
+        let w = writer.try_borrow().map_err(|_| Error::Busy)?;
+        if w.is_lost() {
+            return Err(Error::LeaseLost);
+        }
+        w.check(now).is_ok()
+    };
+    let mut at = millis(now)?;
+    if valid {
+        let renewal = writer
+            .try_borrow_mut()
+            .map_err(|_| Error::Busy)?
+            .renew_request(now)?;
+        let Some(renewal) = renewal else {
+            return Ok(());
+        };
+        let written = lease.write(&renewal.prev, &renewal.state);
+        let renewed = writer
+            .try_borrow_mut()
+            .map_err(|_| Error::Busy)?
+            .renew_commit(&renewal, written)?;
+        if renewed == Renewed::Done {
+            return Ok(());
+        }
+        at = renewal.at;
+    }
+    let read = lease.read();
+    let again = writer
+        .try_borrow_mut()
+        .map_err(|_| Error::Busy)?
+        .reclaim_request(read, at)?;
+    let Some(again) = again else {
+        return Ok(());
+    };
+    let written = lease.write(&again.prev, &again.state);
+    writer
+        .try_borrow_mut()
+        .map_err(|_| Error::Busy)?
+        .reclaim_commit(&again, written)
+}
+/// De lease zoals een sluitende host hem aantreft ([`Held::take`]).
+pub enum Held {
+    /// Alleen van ons: [`Writer::release`] geeft hem vrij.
+    Writer(Writer),
+    /// Nog gedeeld met een vernieuwing onderweg (een job op een andere
+    /// stack): vrijgegeven op eigenaar en generatie ([`release_named`]).
+    Named {
+        /// De eigenaar in de lease.
+        owner: String,
+        /// Het fencing-token.
+        generation: u64,
+    },
+}
+impl Held {
+    /// De gedeelde lease bij het sluiten: van ons alleen, of nog gedeeld en
+    /// dan bij naam. `None` als iemand hem op dit moment leent; dan verloopt
+    /// hij vanzelf.
+    pub fn take(writer: alloc::rc::Rc<RefCell<Writer>>) -> Option<Held> {
+        match alloc::rc::Rc::try_unwrap(writer) {
+            Ok(writer) => Some(Held::Writer(writer.into_inner())),
+            Err(writer) => {
+                let w = writer.try_borrow().ok()?;
+                Some(Held::Named {
+                    owner: string(w.owner()).ok()?,
+                    generation: w.generation(),
+                })
+            }
+        }
+    }
+}
+/// Geeft de lease van `owner` met `generation` vrij zonder de [`Writer`]:
+/// leest de lease en verwijdert hem op die handle, alleen als hij nog deze
+/// eigenaar en generatie noemt. Weg, of al van een ander: niets van ons over.
+pub fn release_named<L: Backend + ?Sized>(lease: &mut L, owner: &str, generation: u64) -> Result {
+    let transport = Error::Object(StoreError::Transport);
+    match lease.read() {
+        Ok((state, handle)) if state.owner == owner && state.generation == generation => {
+            match lease.delete(&handle) {
+                Ok(()) | Err(hop_discovery::Error::NoLease | hop_discovery::Error::LeaseHeld) => {
+                    Ok(())
+                }
+                Err(hop_discovery::Error::Unreachable) => Err(transport),
+            }
+        }
+        Ok(_) | Err(hop_discovery::Error::NoLease) => Ok(()),
+        Err(_) => Err(transport),
     }
 }
 /// Eén voorwaardelijke schrijf van de lease, buiten de Writer om uit te voeren.

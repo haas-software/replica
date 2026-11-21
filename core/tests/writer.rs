@@ -9,6 +9,7 @@ use replica_core::{
     writer::{
         Backend, LeaseState, MemBackend, ReadOnly, Renewed, Role, Writer, claim,
         discovery::{self, Error as LeaseError},
+        renew_or_reclaim, renew_shared,
     },
 };
 use replica_sqlite::Engine;
@@ -173,6 +174,49 @@ fn renewal_in_steps_keeps_the_store_io_outside_the_writer() {
         Err(Error::LeaseLost)
     );
     assert_eq!(w.check(at(16_001)), Err(Error::LeaseLost));
+}
+#[test]
+fn shared_renewal_reclaims_after_a_lost_reply_and_after_the_deadline() {
+    let mut fs = Fs::default();
+    let mut lease = Faulty::default();
+    let w = std::cell::RefCell::new(writer(claim(&mut fs, &mut lease, "a", TTL, at(0)).unwrap()));
+    lease.lose_reply = true;
+    assert!(renew_shared(&w, &mut lease, at(5_000)).is_err());
+    // De PUT landde: de volgende vernieuwing krijgt 412 en herovert onze
+    // eigen lease. Dit was altijd `Busy` (de lening van `renew_commit` leefde
+    // door in de `match`).
+    renew_shared(&w, &mut lease, at(10_000)).unwrap();
+    assert_eq!(w.borrow().deadline(), 1_790_765_296_000 + 30_000);
+    // De store antwoordt niet tot voorbij de schrijfdeadline: niemand nam de
+    // lease over, dus herovering met dezelfde generatie.
+    lease.down = true;
+    assert_eq!(
+        renew_or_reclaim(&w, &mut lease, at(16_000)),
+        Err(Error::Object(replica_core::object::StoreError::Transport))
+    );
+    lease.down = false;
+    assert_eq!(w.borrow().check(at(31_000)), Err(Error::LeaseLost));
+    renew_or_reclaim(&w, &mut lease, at(31_000)).unwrap();
+    w.borrow().check(at(31_001)).unwrap();
+    assert_eq!(w.borrow().generation(), 1);
+    assert!(!w.borrow().is_lost());
+    // Een andere eigenaar in de lease: blijvend verlies.
+    let (state, handle) = lease.read().unwrap();
+    let foreign = LeaseState {
+        owner: "b#x".into(),
+        generation: state.generation + 1,
+        ..state
+    };
+    lease.inner.write(&handle, &foreign).unwrap();
+    assert_eq!(
+        renew_or_reclaim(&w, &mut lease, at(37_000)),
+        Err(Error::LeaseLost)
+    );
+    assert!(w.borrow().is_lost());
+    assert_eq!(
+        renew_or_reclaim(&w, &mut lease, at(38_000)),
+        Err(Error::LeaseLost)
+    );
 }
 #[test]
 fn release_lets_a_reader_take_over_at_once() {
