@@ -20,9 +20,9 @@ Zie [contracten en resterende aansluiting](docs/port.md).
 | Crate | Verantwoordelijkheid |
 | --- | --- |
 | `replica-sqlite` | SQLite 3.53.4, C-shim, veilige verbindingen/statements, vaste `memsys5`-heap en VFS; transparante paginacompressie (`compress`, `lz`, zie [docs/compress.md](docs/compress.md)) |
-| `replica-core` | Go-formaten, tracking/dirty logs, lokale markers, capture, publicatie, prepare, restore, compactie, retentie en schrijverlease |
+| `replica-core` | Go-formaten, tracking/dirty logs, lokale markers, capture, publicatie, prepare, restore, compactie, retentie en schrijverlease; meer databases onder één lease (`group`), banen (`lanes`), capturenummers (`publications`) en een volgende lezer (`follow`), zie [docs/group.md](docs/group.md) |
 | `replica-s3` | Concrete objectadapter op Lean S3 v3.1.1, SigV4, begrensd streamen en volledige listings |
-| `replica-hopos` | Async system-client als SQLite-opslag via de private stack; `xSync` is OP_SYNC |
+| `replica-hopos` | Async system-client als SQLite-opslag via de private stack; `xSync` is OP_SYNC; de banen van een eigenaarslot (`lanes`) |
 | `replica-sqlite-smoke` | RAM-SQLite als echte Hop-job, twee onafhankelijke slots |
 | `replica-sqlite-persist` | HopFS-commit, koude herstart, echte capture/restore en annulering van langlopende SQL |
 | `replica-sqlite-bench` | De meetkern: dezelfde stappen op HopOS (`tools/qemu-bench.py`, of als job op ijzer) en op de host (`cargo run -p replica-sqlite-bench`, RAM) naast `tools/bench-host.sh` (SQLite's unix-VFS) |
@@ -199,6 +199,17 @@ nooit een halve wijziging. Zie de moduledocs van `owner` en
 te publiceren is, zodat een host de rust alleen vraagt als het nodig is;
 `writer::renew_shared` vernieuwt de gedeelde lease in stappen, bijvoorbeeld
 vóór elke PUT van een lange upload.
+
+### Meer databases per domein
+
+`group::Group` repliceert de databases van één domein elk als eigen
+namespace onder één gedeelde schrijverlease: lui voorbereid per database,
+de lease bijgehouden (ook voorbij de schrijfdeadline heroverd zolang niemand
+hem nam), publiceren in rust met backoff in plaats van fencen bij een store
+die even niet antwoordt, en met banen (`lanes::Offload`) het store-werk naast
+de eigenaar. De eigenaar nummert zijn captures (`Replica::begun`,
+`Synced::capture`), zodat een host weet welke writes in de store staan.
+`follow::Follow` is een lezer zonder lease. Zie [docs/group.md](docs/group.md).
 
 S3 vanuit een app-slot: `replica_hopos::s3::store(&endpoint, Wait(s))` is een
 `replica_s3::S3` over `leans3http::Http` over Lean's `WebDial` over

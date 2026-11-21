@@ -7,7 +7,8 @@ lease-termijn verder. Asynchroon is goed genoeg: een paar handelingen kwijt
 weegt niet op tegen uren downtime.
 
 1. **Hostapp: lease vernieuwen.** De hostapp roept `Replica::renew` aan, ook
-   tijdens uploads (via `begin`/`finish`).
+   tijdens uploads (via `begin`/`finish`). `group::Group` doet dit voor een
+   app met meer databases (`Group::keep_lease`, de leasebaan).
 2. **Overname en een late PUT.** Gedaan zonder nieuwe generatie (een
    snapshot van gigabytes per overname is te duur): het fencing-token in elk
    manifest, het hoogste wint bij een dubbele sequence; `put_new` voor vaste
@@ -23,6 +24,8 @@ weegt niet op tegen uren downtime.
 3. **Volgen.** Een lezer past nieuwe manifesten incrementeel toe op zijn
    lokale kopie (de file change counter op pagina 1 maakt SQLite's cache
    ongeldig); een nieuwe generatie in `current` geeft een volledige restore.
+   Gedaan: `follow::Follow` (uit EasyFlor, 21-11-2026); de host heropent zijn
+   verbinding na een update.
 4. **Promotie.** Lease overnemen, inhalen tot de tip, nieuwe generatie,
    SQLite read-write heropenen. Eerst handmatig, daarna automatisch.
 
