@@ -138,6 +138,11 @@ impl Suspend for Wait {
         }
     }
 }
+/// Een eigen poort per toets (de toetsen lopen tegelijk), ruim genoeg om niets
+/// te begrenzen.
+fn gate() -> &'static replica_s3::Gate {
+    Box::leak(Box::new(replica_s3::Gate::new(64, u64::MAX)))
+}
 fn client() -> leans3::Client {
     leans3::Client {
         endpoint: "https://s3.example.test".into(),
@@ -179,6 +184,7 @@ fn lease_is_a_conditional_put_and_412_means_held() {
             move || Net(w.clone())
         },
         Wait { cancel: false },
+        gate(),
     )
     .unwrap();
     let mut lease = s.lease("replica/test/lease", 30_000);
@@ -251,6 +257,7 @@ fn large_segment_streams_with_budget_and_checks_truncation() {
             move || Net(w.clone())
         },
         Wait { cancel: false },
+        gate(),
     )
     .unwrap();
     let data = vec![37; 5 << 20];
@@ -281,6 +288,7 @@ fn complete_list_only_and_delete_absent_is_success() {
             move || Net(w.clone())
         },
         Wait { cancel: false },
+        gate(),
     )
     .unwrap();
     let body=b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken><Contents><Key>gen/L0/one.json</Key></Contents></ListBucketResult>".to_vec();
@@ -307,6 +315,7 @@ fn cancellation_after_request_disables_owner_and_invalid_clock_sends_nothing() {
             move || Net(w.clone())
         },
         Wait { cancel: true },
+        gate(),
     )
     .unwrap();
     assert_eq!(s.put("commit", b"manifest"), Err(StoreError::Cancelled));
@@ -321,7 +330,8 @@ fn cancellation_after_request_disables_owner_and_invalid_clock_sends_nothing() {
                 let w = world.clone();
                 move || Net(w.clone())
             },
-            Wait { cancel: false }
+            Wait { cancel: false },
+            gate(),
         ),
         Err(StoreError::Configuration)
     ));
@@ -338,6 +348,7 @@ fn directory_pages_skip_data_and_batches_allow_explicit_truncation() {
             move || Net(w.clone())
         },
         Wait { cancel: false },
+        gate(),
     )
     .unwrap();
     reply(&world, 200, b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>two</NextContinuationToken><Contents><Key>gen/marker</Key></Contents></ListBucketResult>".to_vec(), None);
@@ -385,6 +396,7 @@ fn cancellation_of_directory_or_batch_listing_poison_the_store() {
                 move || Net(w.clone())
             },
             Wait { cancel: true },
+            gate(),
         )
         .unwrap();
         let error = if directories {
@@ -419,6 +431,7 @@ fn lease_ghost_is_taken_over_only_after_a_ttl_unchanged() {
             move || Net(w.clone())
         },
         Wait { cancel: false },
+        gate(),
     )
     .unwrap();
     let state = LeaseState {
@@ -465,6 +478,7 @@ fn segment_gets_overlap_across_transports_and_keep_their_order() {
             }
         },
         Spin,
+        gate(),
     )
     .unwrap();
     assert_eq!(s.parallel().requests, replica_s3::STREAMS);
@@ -508,6 +522,7 @@ fn cancelled_parallel_round_poisons_the_store() {
             move || Net(w.clone())
         },
         Wait { cancel: true },
+        gate(),
     )
     .unwrap()
     .streams(2, 1 << 20);
@@ -517,4 +532,212 @@ fn cancelled_parallel_round_poisons_the_store() {
     ));
     world.borrow_mut().pause = false;
     assert!(matches!(s.get("g/a", 10), Err(StoreError::Cancelled)));
+}
+/// Hoeveel transports er nu bestaan (open zijn), het hoogste aantal ooit, en
+/// hoeveel er ooit gemaakt zijn; gedeeld door alle stores van een toets.
+#[derive(Default)]
+struct Count {
+    open: std::cell::Cell<usize>,
+    peak: std::cell::Cell<usize>,
+    made: std::cell::Cell<usize>,
+}
+/// Een [`Net`] die zich telt zolang hij bestaat.
+struct Counted(Net, Rc<Count>);
+impl Counted {
+    fn new(world: &Rc<RefCell<World>>, count: &Rc<Count>) -> Self {
+        count.open.set(count.open.get() + 1);
+        count.made.set(count.made.get() + 1);
+        count.peak.set(count.peak.get().max(count.open.get()));
+        Counted(Net(world.clone()), count.clone())
+    }
+}
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.1.open.set(self.1.open.get() - 1);
+    }
+}
+impl Transport for Counted {
+    type Response = Reply;
+    async fn send(&mut self, r: Request<'_, '_>) -> Result<Reply, IoError> {
+        self.0.send(r).await
+    }
+}
+fn counted(
+    gate: &'static replica_s3::Gate,
+    count: &Rc<Count>,
+) -> (Rc<RefCell<World>>, replica_s3::S3<Counted, Spin>) {
+    let world = Rc::new(RefCell::new(World {
+        slow: true,
+        ..World::default()
+    }));
+    let s = replica_s3::S3::new(
+        client(),
+        {
+            let (w, c) = (world.clone(), count.clone());
+            move || Counted::new(&w, &c)
+        },
+        Spin,
+        gate,
+    )
+    .unwrap();
+    (world, s)
+}
+fn segments(world: &Rc<RefCell<World>>, n: usize) {
+    for i in 0..n {
+        reply(world, 200, vec![i as u8; 10], Some(10));
+    }
+}
+#[test]
+fn one_gate_bounds_the_streams_of_every_store_and_a_plain_call_drops_the_extras() {
+    let gate: &'static _ = Box::leak(Box::new(replica_s3::Gate::new(4, 1 << 20)));
+    let count = Rc::new(Count::default());
+    let (wa, mut a) = counted(gate, &count);
+    let (wb, mut b) = counted(gate, &count);
+    assert_eq!(count.open.get(), 2);
+    assert_eq!(a.parallel().requests, 4);
+    assert_eq!(a.parallel().bytes, 1 << 20);
+    // A neemt de hele poort: zijn vaste verbinding en drie extra.
+    let keys = [("g/a", 10), ("g/b", 10), ("g/c", 10), ("g/d", 10)];
+    segments(&wa, 4);
+    let replies = a.get_all(&keys).unwrap();
+    assert!(replies.iter().all(Result::is_ok), "{replies:?}");
+    assert_eq!(count.open.get(), 5);
+    assert_eq!(gate.free(), (0, (1 << 20) - 40));
+    // B krijgt niets: één stroom, na elkaar over zijn vaste verbinding.
+    assert_eq!(b.parallel().requests, 1);
+    segments(&wb, 3);
+    let replies = b.get_all(&keys[..3]).unwrap();
+    assert_eq!(replies[2], Ok(vec![2; 10]));
+    assert_eq!(count.open.get(), 5);
+    let calls = wb.borrow().calls.clone();
+    assert!(
+        calls
+            .chunks(2)
+            .all(|c| c[0].starts_with("GET ") && c[1].starts_with("done ")),
+        "na elkaar: {calls:?}"
+    );
+    // De volgende ronde van A hergebruikt zijn extra verbindingen.
+    segments(&wa, 4);
+    a.get_all(&keys).unwrap();
+    assert_eq!((count.open.get(), count.made.get()), (5, 5));
+    // Een call die geen ronde is: de extra vallen, de poort is weer vrij.
+    reply(&wa, 200, Vec::new(), Some(0));
+    a.put("g/manifest", b"m").unwrap();
+    assert_eq!(count.open.get(), 2);
+    assert_eq!(gate.free(), (4, 1 << 20));
+    // Nu krijgt B ze, tot zijn eigen grens.
+    let mut b = b.streams(3, 1 << 20);
+    assert_eq!(b.parallel().requests, 3);
+    segments(&wb, 3);
+    b.get_all(&keys[..3]).unwrap();
+    assert_eq!(count.open.get(), 4);
+    // Het einde van een herstel zonder volgende call: `rest`.
+    b.rest();
+    assert_eq!(count.open.get(), 2);
+    assert_eq!(gate.free(), (4, 1 << 20));
+    // Nooit meer dan de poort in rondes, plus de vaste verbinding van de ander.
+    assert_eq!(count.peak.get(), 5);
+    // De drop geeft terug wat een store nog had.
+    segments(&wb, 2);
+    b.get_all(&keys[..2]).unwrap();
+    assert_eq!(gate.free().0, 2);
+    drop(b);
+    assert_eq!(gate.free(), (4, 1 << 20));
+    assert_eq!(count.open.get(), 1);
+}
+#[test]
+fn every_plain_call_ends_the_round() {
+    let gate: &'static _ = Box::leak(Box::new(replica_s3::Gate::new(4, 1 << 20)));
+    let count = Rc::new(Count::default());
+    let (w, mut s) = counted(gate, &count);
+    let keys = [("g/a", 10), ("g/b", 10)];
+    let list = b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>".to_vec();
+    for call in ["get", "list", "list_batch", "directories", "delete"] {
+        segments(&w, 2);
+        s.get_all(&keys).unwrap();
+        assert_eq!(count.open.get(), 2, "{call}");
+        match call {
+            "get" => {
+                reply(&w, 200, vec![1], Some(1));
+                s.get("g/a", 10).unwrap();
+            }
+            "list" => {
+                reply(&w, 200, list.clone(), None);
+                s.list("g/", 10).unwrap();
+            }
+            "list_batch" => {
+                reply(&w, 200, list.clone(), None);
+                s.list_batch("g/", 10).unwrap();
+            }
+            "directories" => {
+                reply(&w, 200, list.clone(), None);
+                s.directories("g/", 10).unwrap();
+            }
+            _ => {
+                reply(&w, 204, Vec::new(), Some(0));
+                s.delete("g/a").unwrap();
+            }
+        }
+        assert_eq!(count.open.get(), 1, "{call}");
+        assert_eq!(gate.free(), (4, 1 << 20), "{call}");
+    }
+}
+#[test]
+fn the_lease_passes_while_the_gate_is_full_and_keeps_the_round() {
+    use replica_core::writer::{Backend, LeaseState};
+    let gate: &'static _ = Box::leak(Box::new(replica_s3::Gate::new(2, u64::MAX)));
+    let count = Rc::new(Count::default());
+    let (wa, mut a) = counted(gate, &count);
+    let (wb, mut b) = counted(gate, &count);
+    let keys = [("g/a", 10), ("g/b", 10)];
+    segments(&wa, 2);
+    a.get_all(&keys).unwrap();
+    assert_eq!(gate.free().0, 0);
+    // B's lease (en een gewone call) wachten niet op de poort.
+    let state = LeaseState {
+        generation: 1,
+        expires_at: 1_790_765_326_000,
+        owner: "b#1".into(),
+    };
+    tagged(&wb, 200, b"", "\"b\"");
+    assert_eq!(
+        b.lease("replica/b/lease", 30_000)
+            .write("", &state)
+            .unwrap(),
+        "\"b\""
+    );
+    reply(&wb, 200, vec![7], Some(1));
+    assert_eq!(b.get("g/x", 10).unwrap(), [7]);
+    // A's eigen lease midden in zijn herstel laat de extra verbinding staan.
+    let body = br#"{"generation":1,"expires_at":"2026-10-01T11:42:06Z","owner":"a#1"}"#;
+    tagged(&wa, 200, body, "\"a\"");
+    a.lease("replica/a/lease", 30_000).read().unwrap();
+    assert_eq!((count.open.get(), gate.free().0), (3, 0));
+    segments(&wa, 2);
+    a.get_all(&keys).unwrap();
+    assert_eq!(count.made.get(), 3);
+}
+#[test]
+fn a_round_wider_than_the_gate_goes_in_pieces_within_the_byte_budget() {
+    let gate: &'static _ = Box::leak(Box::new(replica_s3::Gate::new(2, 100)));
+    let count = Rc::new(Count::default());
+    let (w, s) = counted(gate, &count);
+    let mut s = s.streams(3, 1 << 20);
+    // De poort begrenst wat de store plant: twee stromen, 100 bytes.
+    assert_eq!(s.parallel().requests, 2);
+    assert_eq!(s.parallel().bytes, 100);
+    // Een aanroeper die toch drie vraagt, krijgt ze in twee stukken, in volgorde.
+    segments(&w, 3);
+    let replies = s.get_all(&[("g/a", 60), ("g/b", 60), ("g/c", 60)]).unwrap();
+    assert_eq!(replies, [Ok(vec![0; 10]), Ok(vec![1; 10]), Ok(vec![2; 10])]);
+    assert_eq!((count.open.get(), count.made.get()), (2, 2));
+    // De bytes van die ronde zijn genomen (tot wat er was) en gaan bij de
+    // volgende ronde of de rust terug.
+    assert_eq!(gate.free(), (0, 0));
+    assert_eq!(s.parallel().bytes, 100);
+    segments(&w, 2);
+    s.get_all(&[("g/a", 10), ("g/b", 10)]).unwrap();
+    assert_eq!(gate.free(), (0, 80));
+    s.rest();
+    assert_eq!(gate.free(), (2, 100));
 }

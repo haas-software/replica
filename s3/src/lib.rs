@@ -5,6 +5,7 @@ extern crate alloc;
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::{
     pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll},
 };
 use leans3::{AsyncWrite, Client, IoError, Transport};
@@ -14,23 +15,132 @@ use replica_core::writer::{
     discovery::{self, wire},
 };
 use replica_sqlite::asynchronous::Suspend;
-/// Gelijktijdige segment-GETs van een herstel of compactie. Bunny Storage
-/// haalt ongeveer 10 MB/s per stroom; gemeten 05-10 vanaf het LAN met delen
-/// van 4 MiB: 1 stroom 10,6, 8 stromen 53 en 16 stromen 69 MB/s, daarboven
-/// niet sneller.
+/// Gelijktijdige segment-GETs van een herstel of compactie, per store. Bunny
+/// Storage haalt ongeveer 10 MB/s per stroom; gemeten 05-10 vanaf het LAN met
+/// delen van 4 MiB: 1 stroom 10,6, 8 stromen 53 en 16 stromen 69 MB/s,
+/// daarboven niet sneller. Wat de hele app tegelijk mag, zegt de [`Gate`].
 pub const STREAMS: usize = 16;
-/// Segmentbytes die één ronde hoogstens vasthoudt: 16 delen van 4 MiB.
+/// Segmentbytes die één ronde van één store hoogstens vasthoudt: 16 delen van
+/// 4 MiB.
 pub const STREAM_BYTES: u64 = 64 << 20;
+/// De bytes van één stroom in een ronde: één deel van 4 MiB.
+pub const PART_BYTES: u64 = 4 << 20;
+/// Stromen van de hele app samen, over alle stores ([`Gate`]).
+pub const APP_STREAMS: usize = 8;
+/// Bytes van de rondes van de hele app samen: [`APP_STREAMS`] delen.
+pub const APP_STREAM_BYTES: u64 = APP_STREAMS as u64 * PART_BYTES;
+/// Bits van de bytes in [`Gate::used`]; de stromen staan erboven.
+const BYTE_BITS: u32 = 48;
+const BYTE_MASK: u64 = (1 << BYTE_BITS) - 1;
+/// De poort van een app: hoeveel stromen de rondes van al zijn stores samen
+/// hebben, en hoeveel bytes ze samen vasthouden. Elke `S3` van de app krijgt
+/// dezelfde mee ([`S3::new`]); per store blijft [`S3::streams`] de grens.
+///
+/// Wat telt: de verbindingen van een ronde (de vaste plus de extra) en de
+/// bytes van die ronde, vanaf de ronde tot de store ze teruggeeft (de eerste
+/// call die geen ronde is, [`S3::rest`], of de drop). Wat niet telt: de ene
+/// vaste verbinding van elke store buiten een ronde, de lease en een ronde
+/// die geen twee stromen kreeg (die haalt na elkaar op over de vaste
+/// verbinding). Een store kan dus altijd verder, één deel tegelijk.
+///
+/// Eén atomic voor beide tellers (stromen boven, bytes onder), zodat ze samen
+/// één waarde zijn; zo mag de poort een `static` zijn, ook op een host met
+/// threads.
+#[derive(Debug)]
+pub struct Gate {
+    streams: usize,
+    bytes: u64,
+    used: AtomicU64,
+}
+impl Gate {
+    /// Een poort voor `streams` stromen en `bytes` bytes (hoogstens 2^16 - 1
+    /// stromen en 2^48 - 1 bytes); bijvoorbeeld [`APP_STREAMS`] en
+    /// [`APP_STREAM_BYTES`].
+    #[must_use]
+    pub const fn new(streams: usize, bytes: u64) -> Self {
+        Self {
+            streams: if streams > 0xffff { 0xffff } else { streams },
+            bytes: if bytes > BYTE_MASK { BYTE_MASK } else { bytes },
+            used: AtomicU64::new(0),
+        }
+    }
+    /// De stromen en bytes die nu vrij zijn.
+    pub fn free(&self) -> (usize, u64) {
+        let (streams, bytes) = unpack(self.used.load(Ordering::Relaxed));
+        (
+            self.streams.saturating_sub(streams),
+            self.bytes.saturating_sub(bytes),
+        )
+    }
+    /// Neemt hoogstens `streams` en `bytes`, zoveel als er vrij is.
+    fn take(&self, streams: usize, bytes: u64) -> (usize, u64) {
+        let mut got = (0, 0);
+        let _ = self
+            .used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                let (s, b) = unpack(used);
+                got = (
+                    streams.min(self.streams.saturating_sub(s)),
+                    bytes.min(self.bytes.saturating_sub(b)),
+                );
+                Some(pack(s + got.0, b + got.1))
+            });
+        got
+    }
+    /// Geeft terug wat [`Gate::take`] gaf.
+    fn give(&self, streams: usize, bytes: u64) {
+        let _ = self
+            .used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                let (s, b) = unpack(used);
+                Some(pack(s.saturating_sub(streams), b.saturating_sub(bytes)))
+            });
+    }
+}
+fn pack(streams: usize, bytes: u64) -> u64 {
+    ((streams as u64) << BYTE_BITS) | (bytes & BYTE_MASK)
+}
+fn unpack(used: u64) -> (usize, u64) {
+    ((used >> BYTE_BITS) as usize, used & BYTE_MASK)
+}
+/// Wat één store van de [`Gate`] heeft. De drop geeft het terug, op elk pad.
+struct Permit {
+    gate: &'static Gate,
+    /// De vaste verbinding plus de extra van de ronde, of nul buiten een ronde.
+    streams: usize,
+    /// De bytes van de laatste ronde.
+    bytes: u64,
+}
+impl Permit {
+    fn give_bytes(&mut self) {
+        self.gate.give(0, core::mem::take(&mut self.bytes));
+    }
+    fn give_all(&mut self) {
+        self.gate.give(
+            core::mem::take(&mut self.streams),
+            core::mem::take(&mut self.bytes),
+        );
+    }
+}
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.give_all();
+    }
+}
 /// Eén client en wachtbrug met hun eigen verbindingen; annulering maakt deze
 /// eigenaar onbruikbaar. Een herstel of compactie haalt tot [`STREAMS`]
-/// segmenten tegelijk op, ieder over een eigen verbinding.
+/// segmenten tegelijk op, ieder over een eigen verbinding, binnen de
+/// [`Gate`] van de app.
 pub struct S3<T, W> {
     client: Client,
     transport: T,
+    /// De extra verbindingen van de rondes (`get_all`); ze vallen bij de
+    /// eerste andere call ([`S3::rest`]), niet op een klok.
     extra: Vec<T>,
     open: Box<dyn FnMut() -> T>,
     streams: usize,
     budget: u64,
+    permit: Permit,
     wait: W,
     poisoned: bool,
     /// Sleutel, ETag en eerste waarneming (ms) van een lease-ghost.
@@ -40,11 +150,13 @@ impl<T: Transport, W: Suspend> S3<T, W> {
     /// `open` maakt één verbinding, bijvoorbeeld `leans3http::Http` over
     /// Lean's `WebDial`; TLS, DNS en termijnen zijn van dat transport. De
     /// eerste gaat meteen open, de rest pas als een herstel of compactie
-    /// tegelijk ophaalt: [`STREAMS`] stromen, samen [`STREAM_BYTES`].
+    /// tegelijk ophaalt: [`STREAMS`] stromen, samen [`STREAM_BYTES`], en
+    /// alleen zoveel als `gate` (de poort van de hele app) vrij heeft.
     pub fn new(
         client: Client,
         mut open: impl FnMut() -> T + 'static,
         wait: W,
+        gate: &'static Gate,
     ) -> Result<Self, StoreError> {
         let out = Self {
             client,
@@ -53,6 +165,11 @@ impl<T: Transport, W: Suspend> S3<T, W> {
             open: Box::new(open),
             streams: STREAMS,
             budget: STREAM_BYTES,
+            permit: Permit {
+                gate,
+                streams: 0,
+                bytes: 0,
+            },
             wait,
             poisoned: false,
             ghost: None,
@@ -60,13 +177,21 @@ impl<T: Transport, W: Suspend> S3<T, W> {
         out.ready()?;
         Ok(out)
     }
-    /// Een andere grens dan [`STREAMS`] en [`STREAM_BYTES`]; één stroom haalt
-    /// na elkaar op.
+    /// Een andere grens dan [`STREAMS`] en [`STREAM_BYTES`] voor deze store;
+    /// één stroom haalt na elkaar op. De [`Gate`] blijft erboven gelden.
     #[must_use]
     pub fn streams(mut self, streams: usize, bytes: u64) -> Self {
         self.streams = streams.max(1);
         self.budget = bytes;
         self
+    }
+    /// Het einde van de rondes: de extra verbindingen vallen (dicht) en wat
+    /// de store van de [`Gate`] had, gaat terug. Elke call die geen
+    /// `get_all` is (PUT, GET, LIST, DELETE) doet dit zelf, de lease niet;
+    /// een host roept het aan na een herstel waar niets op volgt.
+    pub fn rest(&mut self) {
+        self.extra.clear();
+        self.permit.give_all();
     }
     fn ready(&self) -> Result<(), StoreError> {
         if self.poisoned {
@@ -89,6 +214,7 @@ impl<T: Transport, W: Suspend> S3<T, W> {
         limit: usize,
         complete: bool,
     ) -> Result<Vec<Object>, StoreError> {
+        self.rest();
         self.ready()?;
         if limit == 0 || limit > replica_core::manifest::MAX_COMMITS {
             return Err(StoreError::Limit);
@@ -121,9 +247,120 @@ impl<T: Transport, W: Suspend> S3<T, W> {
     }
 }
 impl<T: Transport, W: Suspend> S3<T, W> {
+    /// Hoeveel verbindingen deze ronde krijgt: wat de store al had, aangevuld
+    /// uit de [`Gate`] tot het aantal sleutels, met de extra verbindingen die
+    /// daarbij horen geopend. De bytes van de vorige ronde zijn verbruikt
+    /// (core vraagt een nieuwe ronde pas als de vorige op is) en gaan eerst
+    /// terug.
+    fn widen(&mut self, keys: &[(&str, usize)]) -> Result<usize, StoreError> {
+        self.permit.give_bytes();
+        if keys.len() < 2 {
+            return Ok(1);
+        }
+        let held = self.permit.streams;
+        if held < keys.len() {
+            let (got, _) = self.permit.gate.take(keys.len() - held, 0);
+            if held + got < 2 {
+                // Geen tweede stroom: na elkaar, buiten de poort.
+                self.permit.gate.give(got, 0);
+                return Ok(1);
+            }
+            self.permit.streams = held + got;
+        }
+        let width = self.permit.streams.min(keys.len());
+        let more = width - 1;
+        if self.extra.len() < more {
+            self.extra
+                .try_reserve_exact(more - self.extra.len())
+                .map_err(|_| StoreError::Limit)?;
+            while self.extra.len() < more {
+                self.extra.push((self.open)());
+            }
+        }
+        let bytes = keys.iter().fold(0u64, |sum, &(_, limit)| {
+            sum.saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+        });
+        let (_, got) = self.permit.gate.take(0, bytes);
+        self.permit.bytes = got;
+        Ok(width)
+    }
+    /// Eén GET over de vaste verbinding; de extra blijven staan.
+    fn fetch(&mut self, key: &str, limit: usize) -> Result<Vec<u8>, StoreError> {
+        self.ready()?;
+        if limit > replica_core::segment::MAX_BYTES {
+            return Err(StoreError::Limit);
+        }
+        let mut sink = Sink {
+            bytes: Vec::new(),
+            limit,
+            limited: false,
+        };
+        let result = self
+            .wait
+            .wait(self.client.get_to(&mut self.transport, key, &mut sink));
+        match result {
+            Err(_) => {
+                self.poisoned = true;
+                Err(StoreError::Cancelled)
+            }
+            Ok(result) => {
+                if sink.limited {
+                    return Err(StoreError::Limit);
+                }
+                result.map_err(map)?;
+                Ok(sink.bytes)
+            }
+        }
+    }
+    /// Eén GET per sleutel tegelijk, over de vaste en de extra verbindingen
+    /// (er zijn er genoeg: [`S3::widen`]).
+    fn fetch_all(&mut self, keys: &[(&str, usize)]) -> Result<Replies, StoreError> {
+        if keys.len() > self.extra.len() + 1 {
+            return Err(StoreError::Limit);
+        }
+        let mut sinks = Vec::new();
+        sinks
+            .try_reserve_exact(keys.len())
+            .map_err(|_| StoreError::Limit)?;
+        for &(_, limit) in keys {
+            sinks.push(Sink {
+                bytes: Vec::new(),
+                limit,
+                limited: false,
+            });
+        }
+        let transports = core::iter::once(&mut self.transport).chain(self.extra.iter_mut());
+        let gets = transports
+            .zip(sinks.iter_mut())
+            .zip(keys)
+            .map(|((transport, sink), &(key, _))| (transport, key, sink));
+        let replies = match self.wait.wait(self.client.get_to_all(gets)) {
+            Ok(replies) => replies.map_err(map)?,
+            Err(_) => {
+                self.poisoned = true;
+                return Err(StoreError::Cancelled);
+            }
+        };
+        let mut out = Vec::new();
+        out.try_reserve_exact(keys.len())
+            .map_err(|_| StoreError::Limit)?;
+        for (sink, reply) in sinks.into_iter().zip(replies) {
+            out.push(match reply {
+                _ if sink.limited => Err(StoreError::Limit),
+                Ok(_) => Ok(sink.bytes),
+                Err(e) => Err(map(e)),
+            });
+        }
+        Ok(out)
+    }
+}
+impl<T: Transport, W: Suspend> S3<T, W> {
     /// De schrijverlease op `key` in deze bucket, via dezelfde client en
     /// hetzelfde transport (zie `replica_core::writer`). `ttl_ms` is de
     /// lease-TTL: zo lang moet een ghost onveranderd blijven vóór overname.
+    /// De lease gaat buiten de [`Gate`] om en laat de extra verbindingen van
+    /// een ronde staan: een vernieuwing midden in een herstel wacht nergens
+    /// op en breekt het herstel niet af.
     pub fn lease<'a>(&'a mut self, key: &'a str, ttl_ms: u64) -> Lease<'a, T, W> {
         Lease {
             s3: self,
@@ -297,6 +534,7 @@ impl<T: Transport, W: Suspend> Store for S3<T, W> {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<alloc::string::String>, StoreError> {
+        self.rest();
         self.ready()?;
         if limit == 0 || limit > replica_core::manifest::MAX_COMMITS {
             return Err(StoreError::Limit);
@@ -328,6 +566,7 @@ impl<T: Transport, W: Suspend> Store for S3<T, W> {
         self.objects(prefix, limit, false)
     }
     fn put(&mut self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.rest();
         self.ready()?;
         if bytes.len() > replica_core::segment::MAX_BYTES {
             return Err(StoreError::Limit);
@@ -344,16 +583,27 @@ impl<T: Transport, W: Suspend> Store for S3<T, W> {
             }
         }
     }
+    /// Deze store's grens, en niet meer dan de [`Gate`] nu geeft: wat de
+    /// store al heeft plus wat vrij is (één stroom altijd). De aanroeper
+    /// (core's prefetch) vraagt dit vlak vóór zijn `get_all`, zonder wachten
+    /// ertussen, dus wat hij plant is dan nog vrij.
     fn parallel(&self) -> Parallel {
+        let (streams, bytes) = self.permit.gate.free();
         Parallel {
-            requests: self.streams,
-            bytes: self.budget,
+            requests: self
+                .streams
+                .min(self.permit.streams.saturating_add(streams))
+                .max(1),
+            bytes: self.budget.min(self.permit.bytes.saturating_add(bytes)),
         }
     }
     /// Eén GET per verbinding, samen in één wachtbeurt (`leans3`'s
     /// `get_to_all`); ieder met zijn eigen begrensde sink. Ontbrekende
-    /// verbindingen gaan nu pas open. Annulering vergiftigt de hele eigenaar,
-    /// zoals bij `get`.
+    /// verbindingen gaan nu pas open, zoveel als de [`Gate`] geeft; ze blijven
+    /// voor de volgende ronde tot [`S3::rest`]. Geeft de poort er minder dan
+    /// sleutels, dan gaat de ronde in stukken; zonder twee stromen na elkaar
+    /// over de vaste verbinding. Annulering vergiftigt de hele eigenaar, zoals
+    /// bij `get`.
     fn get_all(&mut self, keys: &[(&str, usize)]) -> Result<Replies, StoreError> {
         self.ready()?;
         if keys.len() > self.streams
@@ -366,79 +616,24 @@ impl<T: Transport, W: Suspend> Store for S3<T, W> {
         let mut out = Vec::new();
         out.try_reserve_exact(keys.len())
             .map_err(|_| StoreError::Limit)?;
-        if let [(key, limit)] = keys {
-            out.push(self.get(key, *limit));
-            return Ok(out);
-        }
-        let more = keys.len() - 1;
-        if self.extra.len() < more {
-            self.extra
-                .try_reserve_exact(more - self.extra.len())
-                .map_err(|_| StoreError::Limit)?;
-            while self.extra.len() < more {
-                self.extra.push((self.open)());
+        let width = self.widen(keys)?;
+        for round in keys.chunks(width) {
+            if let [(key, limit)] = round {
+                out.push(self.fetch(key, *limit));
+                continue;
             }
-        }
-        let mut sinks = Vec::new();
-        sinks
-            .try_reserve_exact(keys.len())
-            .map_err(|_| StoreError::Limit)?;
-        for &(_, limit) in keys {
-            sinks.push(Sink {
-                bytes: Vec::new(),
-                limit,
-                limited: false,
-            });
-        }
-        let transports = core::iter::once(&mut self.transport).chain(self.extra.iter_mut());
-        let gets = transports
-            .zip(sinks.iter_mut())
-            .zip(keys)
-            .map(|((transport, sink), &(key, _))| (transport, key, sink));
-        let replies = match self.wait.wait(self.client.get_to_all(gets)) {
-            Ok(replies) => replies.map_err(map)?,
-            Err(_) => {
-                self.poisoned = true;
-                return Err(StoreError::Cancelled);
+            for reply in self.fetch_all(round)? {
+                out.push(reply);
             }
-        };
-        for (sink, reply) in sinks.into_iter().zip(replies) {
-            out.push(match reply {
-                _ if sink.limited => Err(StoreError::Limit),
-                Ok(_) => Ok(sink.bytes),
-                Err(e) => Err(map(e)),
-            });
         }
         Ok(out)
     }
     fn get(&mut self, key: &str, limit: usize) -> Result<Vec<u8>, StoreError> {
-        self.ready()?;
-        if limit > replica_core::segment::MAX_BYTES {
-            return Err(StoreError::Limit);
-        }
-        let mut sink = Sink {
-            bytes: Vec::new(),
-            limit,
-            limited: false,
-        };
-        let result = self
-            .wait
-            .wait(self.client.get_to(&mut self.transport, key, &mut sink));
-        match result {
-            Err(_) => {
-                self.poisoned = true;
-                Err(StoreError::Cancelled)
-            }
-            Ok(result) => {
-                if sink.limited {
-                    return Err(StoreError::Limit);
-                }
-                result.map_err(map)?;
-                Ok(sink.bytes)
-            }
-        }
+        self.rest();
+        self.fetch(key, limit)
     }
     fn delete(&mut self, key: &str) -> Result<(), StoreError> {
+        self.rest();
         self.ready()?;
         let options = leans3::DeleteOptions::default();
         match self

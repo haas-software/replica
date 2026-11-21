@@ -127,13 +127,20 @@ pub fn client(endpoint: &Endpoint<'_>) -> Result<leans3::Client, StoreError> {
     })
 }
 
+/// De poort van de app: de stromen en bytes van de rondes van al zijn stores
+/// samen (`replica_s3::APP_STREAMS`, `replica_s3::APP_STREAM_BYTES`). Elke
+/// [`store`] krijgt deze; een app die zelf `replica_s3::S3::new` aanroept,
+/// geeft hem ook mee, zodat er één per app is.
+pub static GATE: replica_s3::Gate =
+    replica_s3::Gate::new(replica_s3::APP_STREAMS, replica_s3::APP_STREAM_BYTES);
+
 /// De objectstore van Replica voor `endpoint`, die op `wait` parkeert: één
-/// verbinding meteen, tot `replica_s3::STREAMS` als een herstel ze vraagt.
-/// Zonder app (`applib::app()` leeg) of zonder wandklok is dit
-/// [`StoreError::Configuration`].
+/// verbinding meteen, tot `replica_s3::STREAMS` als een herstel ze vraagt en
+/// [`GATE`] ze heeft. Zonder app (`applib::app()` leeg) of zonder wandklok is
+/// dit [`StoreError::Configuration`].
 pub fn store<W: Suspend>(endpoint: &Endpoint<'_>, wait: W) -> Result<Store<W>, StoreError> {
     if applib::app().is_none() {
         return Err(StoreError::Configuration);
     }
-    replica_s3::S3::new(client(endpoint)?, transport, wait)
+    replica_s3::S3::new(client(endpoint)?, transport, wait, &GATE)
 }
