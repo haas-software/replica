@@ -962,24 +962,20 @@ fn readers_see_the_committed_state_while_one_writes() {
     let mut v2 = v1[..cut].to_vec();
     v2[2 * page..3 * page].copy_from_slice(&pages(1, page, 4));
     assert_eq!(read_all(&mut r, rid), v2);
-    // Wie opent terwijl een ander schrijft zonder meelezers, krijgt een eigen
-    // kopie van de gecommitte staat.
+    // Wie opent terwijl een ander alleen schrijft, deelt de kaart ook: de
+    // gecommitte staat tot de commit, daarna meteen de nieuwe.
     r.close(rid).unwrap();
     w.write(wid, 0, &pages(2, page, 5)).unwrap();
     let mut late = Compressed::shared(Vol::new(&d), pol, &maps);
     let lid = late.open(c"t.db", OpenFlags(2)).unwrap();
     assert_eq!(read_all(&mut late, lid), v2);
-    assert_eq!(maps.heap().files, 2);
-    w.sync(wid, 3).unwrap();
-    late.close(lid).unwrap();
     assert_eq!(maps.heap().files, 1);
-    // Een nieuwe opener deelt weer en ziet de laatste commit.
-    let rid = r.open(c"t.db", OpenFlags(2)).unwrap();
+    w.sync(wid, 3).unwrap();
     let mut v3 = v2.clone();
     v3[..2 * page].copy_from_slice(&pages(2, page, 5));
-    assert_eq!(read_all(&mut r, rid), v3);
+    assert_eq!(read_all(&mut late, lid), v3);
+    late.close(lid).unwrap();
     assert_eq!(maps.heap().files, 1);
-    r.close(rid).unwrap();
     w.close(wid).unwrap();
     assert_eq!(maps.heap(), Heap::default());
 }

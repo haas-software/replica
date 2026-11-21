@@ -113,11 +113,11 @@ bestand één kaart, 8 B per pagina één keer in plaats van per eigenaar (Nagel
 `main.db` 17,2 MB; EasyFlor had per bestand 2 eigenaren plus één per
 leessessie, meting 21 nov 2026). De ene schrijver werkt hem bij; zolang zijn
 transactie loopt, zien de anderen de gecommitte staat (de oude ingang van elke
-pagina die hij veranderde, alleen bewaard als er een ander meeleest), na zijn
-commit meteen de nieuwe. Een tweede schrijver krijgt `SQLITE_BUSY`. Opent een
-eigenaar terwijl een ander zonder meelezers schrijft, dan krijgt hij een eigen
-kopie van de gecommitte staat. Sluit het laatste handvat (van welke eigenaar
-ook), dan gaat de kaart terug naar de heap; de volgende `open` leest
+pagina die hij veranderde, 16 B per pagina tot de commit, bewaard zodra de
+`Maps` meer houders heeft, zodat ook wie midden in de transactie opent de ene
+kaart deelt), na zijn commit meteen de nieuwe. Een tweede schrijver krijgt
+`SQLITE_BUSY`. Sluit het laatste handvat (van welke eigenaar ook), dan gaat de
+kaart terug naar de heap; de volgende `open` leest
 superblokken, snapshot en log. Een `open` op een kaart die een andere eigenaar
 al had, kijkt superblok en log na: een schrijver buiten deze `Maps` laat hem
 opnieuw laden. Een lening van het register overleeft nooit een aanroep van de
@@ -185,7 +185,7 @@ piekgeheugen van 44 MB.
 | `free_space_reuse_keeps_the_file_bounded` | 3000 commits herschrijven 2000 documenten: fysiek ≤ 1,5 × levend + speling, geen groei na opwarmen; na DELETE en VACUUM krimpt het |
 | `power_cut_at_every_write_and_sync_of_a_commit` | vijf soorten commits (eerste, log, checkpoint, schoonmaken, krimp) met een knip na elke write/sync/truncate, drie seeds voor wat landde (weg, heel, half per sector): heropenen, `integrity_check`, oud of nieuw, daarna bruikbaar |
 | `plain_files_stay_plain_and_both_formats_mix`, `two_owners_see_each_others_commits`, `vacuum_into_converts_to_compressed_16k`, `damaged_containers_give_errors_not_panics` | gemengde formaten (ATTACH), `Policy::plain`, twee eigenaren (ook met `synchronous=OFF` en `journal_mode=TRUNCATE`: de ander ziet elke afgeronde transactie), omzetten, 300 beschadigde containers |
-| `owners_on_one_maps_share_one_map_and_give_it_back`, `readers_see_the_committed_state_while_one_writes`, `a_writer_gone_mid_transaction_leaves_readers_the_file`, `a_restore_leaves_a_tight_map` | vier eigenaren op één `Maps`: één kaart, commits meteen zichtbaar (ook via SQLite), heap leeg na het laatste handvat; tijdens een transactie (overschrijven, groeien, deelwrite, krimp) ziet een lezer de gecommitte staat, een tweede schrijver `SQLITE_BUSY`, een late opener een eigen kopie; een schrijver weg zonder commit: de lezer leest het bestand opnieuw; een herstel van 40.000 pagina's laat een kaart van precies 8 B per pagina |
+| `owners_on_one_maps_share_one_map_and_give_it_back`, `readers_see_the_committed_state_while_one_writes`, `a_writer_gone_mid_transaction_leaves_readers_the_file`, `a_restore_leaves_a_tight_map` | vier eigenaren op één `Maps`: één kaart, commits meteen zichtbaar (ook via SQLite), heap leeg na het laatste handvat; tijdens een transactie (overschrijven, groeien, deelwrite, krimp) ziet een lezer de gecommitte staat, een tweede schrijver `SQLITE_BUSY`, een late opener deelt de kaart; een schrijver weg zonder commit: de lezer leest het bestand opnieuw; een herstel van 40.000 pagina's laat een kaart van precies 8 B per pagina |
 | `core/tests/formats.rs` | `SPINSEG2` rondgang (nul, ruis, JSON, half) voor 512 B..64 KiB, afgebroken en omgedraaide bytes, kapot LZ-blok onder een kloppende hash |
 | `core/tests/compact.rs` | een `SPINSEG2`-invoer geeft een `SPINSEG2`-compactie met dezelfde pagina's als Go |
 | `core/tests/compressed.rs` | SQL- en sync-kant elk een `Compressed<Dir>`: publiceren (alleen `SPINSEG2`, store < 1/3 van logisch), increment, herstel op een lege map (container of gewoon), een oude replica (`SPINSEG1`, gewoon bestand) door de nieuwe code, en oud en nieuw door elkaar |
