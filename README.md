@@ -53,19 +53,20 @@ een WAL zou die pagina's pas bij een checkpoint laten zien.
 
 ## Versies en pins
 
-Replica zelf: **v3.2.3** (voorstel, nog niet getagd; dezelfde nummering als
-HopOS en Lean). Afnemers pinnen een tag, geen rev op een branch.
+Replica zelf: **v3.2.4** (dezelfde nummering als HopOS). Afnemers pinnen een
+tag, geen rev op een branch.
 
 | Afhankelijkheid | Crates | Pin |
 | --- | --- | --- |
-| HopOS (`hop-os/HopOS`) | `applib`, `sync` | `v3.2.3` |
+| HopOS (`hop-os/HopOS`) | `applib`, `sync` | `v3.2.4` |
 | Lean (`haas-software/lean`) | `leans3`, `leans3http`, `leanhttp`, `leanhttps`, `leantls`, `leancrypto` (en `leannet` via applib) | `v3.2.3` |
 | Hop (`hop-os/hop`) | `types`, `discovery` | `v3.2.1` |
 | SQLite | gevendord in `vendor/sqlite` | 3.53.4 |
 | Rust | `rust-toolchain.toml` | 1.93.0 |
 
-HopOS en Lean hebben dezelfde tag: applib brengt `leannet` mee en `TcpConn`
-moet dezelfde `Dial` kennen als leanhttp. `tools/gate.sh` legt deze tabel
+Lean heeft de tag die HopOS zelf pint (HopOS v3.2.4 pint Lean v3.2.3):
+applib brengt `leannet` mee en `TcpConn` moet dezelfde `Dial` kennen als
+leanhttp. `tools/gate.sh` legt deze tabel
 tegen de `Cargo.toml`'s.
 
 **Het contract met Hop.** De schrijverlease is het leaseobject van
