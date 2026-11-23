@@ -23,9 +23,11 @@ elke database publiceert op zijn eigen moment.
 | `group::release` | Lease terug bij het sluiten: na een transportfout nog twee keer, bij naam |
 | `writer::renew_or_reclaim` | Vernieuwen; voorbij de schrijfdeadline heroveren zolang niemand de lease nam |
 | `lanes` | `Offload` (de haak van de host: "draai dit op baan X"), `LaneSide`/`LaneStore` (de store van een baan kan de lease lezen: het onderhoud bevestigt hem vóór het weggooit); een `Job` is ondoorzichtig, de host draait hem met `Job::run` |
+| `lanes::KeepLease` | De haak tussen de store van de eigenaar en zijn open groep: de waiter van de store houdt de lease bij terwijl één call wacht (`Group::with_keep_lease`) |
 | `publications::Publications` | Gedeelde kijk op de capturenummers van de eigenaars |
 | `follow::Follow` | Een lezer zonder lease die de publicaties van de schrijver volgt |
 | `replica_hopos::lanes` | De banen op HopOS: `Lanes::run` per stack, `OwnerLanes` als `Offload` |
+| `replica_hopos::keep::Keeping` | De waiter op HopOS: wacht als `Wait`, en roept elke seconde van een wachtbeurt `KeepLease::keep` aan |
 | `replica_hopos::s3::lease_store` | De store van de lease met `Dial::Forced`: de plek voor de geforceerde dial van lean/applib (nu nog gewoon) |
 
 `group::Group` ligt bovenop `owner::Replica`; er is geen derde niveau. De
@@ -36,7 +38,9 @@ modules eronder (`prepare`, `replication`, `restore`, ...) zijn intern.
 1. Claim de lease (`writer::claim` op `<prefix>/<domain>/lease`) vóór iets
    wordt opgehaald. Een `Role::Reader` maakt geen groep.
 2. `Group::new(config, store, writer, millis, report)`; met banen
-   `.with_offload(&lanes)`, en `.with_publications(rc)` als iemand wacht.
+   `.with_offload(&lanes)` en `.with_keep_lease(&keep)` (de `KeepLease` die
+   ook de waiter van de store van de eigenaar kreeg, zie "De lease tijdens
+   één lange call"), en `.with_publications(rc)` als iemand wacht.
 3. `Group::prepare(file, sync, &verify)` de eerste keer dat SQLite `file`
    opent. `verify` controleert een herstelde scratchdatabase en roept zijn
    derde argument aan tijdens de controle (`group::Ticking` om de opslag).
@@ -49,8 +53,35 @@ modules eronder (`prepare`, `replication`, `restore`, ...) zijn intern.
    `Group::close` en `group::release`.
 
 `Report` krijgt elke herkansing (`retry`, met de oorzaak en `next_ms`), het
-herstel (`recovered`), het verlies (`lost`, eenmaal), andere fouten en elke
-publicatie: de host maakt er zijn logregels van.
+herstel (`recovered`), het verlies (`lost`, eenmaal), andere fouten, elke
+publicatie en elke store-call van de eigenaar die langer duurde dan de marge
+van de lease (`slow`, met hoe lang de laatste vernieuwing toen geleden was):
+de host maakt er zijn logregels van.
+
+## De lease tijdens één lange call
+
+De eigenaar zet een vernieuwing op de leasebaan alleen als hij zelf loopt:
+vóór elke store- en opslagcall van een herstel (`Group::prepare`), uit
+`cooperate`. Eén call die langer wacht dan de marge van de lease (een
+segment-GET die zijn budget vol maakt en opnieuw gaat) liet de lease verlopen
+zonder dat iets het zei; het herstel liep minuten door en pas de prepare van
+de volgende database vond hem verloren (EasyFlor, 23-11-2026: een GET van
+39 s bij een lease van 30 s).
+
+- **Bijhouden tijdens het wachten.** De store van de eigenaar wacht met een
+  waiter die elke seconde `KeepLease::keep` aanroept (`Keeping` uit
+  `replica_hopos::keep`, om zijn `Wait`), en de groep hangt zich eraan met
+  `Group::with_keep_lease`: dezelfde vernieuwing als `Group::keep_lease`, op
+  de leasebaan. Alleen met banen; zonder vernieuwt de eigenaar op zijn eigen
+  store, en die wacht dan.
+- **Snel falen.** Vóór en na elke store-call van een herstel of publicatie
+  kijkt de groep of de lease nog staat. Is hij overgenomen of verlopen, dan
+  stopt het herstel daar: `Error::LeaseLost` en `Report::lost` op die database
+  en stap `prepare` (of `sync`), met de oorzaak `taken` of `expired`; een call
+  langer dan de marge staat er vlak voor als `Report::slow`.
+- **Rondes.** Een herstel haalt zijn segmenten in rondes die zich aan hun duur
+  aanpassen; een ronde is nooit breder dan wat de store op dat moment geeft,
+  zodat ze één wachtbeurt is en de controle erna echt na de ronde komt.
 
 ## Welke writes de store heeft
 
@@ -78,5 +109,8 @@ en het onderhoud (`owner::Config::background_maintenance` staat dan aan).
 `core/tests/group.rs`: banen en capturenummers, een korte storing (backoff,
 wachten voorbij de deadline, herovering met dezelfde generatie), vrijgeven bij
 naam, een herstel langer dan de lease, een lezer die volgt.
+`core/tests/keep_lease.rs`: één GET van 40 s in een herstel; zonder
+`KeepLease` stopt het herstel daar (`slow`, dan `lost ... cause=expired`),
+met vernieuwt de leasebaan tijdens de GET en komen beide databases binnen.
 `core/tests/writer.rs`: `renew_or_reclaim` en de herovering in `renew_shared`.
 `hopos/tests/lanes.rs`: de banen op echte stacks.

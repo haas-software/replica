@@ -26,13 +26,77 @@
 //! een store- of opslagcall heen geleend worden (het rustprotocol van
 //! [`crate::owner`]). Alleen [`crate::group::Group`] maakt jobs; een host
 //! geeft hem zijn haak met `Group::with_offload`.
+//!
+//! **De lease tijdens één lange call van de eigenaar** ([`KeepLease`]). De
+//! eigenaar zet een vernieuwing op de leasebaan alleen als hij zelf loopt:
+//! vóór elke store- en opslagcall van een herstel, uit de progresscallback
+//! van een statement. Eén call die langer wacht dan de marge van de lease
+//! (een segment-GET die zijn budget vol maakt en opnieuw gaat) liet de lease
+//! dan verlopen zonder dat iets het zei (EasyFlor, 23-11-2026: een GET van
+//! 39 s bij een lease van 30 s, daarna `LeaseLost` bij de prepare van het
+//! volgende bestand). De store van de eigenaar wacht daarom met een waiter
+//! die tijdens het wachten [`KeepLease::keep`] aanroept (op HopOS
+//! `replica_hopos::keep::Keeping`), en de groep hangt zich eraan met
+//! `Group::with_keep_lease`.
 use crate::Result;
 use crate::group::Bucket;
 use crate::object::{Object, Parallel, Replies, Store, StoreError};
 use crate::writer::{Backend, LeaseState, discovery};
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, rc::Weak, string::String, vec::Vec};
+use core::cell::{Cell, RefCell};
 use core::ffi::CStr;
 use replica_sqlite::{FileId, OpenFlags, Storage};
+/// Een lease die bijgehouden wordt terwijl de eigenaar op zijn store wacht
+/// (zie [`KeepLease`]); een `Group` is er een.
+pub trait Keep {
+    /// Zet een vernieuwing op de leasebaan als die aan de beurt is (en neemt
+    /// een vernieuwing terug die de baan afmaakte), zonder de store van de
+    /// eigenaar: die wacht nu. Goedkoop als er niets te doen is.
+    fn keep(&self);
+}
+/// De haak tussen de store van een eigenaar en de groep die nu op die store
+/// loopt: de waiter van de store roept [`KeepLease::keep`] aan, ongeveer eens
+/// per seconde terwijl één call wacht, op de stack van de eigenaar, tussen
+/// twee wachtbeurten. Zonder open groep (of zonder banen) doet dat niets.
+///
+/// Eén per store van een eigenaar, gemaakt vóór de store en de groep; de
+/// groep die het laatst `Group::with_keep_lease` kreeg, wordt bijgehouden.
+/// De haak houdt alleen een zwakke verwijzing: een gesloten groep laat niets
+/// achter.
+#[derive(Default)]
+pub struct KeepLease<'k> {
+    /// De open groep.
+    open: RefCell<Option<Weak<dyn Keep + 'k>>>,
+    /// Een `keep` loopt al (een call van de groep die zelf weer wacht).
+    keeping: Cell<bool>,
+}
+impl<'k> KeepLease<'k> {
+    /// Houdt voortaan `keep` bij (in plaats van wat er stond).
+    pub fn hold(&self, keep: Weak<dyn Keep + 'k>) {
+        *self.open.borrow_mut() = Some(keep);
+    }
+    /// Is er een open lease om bij te houden? Een waiter zonder hoeft niet
+    /// tussendoor wakker te worden.
+    pub fn is_active(&self) -> bool {
+        self.open
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| w.strong_count() > 0)
+    }
+    /// Houdt de open lease bij ([`Keep::keep`]); niets zonder open lease, en
+    /// niets als dit al loopt.
+    pub fn keep(&self) {
+        let open = self.open.borrow().as_ref().and_then(Weak::upgrade);
+        let Some(open) = open else {
+            return;
+        };
+        if self.keeping.replace(true) {
+            return;
+        }
+        open.keep();
+        self.keeping.set(false);
+    }
+}
 /// Welke baan een [`Job`] draait: elke baan doet zijn jobs één voor één, op volgorde.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lane {

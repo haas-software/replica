@@ -17,7 +17,11 @@
 //!   vóór elke store-call en tijdens de integriteitscontrole ([`Ticking`]),
 //!   en gaan de GET's in rondes die zich aanpassen aan hun duur: een herstel
 //!   langer dan twee derde lease verloor anders de lease bij de volgende
-//!   database (EasyFlor, 16-11-2026, 256 MiB op QEMU).
+//!   database (EasyFlor, 16-11-2026, 256 MiB op QEMU). Tijdens één lange
+//!   call houdt de waiter van de store de lease bij ([`KeepLease`],
+//!   [`Group::with_keep_lease`]); is hij toch verloren, dan stopt het herstel
+//!   bij de call waar dat bleek, met [`Report::lost`] op die database
+//!   (EasyFlor, 23-11-2026: één GET van 39 s, lease 30 s).
 //! - **De lease bijhouden** ([`Group::keep_lease`]): hoogstens eens per
 //!   seconde gekeken, vernieuwd op leeftijd, ook uit de progresscallback van
 //!   een lang statement. Voorbij de schrijfdeadline maar vóór het verlopen
@@ -48,7 +52,7 @@
 //! eigenaar, de SQL-kant (de [`Vfs`] per database) en de banen delen alleen
 //! `RefCell`'s die per stap kort geleend worden (het rustprotocol van
 //! [`crate::owner`]). De host meldt wat er gebeurt via [`Report`].
-use crate::lanes::{DynStorage, DynStore, Job, Lane, LaneSide, Offload};
+use crate::lanes::{DynStorage, DynStore, Job, Keep, KeepLease, Lane, LaneSide, Offload};
 use crate::local::Name;
 use crate::object::{Object, Parallel, Replies, Store, StoreError};
 use crate::owner::{Config as ReplicaConfig, Maintenance, Pending, Replica, Synced, Vfs};
@@ -58,7 +62,13 @@ use crate::replication::Uploaded;
 use crate::time::Time;
 use crate::writer::{self, Backend, Held, Writer};
 use crate::{Error, Result, marker};
-use alloc::{boxed::Box, format, rc::Rc, string::String, vec::Vec};
+use alloc::{
+    boxed::Box,
+    format,
+    rc::{Rc, Weak},
+    string::String,
+    vec::Vec,
+};
 use core::cell::{Cell, RefCell};
 use core::ffi::CStr;
 use replica_sqlite::{FileId, OpenFlags, Storage};
@@ -171,6 +181,14 @@ pub trait Report {
     fn failed(&self, file: &str, step: &str, error: Error);
     /// Een capture van `file` is gepubliceerd.
     fn published(&self, file: &str);
+    /// Eén store-call van de eigenaar bij `step` van `file` duurde `call_ms`,
+    /// langer dan de marge van de lease (een derde termijn); de laatste
+    /// bevestigde vernieuwing was toen `renewed_ms` geleden. Zonder banen en
+    /// zonder [`KeepLease`] kon de lease in die call niet vernieuwd worden;
+    /// volgt er [`Report::lost`], dan is dit de oorzaak. Standaard niets.
+    fn slow(&self, file: &str, step: &str, call_ms: i64, renewed_ms: i64) {
+        let _ = (file, step, call_ms, renewed_ms);
+    }
 }
 /// Controleert een herstelde scratchdatabase vóór die iets vervangt (de
 /// callback van Prepare). Het derde argument roept de controle aan terwijl
@@ -254,48 +272,102 @@ struct Member<D> {
     flight: Option<Slot<Landed>>,
 }
 /// De store tijdens een herstel in [`Replica::prepare_shared`] of een
-/// publicatie: vóór elke call vernieuwt hij de lease als die aan de beurt is.
+/// publicatie: vóór elke call vernieuwt hij de lease als die aan de beurt is,
+/// en vóór en na elke call kijkt hij of de lease nog staat.
 ///
 /// Replica herstelt in rondes: tot `parallel().requests` GET's tegelijk, dan
 /// elk deel uitpakken, hashen en schrijven, dan de volgende ronde. Binnen een
-/// ronde wordt niets vernieuwd, dus haar duur beslist: bij een herstel
-/// (`adapt`) beginnen de rondes bij één GET en verdubbelen ze zolang een hele
-/// ronde korter duurt dan een vierentwintigste lease, tot het eigen aantal
-/// van de store, en halveren ze als er een langer duurt dan een zesde. Alleen
-/// een enkel segment dat langer duurt dan de marge van de lease kan hem dan
-/// nog kosten. Een publicatie gebruikt het eigen aantal van de store.
-struct Renewing<'a, S: Bucket> {
+/// ronde vernieuwt de eigenaar zelf niets, dus haar duur beslist: bij een
+/// herstel (`adapt`) beginnen de rondes bij één GET en verdubbelen ze zolang
+/// een hele ronde korter duurt dan een vierentwintigste lease, tot wat de
+/// store nu geeft, en halveren ze als er een langer duurt dan een zesde. Een
+/// ronde is zo één wachtbeurt van de store (nooit breder dan zijn eigen
+/// `parallel`, anders deelt hij hem op in stukken na elkaar). Wat binnen één
+/// wachtbeurt nog lang kan duren (één segment dat zijn budget vol maakt),
+/// houdt de waiter van de store bij ([`KeepLease`]). Een publicatie gebruikt
+/// het eigen aantal van de store.
+///
+/// Is de lease verloren (overgenomen, of verlopen tijdens een lange call),
+/// dan faalt de call met [`StoreError::Cancelled`] en is `lost` gezet: een
+/// herstel stopt bij de call waar het gebeurde, in plaats van minutenlang
+/// door te lopen tot de volgende database de lease verloren vindt
+/// (EasyFlor, 23-11-2026). Een call langer dan de marge van de lease wordt
+/// gemeld ([`Report::slow`]).
+struct Renewing<'a, 'k, S: Bucket> {
     /// Per call geleend, zodat de controle tussendoor kan vernieuwen.
     store: &'a RefCell<S>,
     /// Vernieuwt de lease als die aan de beurt is ([`Group::keep_lease`]).
     tick: &'a dyn Fn(),
-    ttl_ms: u64,
-    /// Unix-milliseconden, voor de duur van een ronde.
-    millis: fn() -> i64,
+    /// De lease van de groep: de klok, de termijn en [`Keeper::standing`].
+    keeper: &'a Keeper<'k>,
+    /// De database en de stap, voor [`Report::slow`].
+    file: &'a str,
+    step: &'static str,
     /// Rondes die zich aan hun duur aanpassen (een herstel).
     adapt: bool,
     /// GET's in de volgende ronde.
     requests: usize,
     /// Wanneer de vorige ronde begon (Unix-ms).
     round_at: Option<i64>,
+    /// De lease bleek verloren; elke volgende call faalt meteen.
+    lost: bool,
 }
-impl<S: Bucket> Renewing<'_, S> {
-    fn renew(&mut self) {
+impl<'a, 'k, S: Bucket> Renewing<'a, 'k, S> {
+    fn new(
+        store: &'a RefCell<S>,
+        tick: &'a dyn Fn(),
+        keeper: &'a Keeper<'k>,
+        file: &'a str,
+        step: &'static str,
+        adapt: bool,
+    ) -> Self {
+        Renewing {
+            store,
+            tick,
+            keeper,
+            file,
+            step,
+            adapt,
+            requests: 1,
+            round_at: None,
+            lost: false,
+        }
+    }
+    /// Staat de lease niet meer (zie [`Standing::Lost`])? Blijvend.
+    fn is_lost(&mut self) -> bool {
+        if !self.lost && self.keeper.standing() == Standing::Lost {
+            self.lost = true;
+        }
+        self.lost
+    }
+    /// Eén call van de store: vernieuwen als het aan de beurt is, niet bij
+    /// een verloren lease, gemeten, en na afloop opnieuw de lease bekeken.
+    fn call<T>(
+        &mut self,
+        f: impl FnOnce(&mut S) -> core::result::Result<T, StoreError>,
+    ) -> core::result::Result<T, StoreError> {
         (self.tick)();
+        if self.is_lost() {
+            return Err(StoreError::Cancelled);
+        }
+        let at = (self.keeper.millis)();
+        let out = f(&mut self.store.borrow_mut());
+        self.keeper.timed(self.file, self.step, at);
+        if self.is_lost() {
+            return Err(StoreError::Cancelled);
+        }
+        out
     }
 }
-impl<S: Bucket> Store for Renewing<'_, S> {
+impl<S: Bucket> Store for Renewing<'_, '_, S> {
     fn put(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError> {
-        self.renew();
-        self.store.borrow_mut().put(key, bytes)
+        self.call(|s| s.put(key, bytes))
     }
     fn put_new(&mut self, key: &str, bytes: &[u8]) -> core::result::Result<(), StoreError> {
-        self.renew();
-        self.store.borrow_mut().put_new(key, bytes)
+        self.call(|s| s.put_new(key, bytes))
     }
     fn get(&mut self, key: &str, limit: usize) -> core::result::Result<Vec<u8>, StoreError> {
-        self.renew();
-        self.store.borrow_mut().get(key, limit)
+        self.call(|s| s.get(key, limit))
     }
     fn parallel(&self) -> Parallel {
         let own = self.store.borrow().parallel();
@@ -303,19 +375,19 @@ impl<S: Bucket> Store for Renewing<'_, S> {
             return own;
         }
         Parallel {
-            requests: self.requests,
+            // Niet breder dan de store nu geeft: dan is een ronde één wachtbeurt.
+            requests: self.requests.min(own.requests).max(1),
             ..own
         }
     }
     fn get_all(&mut self, keys: &[(&str, usize)]) -> core::result::Result<Replies, StoreError> {
         if !self.adapt {
-            self.renew();
-            return self.store.borrow_mut().get_all(keys);
+            return self.call(|s| s.get_all(keys));
         }
-        let now = (self.millis)();
+        let now = (self.keeper.millis)();
         if let Some(at) = self.round_at {
             let round = now.saturating_sub(at);
-            let slow = i64::try_from(self.ttl_ms / 6).unwrap_or(i64::MAX);
+            let slow = i64::try_from(self.keeper.ttl_ms / 6).unwrap_or(i64::MAX);
             let most = self.store.borrow().parallel().requests.max(1);
             self.requests = if round > slow {
                 (self.requests / 2).max(1)
@@ -326,39 +398,34 @@ impl<S: Bucket> Store for Renewing<'_, S> {
             };
         }
         self.round_at = Some(now);
-        self.renew();
-        self.store.borrow_mut().get_all(keys)
+        self.call(|s| s.get_all(keys))
     }
     fn rest(&mut self) {
         self.store.borrow_mut().rest();
     }
     fn delete(&mut self, key: &str) -> core::result::Result<(), StoreError> {
-        self.renew();
-        self.store.borrow_mut().delete(key)
+        self.call(|s| s.delete(key))
     }
     fn list(
         &mut self,
         prefix: &str,
         limit: usize,
     ) -> core::result::Result<Vec<Object>, StoreError> {
-        self.renew();
-        self.store.borrow_mut().list(prefix, limit)
+        self.call(|s| s.list(prefix, limit))
     }
     fn directories(
         &mut self,
         prefix: &str,
         limit: usize,
     ) -> core::result::Result<Vec<String>, StoreError> {
-        self.renew();
-        self.store.borrow_mut().directories(prefix, limit)
+        self.call(|s| s.directories(prefix, limit))
     }
     fn list_batch(
         &mut self,
         prefix: &str,
         limit: usize,
     ) -> core::result::Result<Vec<Object>, StoreError> {
-        self.renew();
-        self.store.borrow_mut().list_batch(prefix, limit)
+        self.call(|s| s.list_batch(prefix, limit))
     }
 }
 /// Hoe lang een flush op de banen wacht voordat hij de rest op de eigenaar
@@ -387,16 +454,22 @@ pub fn time_at(ms: i64) -> Result<Time> {
         u32::try_from(ms.rem_euclid(1000) * 1_000_000).unwrap_or(0),
     )
 }
-/// De databases van één domein onder één schrijverlease (zie de moduledocs).
-pub struct Group<'h, D: Storage, S: Bucket> {
-    config: Config,
-    store: Rc<RefCell<S>>,
+/// De lease van een groep en de boekhouding van zijn store-stappen: alles
+/// wat [`Group::keep_lease`] raakt. Gedeeld (een `Rc`) zodat de waiter van de
+/// store hem ook tijdens één lange call van de eigenaar kan bijhouden
+/// ([`KeepLease`], via een zwakke verwijzing); verder is de groep de enige
+/// gebruiker. Alles is `Cell` of kort geleende `RefCell`, nooit over een
+/// store- of opslagcall heen.
+struct Keeper<'h> {
+    /// De termijn van de lease (ms).
+    ttl_ms: u64,
+    /// Seconden tussen twee publicaties van één database.
+    interval: u32,
+    /// `<prefix>/<domain>/lease`.
+    key: String,
     millis: fn() -> i64,
     report: Box<dyn Report + 'h>,
     writer: Rc<RefCell<Writer>>,
-    files: RefCell<Vec<Member<D>>>,
-    /// Wat de store per database bevestigde.
-    publications: Rc<Publications>,
     /// Wanneer [`Group::keep_lease`] het laatst naar de lease keek (Unix-ms).
     lease_tried: Cell<i64>,
     /// Store-stappen (vernieuwingen, publicaties) die op rij mislukten en
@@ -413,110 +486,38 @@ pub struct Group<'h, D: Storage, S: Bucket> {
     /// De lease is overgenomen of verlopen, en dat is gemeld.
     fenced: Cell<bool>,
     /// Waar het store-werk buiten de stack van de eigenaar loopt; `None`: erop.
-    offload: Option<&'h dyn Offload>,
+    offload: Cell<Option<&'h dyn Offload>>,
     /// Een [`Lane::Lease`]-vernieuwing die de eigenaar nog niet terugnam.
     lease_flight: RefCell<Option<Slot<Result>>>,
     /// Wanneer een baan de store het laatst hoorde antwoorden (Unix-ms): de
     /// eigenaar roept de store in rust (een onzeker manifest) alleen aan
     /// zolang die antwoordt.
     answered_at: Cell<i64>,
+    /// Een vernieuwing op de eigenaar zelf loopt ([`Group::renew`]): de waiter
+    /// zet er geen tweede op de leasebaan naast.
+    renewing: Cell<bool>,
 }
-impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
-    /// De groep van `config.domain` met de geclaimde lease `writer`
-    /// ([`crate::writer::claim`]), op `store`. `millis` is de wandklok
-    /// (Unix-milliseconden), `report` hoort wat er gebeurt.
-    pub fn new(
-        config: Config,
-        store: Rc<RefCell<S>>,
-        writer: Rc<RefCell<Writer>>,
-        millis: fn() -> i64,
-        report: Box<dyn Report + 'h>,
-    ) -> Self {
-        Group {
-            config,
-            store,
-            millis,
-            report,
-            writer,
-            files: RefCell::new(Vec::new()),
-            publications: Rc::new(Publications::new()),
-            lease_tried: Cell::new(i64::MIN),
-            retries: Cell::new(0),
-            retry_at: Cell::new(i64::MIN),
-            failing_since: Cell::new(0),
-            lease_failing: Cell::new(false),
-            files_failing: RefCell::new(Vec::new()),
-            fenced: Cell::new(false),
-            offload: None,
-            lease_flight: RefCell::new(None),
-            answered_at: Cell::new(i64::MIN),
-        }
-    }
-    /// De uploads, het onderhoud en de lease lopen op de banen van `offload`
-    /// (zie [`crate::lanes`]); zonder op de eigenaar.
-    #[must_use]
-    pub fn with_offload(mut self, offload: &'h dyn Offload) -> Self {
-        self.offload = Some(offload);
-        self
-    }
-    /// De publicaties in `publications` bijhouden (gedeeld met wie wacht)
-    /// in plaats van in een eigen [`Publications`].
-    #[must_use]
-    pub fn with_publications(mut self, publications: Rc<Publications>) -> Self {
-        self.publications = publications;
-        self
-    }
-    /// Wat de store per database bevestigde.
-    pub fn publications(&self) -> &Rc<Publications> {
-        &self.publications
-    }
-    /// De configuratie.
-    pub fn config(&self) -> &Config {
-        &self.config
-    }
-    /// De lease van de groep.
-    pub fn writer(&self) -> &Rc<RefCell<Writer>> {
-        &self.writer
-    }
+impl Keeper<'_> {
     fn now(&self) -> Result<Time> {
         time_at((self.millis)())
-    }
-    /// Is `file` al voorbereid?
-    pub fn has(&self, file: &str) -> bool {
-        self.files.borrow().iter().any(|f| f.name == file)
-    }
-    /// Heeft een database iets te publiceren ([`Replica::has_changes`])?
-    pub fn has_changes(&self) -> bool {
-        self.files.borrow().iter().any(|f| f.replica.has_changes())
-    }
-    /// De getrackte VFS van `file` over `b` ([`Replica::vfs`]).
-    pub fn vfs<'a, B: Storage>(&self, file: &str, b: &'a mut B) -> Result<Vfs<'a, B>> {
-        let files = self.files.borrow();
-        let member = files.iter().find(|f| f.name == file).ok_or(Error::State)?;
-        member.replica.vfs(b)
-    }
-    /// Eén vernieuwing (of herovering) van de lease, nu, op de store van de eigenaar.
-    fn renew(&self) -> Result {
-        let now = self.now()?;
-        let mut store = self.store.try_borrow_mut().map_err(|_| Error::Busy)?;
-        let key = self.config.lease_key();
-        let mut lease = store
-            .lease(&key, self.config.ttl_ms)
-            .map_err(Error::Object)?;
-        writer::renew_or_reclaim(&self.writer, &mut lease, now)
     }
     /// Het eind van de lease zoals wij hem het laatst schreven (Unix-ms): de
     /// schrijfdeadline plus de marge van een derde termijn.
     fn expiry(&self) -> Option<i64> {
         let w = self.writer.try_borrow().ok()?;
-        let end = w.deadline().saturating_add(self.config.ttl_ms / 3);
+        let end = w.deadline().saturating_add(self.ttl_ms / 3);
         Some(i64::try_from(end).unwrap_or(i64::MAX))
+    }
+    /// De laatste bevestigde vernieuwing (Unix-ms), zoals de Writer hem kent.
+    fn confirmed(&self) -> Option<i64> {
+        let end = self.expiry()?;
+        Some(end.saturating_sub(i64::try_from(self.ttl_ms).unwrap_or(i64::MAX)))
     }
     fn is_lost(&self) -> bool {
         self.writer.try_borrow().is_ok_and(|w| w.is_lost())
     }
-    /// Waar de lease nu staat (zie [`Standing`]).
-    pub fn standing(&self) -> Standing {
+    /// Zie [`Group::standing`].
+    fn standing(&self) -> Standing {
         let at = (self.millis)();
         let Ok(w) = self.writer.try_borrow() else {
             // Alleen geleend voor de boekhouding van een vernieuwing: zoals het was.
@@ -533,6 +534,14 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
             Standing::Held(u64::try_from(wait).unwrap_or(1000))
         }
     }
+    /// Waarom de lease verloren is: een andere houder, of verlopen.
+    fn loss(&self) -> Failure {
+        if self.is_lost() {
+            Failure::Taken
+        } else {
+            Failure::Expired
+        }
+    }
     /// Wat een mislukte store-stap van de schrijver betekent (zie [`Failure`]).
     fn classify(&self, e: &Error) -> Failure {
         if self.is_lost() {
@@ -546,6 +555,17 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
             _ => Failure::Other,
         }
     }
+    /// Een store-call van de eigenaar die op `at` (Unix-ms) begon, is klaar:
+    /// duurde hij langer dan de marge van de lease, dan [`Report::slow`].
+    fn timed(&self, file: &str, step: &str, at: i64) {
+        let now = (self.millis)();
+        let took = now.saturating_sub(at);
+        if took < i64::try_from(self.ttl_ms / 3).unwrap_or(i64::MAX) {
+            return;
+        }
+        let renewed = self.confirmed().map_or(-1, |c| now.saturating_sub(c));
+        self.report.slow(file, step, took, renewed);
+    }
     /// Een store-stap die mislukte en opnieuw geprobeerd wordt: de backoff en
     /// [`Report::retry`]. De lease na de backoff; de publicatie van een
     /// database ook na zijn eigen interval (een mislukte poging krijgt het
@@ -557,7 +577,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
             self.failing_since.set(at);
         }
         self.retries.set(n);
-        let mut backoff = backoff_ms(n, self.config.ttl_ms);
+        let mut backoff = backoff_ms(n, self.ttl_ms);
         if matches!(self.standing(), Standing::Held(_)) {
             // Writes wachten: de lease snel terug zodra de store antwoordt.
             backoff = backoff.min(2000);
@@ -571,7 +591,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
             if !failing.iter().any(|f| f == file) {
                 failing.push(String::from(file));
             }
-            backoff.max(i64::from(self.config.interval) * 1000)
+            backoff.max(i64::from(self.interval) * 1000)
         };
         self.report.retry(file, step, e, failure, n, next);
     }
@@ -604,50 +624,28 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
         self.report.failed(file, step, e);
         e
     }
-    /// Vernieuwt de lease als die aan de beurt is (eens per zesde termijn),
-    /// hoogstens eens per seconde bekeken: de host roept dit waar SQLite lang
-    /// loopt tussen twee rustmomenten (de progresscallback van een verzoek),
-    /// dus het kost een klokleesbeurt. De schrijfdeadline ligt twee derde
-    /// termijn na de laatste vernieuwing (20 s van 30); een verzoek mag langer
-    /// lopen, en rust komt pas tussen verzoeken. Na een fout wacht dit de
-    /// backoff af, zodat een store die niet antwoordt niet elk verzoek bij
-    /// elke controle ophoudt.
-    ///
-    /// Met banen is de vernieuwing een [`Lane::Lease`]-job: hier in de rij gezet
-    /// (en de banen krijgen een beurt), nooit afgewacht; de uitkomst komt
-    /// bij de volgende keer terug.
-    pub fn keep_lease(&self) {
+    /// Mag [`Group::keep_lease`] nu naar de lease kijken: hoogstens eens per
+    /// seconde, niet in de backoff na een fout, niet voor een verloren lease
+    /// (gefencet bij de volgende controle van de host; geen store-call voor
+    /// een lease die we niet kunnen houden). `Some(nu)` als hij mag.
+    fn look(&self) -> Option<i64> {
         let at = (self.millis)();
         if at.saturating_sub(self.lease_tried.get()) < 1000 || at < self.retry_at.get() {
-            return;
+            return None;
         }
         self.lease_tried.set(at);
-        if self.standing() == Standing::Lost {
-            // Gefencet bij de volgende controle van de host; geen store-call
-            // voor een lease die we niet kunnen houden.
-            return;
-        }
-        if let Some(off) = self.offload {
-            // Een verloren lease wordt hier gemeld en bij de volgende
-            // controle van de host gefencet ([`Group::standing`]).
-            let _ = self.lease_landed();
-            if self.standing() != Standing::Lost && self.lease_due(at) && self.push_lease(off) {
-                off.breathe();
-            }
-            return;
-        }
-        match self.renew() {
-            Ok(()) => self.lease_failing.set(false),
-            Err(Error::Busy) => {}
-            Err(e) => match self.classify(&e) {
-                f @ (Failure::Transport | Failure::Deadline) => self.retry("lease", "renew", e, f),
-                f @ (Failure::Taken | Failure::Expired) => {
-                    self.lost("lease", "renew", Some(e), f);
-                }
-                Failure::Other => {
-                    self.failed("lease", "renew", e);
-                }
-            },
+        (self.standing() != Standing::Lost).then_some(at)
+    }
+    /// Het bijhouden met banen: een vernieuwing die de leasebaan afmaakte
+    /// terugnemen, en een nieuwe in de rij zetten als die aan de beurt is (de
+    /// banen krijgen dan een beurt). Nooit afgewacht, geen store-call op de
+    /// eigenaar.
+    fn keep_on_lanes(&self, off: &dyn Offload, at: i64) {
+        // Een verloren lease wordt hier gemeld en bij de volgende controle
+        // van de host gefencet ([`Group::standing`]).
+        let _ = self.lease_landed();
+        if self.standing() != Standing::Lost && self.lease_due(at) && self.push_lease(off) {
+            off.breathe();
         }
     }
     /// Is een vernieuwing aan de beurt op `at` (Unix-ms)? Zoals de Writer het
@@ -657,7 +655,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
         let Ok(w) = self.writer.try_borrow() else {
             return false;
         };
-        let ttl = self.config.ttl_ms;
+        let ttl = self.ttl_ms;
         // `Writer::deadline` is de laatste bevestiging plus twee derde termijn.
         let confirmed = w.deadline().saturating_add(ttl / 3).saturating_sub(ttl);
         u64::try_from(at).is_ok_and(|at| at.saturating_sub(confirmed) >= ttl / 6)
@@ -668,8 +666,8 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
             return false;
         }
         let writer = self.writer.clone();
-        let key = self.config.lease_key();
-        let ttl = self.config.ttl_ms;
+        let key = self.key.clone();
+        let ttl = self.ttl_ms;
         let millis = self.millis;
         let slot: Slot<Result> = Rc::new(RefCell::new(None));
         let back = slot.clone();
@@ -731,6 +729,203 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
             },
         }
     }
+}
+/// De waiter van de store van de eigenaar houdt de lease bij terwijl één
+/// call wacht ([`KeepLease`]). Alleen met banen: zonder vernieuwt de eigenaar
+/// op zijn eigen store, en die wacht nu.
+impl Keep for Keeper<'_> {
+    fn keep(&self) {
+        let Some(off) = self.offload.get() else {
+            return;
+        };
+        if self.renewing.get() {
+            return;
+        }
+        if let Some(at) = self.look() {
+            self.keep_on_lanes(off, at);
+        }
+    }
+}
+/// De databases van één domein onder één schrijverlease (zie de moduledocs).
+pub struct Group<'h, D: Storage, S: Bucket> {
+    config: Config,
+    store: Rc<RefCell<S>>,
+    files: RefCell<Vec<Member<D>>>,
+    /// Wat de store per database bevestigde.
+    publications: Rc<Publications>,
+    /// De lease en de boekhouding van de store-stappen.
+    keeper: Rc<Keeper<'h>>,
+}
+impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
+    /// De groep van `config.domain` met de geclaimde lease `writer`
+    /// ([`crate::writer::claim`]), op `store`. `millis` is de wandklok
+    /// (Unix-milliseconden), `report` hoort wat er gebeurt.
+    pub fn new(
+        config: Config,
+        store: Rc<RefCell<S>>,
+        writer: Rc<RefCell<Writer>>,
+        millis: fn() -> i64,
+        report: Box<dyn Report + 'h>,
+    ) -> Self {
+        let keeper = Rc::new(Keeper {
+            ttl_ms: config.ttl_ms,
+            interval: config.interval,
+            key: config.lease_key(),
+            millis,
+            report,
+            writer,
+            lease_tried: Cell::new(i64::MIN),
+            retries: Cell::new(0),
+            retry_at: Cell::new(i64::MIN),
+            failing_since: Cell::new(0),
+            lease_failing: Cell::new(false),
+            files_failing: RefCell::new(Vec::new()),
+            fenced: Cell::new(false),
+            offload: Cell::new(None),
+            lease_flight: RefCell::new(None),
+            answered_at: Cell::new(i64::MIN),
+            renewing: Cell::new(false),
+        });
+        Group {
+            config,
+            store,
+            files: RefCell::new(Vec::new()),
+            publications: Rc::new(Publications::new()),
+            keeper,
+        }
+    }
+    /// De uploads, het onderhoud en de lease lopen op de banen van `offload`
+    /// (zie [`crate::lanes`]); zonder op de eigenaar.
+    #[must_use]
+    pub fn with_offload(self, offload: &'h dyn Offload) -> Self {
+        self.keeper.offload.set(Some(offload));
+        self
+    }
+    /// De store van de eigenaar houdt deze lease bij terwijl één van zijn
+    /// calls wacht: `keep` is de haak van die store (zie [`KeepLease`]; op
+    /// HopOS `replica_hopos::keep::Keeping`). Alleen met banen
+    /// ([`Group::with_offload`]): de vernieuwing gaat dan op de leasebaan,
+    /// zoals bij [`Group::keep_lease`]. Zonder banen doet de haak niets.
+    #[must_use]
+    pub fn with_keep_lease(self, keep: &KeepLease<'h>) -> Self {
+        let weak: Weak<dyn Keep + 'h> = Rc::downgrade(&self.keeper) as Weak<dyn Keep + 'h>;
+        keep.hold(weak);
+        self
+    }
+    /// De publicaties in `publications` bijhouden (gedeeld met wie wacht)
+    /// in plaats van in een eigen [`Publications`].
+    #[must_use]
+    pub fn with_publications(mut self, publications: Rc<Publications>) -> Self {
+        self.publications = publications;
+        self
+    }
+    /// Wat de store per database bevestigde.
+    pub fn publications(&self) -> &Rc<Publications> {
+        &self.publications
+    }
+    /// De configuratie.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+    /// De lease van de groep.
+    pub fn writer(&self) -> &Rc<RefCell<Writer>> {
+        &self.keeper.writer
+    }
+    fn now(&self) -> Result<Time> {
+        self.keeper.now()
+    }
+    /// Is `file` al voorbereid?
+    pub fn has(&self, file: &str) -> bool {
+        self.files.borrow().iter().any(|f| f.name == file)
+    }
+    /// Heeft een database iets te publiceren ([`Replica::has_changes`])?
+    pub fn has_changes(&self) -> bool {
+        self.files.borrow().iter().any(|f| f.replica.has_changes())
+    }
+    /// De getrackte VFS van `file` over `b` ([`Replica::vfs`]).
+    pub fn vfs<'a, B: Storage>(&self, file: &str, b: &'a mut B) -> Result<Vfs<'a, B>> {
+        let files = self.files.borrow();
+        let member = files.iter().find(|f| f.name == file).ok_or(Error::State)?;
+        member.replica.vfs(b)
+    }
+    /// Eén vernieuwing (of herovering) van de lease, nu, op de store van de eigenaar.
+    fn renew(&self) -> Result {
+        let now = self.now()?;
+        let mut store = self.store.try_borrow_mut().map_err(|_| Error::Busy)?;
+        let key = self.config.lease_key();
+        let mut lease = store
+            .lease(&key, self.config.ttl_ms)
+            .map_err(Error::Object)?;
+        self.keeper.renewing.set(true);
+        let out = writer::renew_or_reclaim(&self.keeper.writer, &mut lease, now);
+        self.keeper.renewing.set(false);
+        out
+    }
+    /// Waar de lease nu staat (zie [`Standing`]).
+    pub fn standing(&self) -> Standing {
+        self.keeper.standing()
+    }
+    fn classify(&self, e: &Error) -> Failure {
+        self.keeper.classify(e)
+    }
+    fn retry(&self, file: &str, step: &str, e: Error, failure: Failure) {
+        self.keeper.retry(file, step, e, failure);
+    }
+    fn recovered(&self) {
+        self.keeper.recovered();
+    }
+    fn lost(&self, file: &str, step: &str, e: Option<Error>, failure: Failure) -> Error {
+        self.keeper.lost(file, step, e, failure)
+    }
+    fn failed(&self, file: &str, step: &str, e: Error) -> Error {
+        self.keeper.failed(file, step, e)
+    }
+    /// Vernieuwt de lease als die aan de beurt is (eens per zesde termijn),
+    /// hoogstens eens per seconde bekeken: de host roept dit waar SQLite lang
+    /// loopt tussen twee rustmomenten (de progresscallback van een verzoek),
+    /// dus het kost een klokleesbeurt. De schrijfdeadline ligt twee derde
+    /// termijn na de laatste vernieuwing (20 s van 30); een verzoek mag langer
+    /// lopen, en rust komt pas tussen verzoeken. Na een fout wacht dit de
+    /// backoff af, zodat een store die niet antwoordt niet elk verzoek bij
+    /// elke controle ophoudt.
+    ///
+    /// Met banen is de vernieuwing een [`Lane::Lease`]-job: hier in de rij gezet
+    /// (en de banen krijgen een beurt), nooit afgewacht; de uitkomst komt
+    /// bij de volgende keer terug. Tijdens één lange store-call van de
+    /// eigenaar doet de waiter van de store dit ([`Group::with_keep_lease`]).
+    pub fn keep_lease(&self) {
+        let Some(at) = self.keeper.look() else {
+            return;
+        };
+        if let Some(off) = self.keeper.offload.get() {
+            self.keeper.keep_on_lanes(off, at);
+            return;
+        }
+        match self.renew() {
+            Ok(()) => self.keeper.lease_failing.set(false),
+            Err(Error::Busy) => {}
+            Err(e) => match self.classify(&e) {
+                f @ (Failure::Transport | Failure::Deadline) => self.retry("lease", "renew", e, f),
+                f @ (Failure::Taken | Failure::Expired) => {
+                    self.lost("lease", "renew", Some(e), f);
+                }
+                Failure::Other => {
+                    self.failed("lease", "renew", e);
+                }
+            },
+        }
+    }
+    /// Neemt een vernieuwing terug die [`Lane::Lease`] afmaakte.
+    fn lease_landed(&self) -> Result {
+        self.keeper.lease_landed()
+    }
+    /// Zet een vernieuwing op [`Lane::Lease`], tenzij er een onderweg is; `true`: gezet.
+    fn push_lease(&self, off: &dyn Offload) -> bool {
+        self.keeper.push_lease(off)
+    }
+    fn lease_due(&self, at: i64) -> bool {
+        self.keeper.lease_due(at)
+    }
     /// Zet de upload van `pending` op [`Lane::Data`].
     fn push_upload(&self, off: &dyn Offload, pending: Pending) -> Slot<Landed> {
         let slot: Slot<Landed> = Rc::new(RefCell::new(None));
@@ -790,7 +985,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
         c.compress = self.config.compress;
         // Met banen is het onderhoud een eigen job ([`Group::rest`]); inline
         // liep het binnen een publicatie op de eigenaar, eens per minuut per database.
-        c.background_maintenance = self.offload.is_some();
+        c.background_maintenance = self.keeper.offload.get().is_some();
         Ok(c)
     }
     /// Bereidt `file` eenmaal voor op zijn sync-handvat `sync`: hersteld uit
@@ -802,24 +997,25 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
     /// is, de GET's in rondes die zich aan hun duur aanpassen (zie de
     /// moduledocs), en elke opslagcall en elke pagina die `verify` leest
     /// tikt ook ([`Ticking`]). Een mislukte vernieuwing is niet de fout van
-    /// het herstel: een verloren lease faalt bij de volgende controle.
+    /// het herstel. Een verloren lease wel: vóór en na elke store-call wordt
+    /// gekeken, en is hij overgenomen of verlopen (bijvoorbeeld tijdens één
+    /// lange GET), dan stopt het herstel daar met [`Error::LeaseLost`] en
+    /// [`Report::lost`] op deze database en stap `prepare`, met de oorzaak
+    /// (`taken` of `expired`; een call langer dan de marge van de lease is
+    /// vooraf gemeld met [`Report::slow`]). Zo ook als de lease al verloren
+    /// was.
     pub fn prepare(&self, file: &str, mut sync: D, verify: &Verify<'_, D>) -> Result<bool> {
         if self.has(file) {
             return Ok(false);
         }
+        if self.standing() == Standing::Lost {
+            return Err(self.lost(file, "prepare", None, self.keeper.loss()));
+        }
         let config = self.replica_config(file)?;
         let now = self.now()?;
-        let replica = {
-            let tick = || self.keep_lease();
-            let mut renewing = Renewing {
-                store: &self.store,
-                tick: &tick,
-                ttl_ms: self.config.ttl_ms,
-                millis: self.millis,
-                adapt: true,
-                requests: 1,
-                round_at: None,
-            };
+        let tick = || self.keep_lease();
+        let mut renewing = Renewing::new(&self.store, &tick, &self.keeper, file, "prepare", true);
+        let prepared = {
             // Ook elke opslagcall van Prepare tikt: na de controle kopieert
             // hij de scratch over het doel (64 KiB per keer), even lang.
             let mut storage = Ticking {
@@ -829,13 +1025,17 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
             Replica::prepare_shared(
                 &mut storage,
                 &mut renewing,
-                self.writer.clone(),
+                self.keeper.writer.clone(),
                 config,
                 now,
                 |b, name| verify(&mut *b.inner, name, &tick),
             )
+        };
+        if renewing.is_lost() {
+            // De fout is de lease, op de stap waar hij verloren ging.
+            return Err(self.lost(file, "prepare", None, self.keeper.loss()));
         }
-        .map_err(|e| self.failed(file, "prepare", e))?;
+        let replica = prepared.map_err(|e| self.failed(file, "prepare", e))?;
         let restored = replica.status().reason == Reason::Restored;
         crate::reserve(&mut self.files.borrow_mut(), 1)?;
         self.files.borrow_mut().push(Member {
@@ -873,7 +1073,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
         self.sync(true)
     }
     fn sync(&self, all: bool) -> Result {
-        if let Some(off) = self.offload {
+        if let Some(off) = self.keeper.offload.get() {
             self.sync_lanes(off, all)?;
             if !all {
                 return Ok(());
@@ -881,15 +1081,10 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
         }
         match self.standing() {
             Standing::Lost => {
-                let failure = if self.is_lost() {
-                    Failure::Taken
-                } else {
-                    Failure::Expired
-                };
-                return Err(self.lost("lease", "renew", None, failure));
+                return Err(self.lost("lease", "renew", None, self.keeper.loss()));
             }
             // In de backoff: het volgende rustmoment daarna probeert opnieuw.
-            _ if !all && (self.millis)() < self.retry_at.get() => return Ok(()),
+            _ if !all && (self.keeper.millis)() < self.keeper.retry_at.get() => return Ok(()),
             _ => {}
         }
         if let Err(e) = self.renew() {
@@ -904,7 +1099,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
                 Failure::Other => Err(self.failed("lease", "renew", e)),
             };
         }
-        self.lease_failing.set(false);
+        self.keeper.lease_failing.set(false);
         // Elke store-call van een publicatie vernieuwt de lease als die aan de
         // beurt is: één ronde van meer databases (of één grote snapshot) kan
         // langer duren dan de schrijfdeadline.
@@ -923,15 +1118,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
             }
             // Per database: een vernieuwing tijdens de vorige publicatie schoof de lease op.
             let now = self.now()?;
-            let mut store = Renewing {
-                store: &self.store,
-                tick: &tick,
-                ttl_ms: self.config.ttl_ms,
-                millis: self.millis,
-                adapt: false,
-                requests: 1,
-                round_at: None,
-            };
+            let mut store = Renewing::new(&self.store, &tick, &self.keeper, &f.name, "sync", false);
             let out = if all {
                 if f.replica.has_changes() {
                     f.replica.sync(&mut f.sync, &mut store, now).map(Some)
@@ -941,15 +1128,23 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
             } else {
                 f.replica.tick(&mut f.sync, &mut store, now)
             };
+            if store.is_lost() {
+                // Overgenomen of verlopen midden in de publicatie: daar gemeld.
+                Self::mirror(&self.publications, f);
+                return Err(self.lost(&f.name, "sync", None, self.keeper.loss()));
+            }
             if matches!(out, Ok(Some(_))) {
                 // Een beurt van deze database lukte: de store antwoordt hem weer.
-                self.files_failing.borrow_mut().retain(|n| *n != f.name);
+                self.keeper
+                    .files_failing
+                    .borrow_mut()
+                    .retain(|n| *n != f.name);
             }
             // De nummers van de eigenaar: welke capture begon en welke landde.
             Self::mirror(&self.publications, f);
             match out {
                 Ok(Some(s)) if s.published => {
-                    self.report.published(&f.name);
+                    self.keeper.report.published(&f.name);
                 }
                 Ok(_) => {}
                 Err(e) => match self.classify(&e) {
@@ -1000,21 +1195,16 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
     /// banen ([`Offload::settle`]), terugnemen wat ze deden, niets beginnen.
     fn sync_lanes(&self, off: &dyn Offload, all: bool) -> Result {
         if self.standing() == Standing::Lost {
-            let failure = if self.is_lost() {
-                Failure::Taken
-            } else {
-                Failure::Expired
-            };
-            return Err(self.lost("lease", "renew", None, failure));
+            return Err(self.lost("lease", "renew", None, self.keeper.loss()));
         }
         if all {
             off.settle(SETTLE_MS);
         }
         self.lease_landed()?;
-        let at = (self.millis)();
-        let backoff = at < self.retry_at.get();
+        let at = (self.keeper.millis)();
+        let backoff = at < self.keeper.retry_at.get();
         if !all && !backoff && self.lease_due(at) && self.push_lease(off) {
-            self.lease_tried.set(at);
+            self.keeper.lease_tried.set(at);
         }
         let valid = self.standing() == Standing::Valid;
         let mut files = self.files.borrow_mut();
@@ -1038,7 +1228,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
                 let (step, out) = match l {
                     Landed::Upload(pending, uploaded) => {
                         if uploaded.is_ok() {
-                            self.answered_at.set(at);
+                            self.keeper.answered_at.set(at);
                         }
                         let mut store = self.store.borrow_mut();
                         let out =
@@ -1048,7 +1238,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
                     }
                     Landed::Maintained(round) => {
                         if round.is_ok() {
-                            self.answered_at.set(at);
+                            self.keeper.answered_at.set(at);
                         }
                         ("maintain", f.replica.maintenance_finish(&mut f.sync, round))
                     }
@@ -1058,9 +1248,12 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
                 Self::mirror(&self.publications, f);
                 match out {
                     Ok(s) => {
-                        self.files_failing.borrow_mut().retain(|n| *n != f.name);
+                        self.keeper
+                            .files_failing
+                            .borrow_mut()
+                            .retain(|n| *n != f.name);
                         if s.published {
-                            self.report.published(&f.name);
+                            self.keeper.report.published(&f.name);
                         }
                     }
                     Err(e) => {
@@ -1078,7 +1271,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
                 // Een onzeker manifest wordt in `begin` opgelost, in rust, met
                 // store-calls: alleen zolang de banen de store horen antwoorden.
                 let uncertain = f.replica.try_marker().is_ok_and(|m| m.uncertain != 0);
-                if uncertain && at.saturating_sub(self.answered_at.get()) > ANSWERED_MS {
+                if uncertain && at.saturating_sub(self.keeper.answered_at.get()) > ANSWERED_MS {
                     continue;
                 }
                 let begun = {
@@ -1093,7 +1286,11 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
                         f.flight = Some(self.push_upload(off, pending));
                     }
                     // Niets veranderd: niets van deze database wacht op de store.
-                    Ok(None) => self.files_failing.borrow_mut().retain(|n| *n != f.name),
+                    Ok(None) => self
+                        .keeper
+                        .files_failing
+                        .borrow_mut()
+                        .retain(|n| *n != f.name),
                     Err(e) => {
                         if let Some(e) = self.lane_failed(&f.name, "capture", e)? {
                             first.get_or_insert(e);
@@ -1140,10 +1337,14 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
     /// blijft in de dirty logs: de volgende eigenaar op dezelfde mappen zet
     /// het voort (`Continued`). Geef de lease daarna vrij met [`release`].
     pub fn close(self) -> Option<Held> {
-        let Group { files, writer, .. } = self;
+        let Group { files, keeper, .. } = self;
         for mut f in files.into_inner() {
             f.replica.close();
         }
+        // De haak van de store ([`KeepLease`]) houdt alleen een zwakke
+        // verwijzing: met de keeper gaat ook zijn deel van de Writer.
+        let writer = keeper.writer.clone();
+        drop(keeper);
         Held::take(writer)
     }
 }
