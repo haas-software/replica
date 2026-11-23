@@ -14,7 +14,7 @@ use replica_core::writer::{
     Backend, LeaseState,
     discovery::{self, wire},
 };
-use replica_sqlite::asynchronous::Suspend;
+use replica_sqlite::asynchronous::{Cancelled, Suspend};
 /// Gelijktijdige segment-GETs van een herstel of compactie, per store. Bunny
 /// Storage haalt ongeveer 10 MB/s per stroom; gemeten 05-10 vanaf het LAN met
 /// delen van 4 MiB: 1 stroom 10,6, 8 stromen 53 en 16 stromen 69 MB/s,
@@ -404,11 +404,13 @@ impl<T: Transport, W: Suspend> Lease<'_, T, W> {
                 ..leans3::PutOptions::default()
             }
         };
+        let key = self.key;
+        let sent = once_more(self.s3, |s3| {
+            s3.wait
+                .wait(s3.client.put(&mut s3.transport, key, body, &options))
+        });
         let s3 = &mut *self.s3;
-        match s3
-            .wait
-            .wait(s3.client.put(&mut s3.transport, self.key, body, &options))
-        {
+        match sent {
             // Zonder ETag kan niemand de volgende CAS doen.
             Ok(Ok(Some(etag))) if !etag.is_empty() => Ok(etag),
             Ok(Err(leans3::Error::PreconditionFailed)) => Err(discovery::Error::LeaseHeld),
@@ -451,11 +453,13 @@ impl<T: Transport, W: Suspend> Lease<'_, T, W> {
     fn delete_if(&mut self, handle: &str) -> discovery::Result {
         self.s3.ready().map_err(|_| discovery::Error::Unreachable)?;
         let options = leans3::DeleteOptions { if_match: handle };
+        let key = self.key;
+        let sent = once_more(self.s3, |s3| {
+            s3.wait
+                .wait(s3.client.delete(&mut s3.transport, key, &options))
+        });
         let s3 = &mut *self.s3;
-        match s3
-            .wait
-            .wait(s3.client.delete(&mut s3.transport, self.key, &options))
-        {
+        match sent {
             Ok(Ok(())) => Ok(()),
             Ok(Err(leans3::Error::NotFound)) => Err(discovery::Error::NoLease),
             Ok(Err(leans3::Error::PreconditionFailed)) => Err(discovery::Error::LeaseHeld),
@@ -514,6 +518,48 @@ impl<T: Transport, W: Suspend> Backend for Lease<'_, T, W> {
             (Err(discovery::Error::LeaseHeld), Some(bare)) => self.delete_if(bare),
             (result, _) => result,
         }
+    }
+}
+/// Faalde een verzoek op een verbinding die dicht bleek (gesloten, gereset,
+/// of de stroom eindigde zonder antwoord)?
+fn is_closed(e: &leans3::Error) -> bool {
+    matches!(
+        e,
+        leans3::Error::Transport {
+            source: IoError::Closed | IoError::UnexpectedEof,
+            ..
+        }
+    )
+}
+/// Eén PUT of DELETE met zijn body in het geheugen, en één nieuwe poging als
+/// de verbinding dicht bleek binnen dezelfde seconde (op de signeerklok).
+///
+/// Een keep-alive-verbinding die een tijd stil was, is vaak al dicht aan de
+/// kant van S3; het eerste verzoek erop faalt dan meteen zonder de store te
+/// bereiken. `leanhttp` speelt zo'n verzoek alleen opnieuw af voor GET en
+/// HEAD, dus faalde een lease-vrijgave of een manifest-PUT na een stilte
+/// (EasyFlor P1 en p31-stall: de opvolger wachtte de hele TTL). Opnieuw is
+/// hier veilig: een PUT van dezelfde bytes naar dezelfde sleutel is
+/// idempotent; een tweede `If-None-Match: *` op een geland eerste geeft 412
+/// ([`StoreError::Exists`], `object::publish` leest dan terug); een tweede
+/// `If-Match` op een geland eerste geeft 412 (de lease heroverd via
+/// `Renewed::Reclaim`); een tweede DELETE vindt niets (succes). Alleen een
+/// snelle sluiting: een call die lang liep en dan brak, gaat niet opnieuw,
+/// zodat de controle van de schrijfdeadline vlak vóór de call blijft gelden.
+fn once_more<T: Transport, W: Suspend, R>(
+    s3: &mut S3<T, W>,
+    mut call: impl FnMut(&mut S3<T, W>) -> Result<Result<R, leans3::Error>, Cancelled>,
+) -> Result<Result<R, leans3::Error>, Cancelled> {
+    let clock = s3.client.now;
+    let started = clock.map(|now| now());
+    let first = call(s3)?;
+    let quick = match (clock, started) {
+        (Some(now), Some(at)) => now().saturating_sub(at) <= 1,
+        _ => false,
+    };
+    match first {
+        Err(ref e) if quick && is_closed(e) && s3.ready().is_ok() => call(s3),
+        first => Ok(first),
     }
 }
 fn map(e: leans3::Error) -> StoreError {
@@ -577,10 +623,10 @@ impl<T: Transport, W: Suspend> Store for S3<T, W> {
             return Err(StoreError::Limit);
         }
         let options = leans3::PutOptions::default();
-        match self
-            .wait
-            .wait(self.client.put(&mut self.transport, key, bytes, &options))
-        {
+        match once_more(self, |s3| {
+            s3.wait
+                .wait(s3.client.put(&mut s3.transport, key, bytes, &options))
+        }) {
             Ok(result) => result.map(|_| ()).map_err(map),
             Err(_) => {
                 self.poisoned = true;
@@ -600,10 +646,10 @@ impl<T: Transport, W: Suspend> Store for S3<T, W> {
             if_none_match: "*",
             ..leans3::PutOptions::default()
         };
-        match self
-            .wait
-            .wait(self.client.put(&mut self.transport, key, bytes, &options))
-        {
+        match once_more(self, |s3| {
+            s3.wait
+                .wait(s3.client.put(&mut s3.transport, key, bytes, &options))
+        }) {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(leans3::Error::PreconditionFailed)) => Err(StoreError::Exists),
             Ok(Err(e)) => Err(map(e)),
@@ -670,10 +716,10 @@ impl<T: Transport, W: Suspend> Store for S3<T, W> {
         self.rest();
         self.ready()?;
         let options = leans3::DeleteOptions::default();
-        match self
-            .wait
-            .wait(self.client.delete(&mut self.transport, key, &options))
-        {
+        match once_more(self, |s3| {
+            s3.wait
+                .wait(s3.client.delete(&mut s3.transport, key, &options))
+        }) {
             Ok(Ok(())) | Ok(Err(leans3::Error::NotFound)) => Ok(()),
             Ok(Err(e)) => Err(map(e)),
             Err(_) => {

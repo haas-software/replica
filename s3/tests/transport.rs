@@ -55,6 +55,8 @@ struct World {
     pause: bool,
     /// Ieder verzoek wacht één poll op het net, zoals een echte verbinding.
     slow: bool,
+    /// Zoveel verzoeken vinden nog een verbinding die dicht bleek.
+    closed: usize,
 }
 /// Eén keer Pending, daarna klaar: genoeg om overlap zichtbaar te maken.
 struct Once(bool);
@@ -107,6 +109,11 @@ impl Transport for Net {
                     h.value
                 ));
             }
+        }
+        let closed = self.0.borrow().closed;
+        if closed > 0 {
+            self.0.borrow_mut().closed = closed - 1;
+            return Err(IoError::Closed);
         }
         let pause = self.0.borrow().pause;
         if pause {
@@ -758,4 +765,70 @@ fn a_round_wider_than_the_gate_goes_in_pieces_within_the_byte_budget() {
     assert_eq!(gate.free(), (0, 80));
     s.rest();
     assert_eq!(gate.free(), (2, 100));
+}
+#[test]
+fn a_put_or_delete_on_a_connection_that_turned_out_closed_goes_once_more() {
+    use replica_core::writer::{Backend, LeaseState};
+    let world = Rc::new(RefCell::new(World::default()));
+    let mut s = replica_s3::S3::new(
+        client(),
+        {
+            let w = world.clone();
+            move || Net(w.clone())
+        },
+        Wait { cancel: false },
+        gate(),
+    )
+    .unwrap();
+    let close = |n: usize| world.borrow_mut().closed = n;
+    let sent = |method: &str, suffix: &str| {
+        world
+            .borrow()
+            .calls
+            .iter()
+            .filter(|c| c.starts_with(method) && c.ends_with(suffix))
+            .count()
+    };
+    // Een PUT: eerst dicht, dan geland.
+    close(1);
+    reply(&world, 200, Vec::new(), Some(0));
+    s.put("test/a", b"x").unwrap();
+    assert_eq!(sent("PUT ", "/test/a"), 2);
+    // `If-None-Match: *` op een eerste die toch landde: 412, het object bestaat.
+    close(1);
+    reply(&world, 412, Vec::new(), Some(0));
+    assert_eq!(s.put_new("test/b", b"x"), Err(StoreError::Exists));
+    assert_eq!(sent("PUT ", "/test/b"), 2);
+    // Een DELETE.
+    close(1);
+    reply(&world, 204, Vec::new(), Some(0));
+    s.delete("test/a").unwrap();
+    assert_eq!(sent("DELETE ", "/test/a"), 2);
+    // Tweemaal dicht: één nieuwe poging, dan de fout.
+    close(2);
+    assert_eq!(s.put("test/c", b"x"), Err(StoreError::Transport));
+    assert_eq!(sent("PUT ", "/test/c"), 2);
+    // Een antwoord (503) gaat niet opnieuw: de store hoorde het verzoek.
+    reply(&world, 503, Vec::new(), Some(0));
+    assert_eq!(s.put("test/d", b"x"), Err(StoreError::Transport));
+    assert_eq!(sent("PUT ", "/test/d"), 1);
+    // De lease: de voorwaardelijke PUT en DELETE ook.
+    let state = LeaseState {
+        generation: 1,
+        expires_at: 1_790_765_326_000,
+        owner: "a#1".into(),
+    };
+    let mut lease = s.lease("test/lease", 30_000);
+    close(1);
+    tagged(&world, 200, b"", "\"one\"");
+    assert_eq!(lease.write("", &state).unwrap(), "\"one\"");
+    close(1);
+    reply(&world, 204, Vec::new(), Some(0));
+    lease.delete("\"one\"").unwrap();
+    assert_eq!(sent("PUT ", "/test/lease"), 2);
+    assert_eq!(sent("DELETE ", "/test/lease"), 2);
+    // Een GET gaat hier niet opnieuw (dat doet leanhttp zelf, op een pool-verbinding).
+    close(1);
+    assert_eq!(s.get("test/a", 16), Err(StoreError::Transport));
+    assert_eq!(sent("GET ", "/test/a"), 1);
 }

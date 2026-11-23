@@ -1351,12 +1351,13 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
 /// Geeft de lease op `key` terug zodat de volgende houder hem meteen
 /// claimt, met het aantal pogingen. De vrijgave van de Writer is één
 /// voorwaardelijke DELETE, en een transport als `leans3http` doet één poging
-/// per verzoek, nooit een herhaling. Bij een stop is de keep-alive-verbinding
-/// vaak een tijd stil geweest en faalt dat eerste verzoek met
-/// `Object(Transport)` zonder de store te bereiken (EasyFlor, 17-11-2026: elke
-/// stop in de recreate-proef; de opvolger wachtte tot de lease verliep). Na
-/// een transportfout dus nog hoogstens twee keer, op een nieuwe verbinding,
-/// bij naam ([`writer::release_named`]).
+/// per verzoek (`replica_s3` doet sinds v3.2.5 nog één bij een verbinding die
+/// meteen dicht bleek; een andere store misschien niet). Bij een stop is de
+/// keep-alive-verbinding vaak een tijd stil geweest en faalt dat eerste
+/// verzoek met `Object(Transport)` zonder de store te bereiken (EasyFlor,
+/// 17-11-2026: elke stop in de recreate-proef; de opvolger wachtte tot de
+/// lease verliep). Na een transportfout dus nog hoogstens twee keer, op een
+/// nieuwe verbinding, bij naam ([`writer::release_named`]).
 ///
 /// [`Held::Named`] (een vernieuwing onderweg houdt de Writer nog) gaat vanaf
 /// de eerste poging bij naam.
