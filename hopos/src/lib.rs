@@ -9,9 +9,13 @@
 //!
 //! [`lanes`] draait het S3-werk van een eigenaar (uploads, onderhoud, de
 //! lease) op twee eigen stacks naast hem (`replica_core::lanes`).
+//!
+//! [`keep::Keeping`] is de waiter van de store van een eigenaar: hij houdt de
+//! lease van de open groep bij terwijl één call wacht.
 #![no_std]
 #![forbid(unsafe_code)]
 extern crate alloc;
+pub mod keep;
 pub mod lanes;
 pub mod s3;
 mod storage;
