@@ -53,8 +53,9 @@ een WAL zou die pagina's pas bij een checkpoint laten zien.
 
 ## Versies en pins
 
-Replica zelf: **v3.2.4** (dezelfde nummering als HopOS). Afnemers pinnen een
-tag, geen rev op een branch.
+Replica zelf: **v3.2.5** (de nummering van HopOS; een patch van Replica
+alleen loopt voor op de HopOS-pin, v3.2.5 pint HopOS v3.2.4). Afnemers pinnen
+een tag, geen rev op een branch.
 
 | Afhankelijkheid | Crates | Pin |
 | --- | --- | --- |
@@ -241,7 +242,10 @@ S3 vanuit een app-slot: `replica_hopos::s3::store(&endpoint, Wait(s))` is een
 `replica_s3::S3` over `leans3http::Http` over Lean's `WebDial` over
 `applib::tcp::Dialer`, met `MOZILLA_ROOTS`, de wandklok van de app en een
 `applib::rand::Rng` per verbinding; `store.lease(key, ttl)` is de hop-lease
-erover. Op de host (feature `std`): `replica_sqlite::host::Dir` (bestanden,
+erover. De store van een eigenaar met een groep wacht met
+`replica_hopos::keep::Keeping::new(Wait(s), &keep)`: terwijl één call wacht,
+houdt hij de lease van de open groep bij (`Group::with_keep_lease(&keep)`,
+zie [docs/group.md](docs/group.md)). Op de host (feature `std`): `replica_sqlite::host::Dir` (bestanden,
 `fsync`, mapbarrière) en `replica_core::host::{Dir, DirLease}` (objectstore en
 lease in een map).
 
