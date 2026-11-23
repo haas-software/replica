@@ -730,9 +730,11 @@ impl Replica {
             .map_err(|_| Error::Busy)?
             .check(now)
     }
-    /// Eén expliciete synchronisatie op de eigenaar: capture, upload en afronding
-    /// in één beurt, in rust. Wie SQL wil laten doorlopen tijdens de upload van
-    /// de delen gebruikt [`Replica::begin`] en [`Replica::finish`].
+    /// Eén expliciete synchronisatie op de eigenaar: capture, upload en
+    /// afronding in één beurt, in rust; zonder
+    /// [`Config::background_maintenance`] ook het onderhoud als het aan de
+    /// beurt is. Wie SQL wil laten doorlopen tijdens de upload van de delen
+    /// gebruikt [`Replica::begin`] en [`Replica::finish`].
     pub fn sync<B: Storage, S: Store>(
         &mut self,
         b: &mut B,
@@ -756,6 +758,10 @@ impl Replica {
                 }
                 Err(e) => return self.abandon_in(&mut st, b, e, now),
             },
+            // Met `background_maintenance` doet de losse taak het onderhoud,
+            // ook als er niets veranderde (zoals `begin`); anders liep het
+            // hier toch op de eigenaar (EasyFlor p31-stall, 20-11-2026).
+            Ok(None) if self.config.background_maintenance => Ok(Synced::default()),
             Ok(None) => self.maintain(&mut st, b, store, now),
             Err(e) => Err(e),
         };

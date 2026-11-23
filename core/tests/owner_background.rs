@@ -69,6 +69,15 @@ fn maintenance_runs_beside_the_owner_and_the_archive_stays_exact() {
     }
     // Er staat geen inline onderhoud meer achter begin.
     assert!(r.begin(&mut fs, &mut bucket, at(3100)).unwrap().is_none());
+    // Ook niet achter een sync zonder wijzigingen (een flush): de vensters
+    // blijven voor de taak.
+    let synced = r.sync(&mut fs, &mut bucket, at(3200)).unwrap();
+    assert!(!synced.published);
+    assert_eq!(
+        synced.maintenance.merged + synced.maintenance.pruned + synced.expired_objects,
+        0,
+        "{synced:?}"
+    );
     let job = r
         .maintenance_begin(&mut fs, at(5000))
         .unwrap()
