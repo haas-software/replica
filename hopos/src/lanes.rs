@@ -13,14 +13,18 @@
 //! - **De eigenaar** neemt alleen de rustmomenten voor wat rust vraagt (zie
 //!   [`replica_core::group::Group::rest`]).
 //!
-//! De host maakt per baan een `applib::stacktask` (de stack en zijn
-//! veiligheidsargument zijn van de host) en laat die [`Lanes::run`] draaien
-//! met de [`LaneSide`] van die stack: zijn lokale opslag en zijn store, die
-//! op die stack parkeren. De eigenaar ziet de banen als [`OwnerLanes`], een
-//! [`Offload`]. De banen van een slot leven zo lang als de app; de domeinen
-//! (tenants) van het slot komen en gaan.
-use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
-use applib::stacktask::Suspender;
+//! [`Lanes::spawn`] maakt de twee `applib::stacktask`s van een slot en laat
+//! op elk [`Lanes::run`] lopen; de host geeft alleen de stackmaten
+//! ([`Stacks`]) en opent op de stack van een baan zijn [`LaneSide`]: zijn
+//! lokale opslag en zijn store, met eigen verbindingen, die op die stack
+//! parkeren. De eigenaar ziet de banen als [`OwnerLanes`] ([`Lanes::owner`]),
+//! een [`Offload`]. De banen van een slot leven zo lang als de app; de
+//! domeinen (tenants) van het slot komen en gaan.
+use alloc::{boxed::Box, collections::VecDeque, format, string::String, vec::Vec};
+use applib::{
+    EXEC,
+    stacktask::{self, Suspender, Task},
+};
 use core::{
     cell::{Cell, RefCell},
     future::{Future, poll_fn},
@@ -105,6 +109,59 @@ impl Lanes {
     fn is_idle(&self) -> bool {
         self.lease.is_idle() && self.data.is_idle()
     }
+    /// Twee banen op eigen stacks (`applib::stacktask`), elk op de executor
+    /// van de app, voor zo lang als de app leeft. Op de stack van een baan
+    /// roept de taak `open(lane, sus, run)` aan: de host opent daar zijn kant
+    /// (lokale opslag en store, die op `sus` parkeren) en geeft hem aan
+    /// `run`, dat de jobs van die baan draait tot de app de taak dropt. Kan
+    /// de host zijn kant niet openen, dan meldt hij dat en keert terug: die
+    /// baan loopt dan niet, en de groep ziet zijn jobs nooit landen (zoals
+    /// een store die niet antwoordt).
+    ///
+    /// # Safety
+    ///
+    /// Het contract van `applib::stacktask::Task::new`, voor het deel van de
+    /// host: zijn kant past met zijn diepste call (een opslag- of storecall,
+    /// een TLS-handshake, een compactie van replica-core) in de stack van die
+    /// baan ([`Stacks`]); `open` keert terug na `Cancelled` (de wacht op de
+    /// volgende job of een call van zijn store eindigt dan), bewaart geen
+    /// verwijzing naar de stack, doet geen longjmp en draait er geen
+    /// SQLite-verbinding op.
+    #[allow(
+        unsafe_code,
+        reason = "de stacks van de banen; het contract staat hierboven"
+    )]
+    pub unsafe fn spawn<O>(stacks: Stacks, open: O) -> Result<&'static Lanes, SpawnError>
+    where
+        O: Fn(Lane, &Suspender, &mut dyn FnMut(&mut dyn LaneSide)) + Clone + 'static,
+    {
+        let lanes: &'static Lanes = Box::leak(Box::new(Lanes::new()));
+        for lane in [Lane::Lease, Lane::Data] {
+            let open = open.clone();
+            let run = move |sus: &Suspender| {
+                // Eindigt als de app de taak dropt (de stop).
+                open(lane, sus, &mut |side| lanes.run(lane, sus, side));
+            };
+            // SAFETY: Het deel van de host staat in het contract van deze
+            // functie. Het deel van replica: de lus wacht alleen in
+            // `Suspender::wait` en keert terug na `Cancelled`; een job van de
+            // groep wisselt alleen binnen een opslag- of storecall van de
+            // kant, en eigenaar en banen delen alleen `RefCell`s die nooit
+            // over zo'n call geleend worden (het rustprotocol van
+            // `replica_core::owner`).
+            let task = unsafe { Task::new(stacks.of(lane), run) }
+                .map_err(|e| SpawnError::Stack(lane, e))?;
+            EXEC.get()
+                .spawn(task)
+                .map_err(|e| SpawnError::Task(lane, format!("{e:?}")))?;
+        }
+        Ok(lanes)
+    }
+    /// De banen zoals de eigenaar op `sus` ze ziet; [`Offload::settle`]
+    /// wacht op een timer van de executor van de app.
+    pub fn owner<'s>(&'s self, sus: &'s Suspender) -> OwnerLanes<'s> {
+        OwnerLanes::new(self, sus, &app_sleep)
+    }
     /// De lus van baan `lane` op de stack van `sus`: elke job één voor één,
     /// met `side`. Keert terug als de app de taak dropt (de wacht op de
     /// volgende job eindigt met `Cancelled`).
@@ -116,6 +173,45 @@ impl Lanes {
             queue.done();
         }
     }
+}
+/// De stackmaten van de banen van een slot, in bytes (64 KiB tot 16 MiB,
+/// zoals `applib::stacktask`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stacks {
+    /// De leasebaan: één kleine voorwaardelijke call tegelijk en zijn TLS-handshake.
+    pub lease: usize,
+    /// De databaan: de uploads, de manifesten, het onderhoud (ook een
+    /// compactie) en hun TLS-handshakes.
+    pub data: usize,
+}
+impl Stacks {
+    /// De leasebaan: 2 MiB.
+    pub const LEASE: usize = 2 << 20;
+    /// [`Stacks::LEASE`] voor de leasebaan, `data` (minstens zoveel) voor de databaan.
+    pub fn new(data: usize) -> Self {
+        Stacks {
+            lease: Self::LEASE,
+            data: data.max(Self::LEASE),
+        }
+    }
+    fn of(self, lane: Lane) -> usize {
+        match lane {
+            Lane::Lease => self.lease,
+            Lane::Data => self.data,
+        }
+    }
+}
+/// Een baan kon niet starten ([`Lanes::spawn`]).
+#[derive(Debug)]
+pub enum SpawnError {
+    /// Zijn stack: een maat buiten het bereik, of geen geheugen.
+    Stack(Lane, stacktask::Error),
+    /// De executor van de app nam de taak niet aan (vol, of te veel taken).
+    Task(Lane, String),
+}
+/// Een timer van de executor van de app, de grens van [`Offload::settle`].
+fn app_sleep<'s>(d: Duration) -> Pin<Box<dyn Future<Output = ()> + 's>> {
+    Box::pin(EXEC.get().after(d))
 }
 /// Een slaap van `Duration` op de timer van de host (bijvoorbeeld zijn
 /// deadlinewiel), voor de grens van [`Offload::settle`].

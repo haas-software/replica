@@ -7,13 +7,16 @@
 //! [`s3`] is de objectstore en de schrijverlease vanuit een app-slot: S3 over
 //! HTTPS met applib's TCP, Lean's TLS, de wandklok en de willekeur van de app.
 //!
-//! [`lanes`] draait het S3-werk van een eigenaar (uploads, onderhoud, de
-//! lease) op twee eigen stacks naast hem (`replica_core::lanes`).
+//! [`lanes`] draait het S3-werk van een eigenaar (uploads, manifesten,
+//! onderhoud, de lease) op twee eigen stacks naast hem
+//! (`replica_core::lanes`). Die stacks maakt [`lanes::Lanes::spawn`]: de
+//! enige `unsafe` van deze crate, een `unsafe fn` met het stackcontract van
+//! `applib::stacktask` voor de kant van de host.
 //!
 //! [`keep::Keeping`] is de waiter van de store van een eigenaar: hij houdt de
 //! lease van de open groep bij terwijl één call wacht.
 #![no_std]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 extern crate alloc;
 pub mod keep;
 pub mod lanes;
