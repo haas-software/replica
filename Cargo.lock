@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "replica-core"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "discovery",
  "leancrypto",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "replica-hopos"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "applib",
  "leanhttp",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "replica-s3"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "leans3",
  "replica-core",
@@ -155,14 +155,14 @@ dependencies = [
 
 [[package]]
 name = "replica-sqlite"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "replica-sqlite",
 ]
 
 [[package]]
 name = "replica-sqlite-bench"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "applib",
  "replica-hopos",
@@ -171,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "replica-sqlite-persist"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "applib",
  "replica-core",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "replica-sqlite-smoke"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "applib",
  "replica-sqlite",

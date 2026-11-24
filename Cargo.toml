@@ -4,7 +4,7 @@ members = ["sqlite", "core", "s3", "hopos", "apps/sqlite-smoke", "apps/sqlite-pe
 default-members = ["sqlite", "core"]
 
 [workspace.package]
-version = "3.2.5"
+version = "3.2.6"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
