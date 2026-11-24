@@ -174,6 +174,32 @@ geciteerde ETags (Hetzner, Ceph) en voor een Bunny-ghost.
 
 2. Voer `prepare::run` uit **vóór** SQLite opent. De callback controleert een
    eventuele scratch-restore met echte SQLite `PRAGMA integrity_check`.
+
+   **Werk van een ander (`Error::ForeignAhead`, v3.2.5).** Een tenant draait
+   op A, dan op B, dan weer op A met A's oude (of teruggezette) volume: de
+   store is in dezelfde generatie verder dan A's marker. Tot v3.2.4
+   publiceerde Prepare dan A's lokale bron als nieuwe snapshot en verdween
+   B's werk stil uit beeld. Nu is een store die verder is alleen van ons als
+   het precies het ene manifest is dat de marker als onzeker wegstuurde, met
+   ons token erin (de marker bewaart `lease_generation` van zijn laatst
+   bevestigde manifest en `uncertain_lease_generation` van het manifest
+   onderweg; een marker zonder die velden houdt de oude regel voor zijn
+   onzekere sequence). Anders:
+   - lokaal schoon (marker `clean`): herstel uit de store (`Reason::Restored`);
+   - lokaal eigen ongepubliceerd werk: Prepare faalt met
+     `Error::ForeignAhead` en raakt niets aan, lokaal noch in de store.
+
+   Ook `ForeignAhead`: ons bevestigde manifest viel door de fencing af (een
+   ander manifest met dezelfde sequence en een hoger token), of een
+   onderbroken generatiewissel zou terugvallen op een generatie waarin een
+   ander sindsdien verder is.
+
+   **Wat de host met `ForeignAhead` doet:** de database (bij EasyFlor: de
+   tenant) blijft dicht, met één logregel die de database en `ForeignAhead`
+   noemt; niet opnieuw proberen in een lus, niets weggooien. Iemand kiest: de lokale bestanden apart zetten en uit de store
+   openen, of het lokale werk eerst veiligstellen. `Error` is niet
+   `non_exhaustive`: een host met een volledige `match` krijgt er een arm bij.
+
 3. Gebruik uitsluitend `prepared.tracking.wrap(&mut storage, &mut marker)`
    voor SQL, of gebruik `Replica::vfs` bij de samengevoegde eigenaar.
    Initialiseer de engine met een geleende, gealigneerde `u64`-heap:
