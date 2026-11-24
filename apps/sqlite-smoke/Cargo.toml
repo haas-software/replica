@@ -9,7 +9,7 @@ build = "build.rs"
 
 [dependencies]
 replica-sqlite = { path = "../../sqlite" }
-applib = { git = "https://github.com/hop-os/HopOS.git", tag = "v3.2.4" }
+applib = { git = "https://github.com/hop-os/HopOS.git", tag = "v3.2.5" }
 
 [lints]
 workspace = true

@@ -53,13 +53,13 @@ een WAL zou die pagina's pas bij een checkpoint laten zien.
 
 ## Versies en pins
 
-Replica zelf: **v3.2.5** (de nummering van HopOS; een patch van Replica
-alleen loopt voor op de HopOS-pin, v3.2.5 pint HopOS v3.2.4). Afnemers pinnen
+Replica zelf: **v3.2.7** (de nummering van HopOS; een patch van Replica
+alleen loopt voor op de HopOS-pin; v3.2.5 en v3.2.6 pinnen HopOS v3.2.4, v3.2.7 pint HopOS v3.2.5). Afnemers pinnen
 een tag, geen rev op een branch.
 
 | Afhankelijkheid | Crates | Pin |
 | --- | --- | --- |
-| HopOS (`hop-os/HopOS`) | `applib`, `sync` | `v3.2.4` |
+| HopOS (`hop-os/HopOS`) | `applib`, `sync` | `v3.2.5` |
 | Lean (`haas-software/lean`) | `leans3`, `leans3http`, `leanhttp`, `leanhttps`, `leantls`, `leancrypto` (en `leannet` via applib) | `v3.2.3` |
 | Hop (`hop-os/hop`) | `types`, `discovery` | `v3.2.1` |
 | SQLite | gevendord in `vendor/sqlite` | 3.53.4 |

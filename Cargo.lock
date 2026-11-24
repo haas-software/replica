@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "abi"
-version = "3.2.4"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.4#589c667dfca861c7e3a682532d4acf6ec235793c"
+version = "3.2.5"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.5#f848cafca2af617f3ef3075a2671db6c85da7772"
 dependencies = [
  "bounded",
  "dev",
@@ -14,8 +14,8 @@ dependencies = [
 
 [[package]]
 name = "applib"
-version = "3.2.4"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.4#589c667dfca861c7e3a682532d4acf6ec235793c"
+version = "3.2.5"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.5#f848cafca2af617f3ef3075a2671db6c85da7772"
 dependencies = [
  "abi",
  "bounded",
@@ -30,13 +30,13 @@ dependencies = [
 
 [[package]]
 name = "bounded"
-version = "3.2.4"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.4#589c667dfca861c7e3a682532d4acf6ec235793c"
+version = "3.2.5"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.5#f848cafca2af617f3ef3075a2671db6c85da7772"
 
 [[package]]
 name = "dev"
-version = "3.2.4"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.4#589c667dfca861c7e3a682532d4acf6ec235793c"
+version = "3.2.5"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.5#f848cafca2af617f3ef3075a2671db6c85da7772"
 
 [[package]]
 name = "discovery"
@@ -48,8 +48,8 @@ dependencies = [
 
 [[package]]
 name = "executor"
-version = "3.2.4"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.4#589c667dfca861c7e3a682532d4acf6ec235793c"
+version = "3.2.5"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.5#f848cafca2af617f3ef3075a2671db6c85da7772"
 dependencies = [
  "dev",
  "sync",
@@ -57,8 +57,8 @@ dependencies = [
 
 [[package]]
 name = "heap"
-version = "3.2.4"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.4#589c667dfca861c7e3a682532d4acf6ec235793c"
+version = "3.2.5"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.5#f848cafca2af617f3ef3075a2671db6c85da7772"
 
 [[package]]
 name = "leancrypto"
@@ -111,15 +111,15 @@ dependencies = [
 
 [[package]]
 name = "netdev"
-version = "3.2.4"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.4#589c667dfca861c7e3a682532d4acf6ec235793c"
+version = "3.2.5"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.5#f848cafca2af617f3ef3075a2671db6c85da7772"
 dependencies = [
  "sync",
 ]
 
 [[package]]
 name = "replica-core"
-version = "3.2.6"
+version = "3.2.7"
 dependencies = [
  "discovery",
  "leancrypto",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "replica-hopos"
-version = "3.2.6"
+version = "3.2.7"
 dependencies = [
  "applib",
  "leanhttp",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "replica-s3"
-version = "3.2.6"
+version = "3.2.7"
 dependencies = [
  "leans3",
  "replica-core",
@@ -155,14 +155,14 @@ dependencies = [
 
 [[package]]
 name = "replica-sqlite"
-version = "3.2.6"
+version = "3.2.7"
 dependencies = [
  "replica-sqlite",
 ]
 
 [[package]]
 name = "replica-sqlite-bench"
-version = "3.2.6"
+version = "3.2.7"
 dependencies = [
  "applib",
  "replica-hopos",
@@ -171,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "replica-sqlite-persist"
-version = "3.2.6"
+version = "3.2.7"
 dependencies = [
  "applib",
  "replica-core",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "replica-sqlite-smoke"
-version = "3.2.6"
+version = "3.2.7"
 dependencies = [
  "applib",
  "replica-sqlite",
@@ -189,8 +189,8 @@ dependencies = [
 
 [[package]]
 name = "sync"
-version = "3.2.4"
-source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.4#589c667dfca861c7e3a682532d4acf6ec235793c"
+version = "3.2.5"
+source = "git+https://github.com/hop-os/HopOS.git?tag=v3.2.5#f848cafca2af617f3ef3075a2671db6c85da7772"
 dependencies = [
  "bounded",
 ]

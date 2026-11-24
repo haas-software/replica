@@ -8,9 +8,9 @@ license.workspace = true
 replica-sqlite = { path = "../sqlite" }
 replica-core = { path = "../core" }
 replica-s3 = { path = "../s3" }
-applib = { git = "https://github.com/hop-os/HopOS.git", tag = "v3.2.4", features = ["http"] }
+applib = { git = "https://github.com/hop-os/HopOS.git", tag = "v3.2.5", features = ["http"] }
 # `select` en `yield_now` van de banen (`lanes`); dezelfde tag als applib.
-hopsync = { package = "sync", git = "https://github.com/hop-os/HopOS.git", tag = "v3.2.4" }
+hopsync = { package = "sync", git = "https://github.com/hop-os/HopOS.git", tag = "v3.2.5" }
 # Dezelfde Lean-tag als applib, zodat `TcpConn` en leanhttp één `Dial` kennen.
 leanhttp = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.3" }
 leanhttps = { git = "https://github.com/haas-software/lean.git", tag = "v3.2.3", features = ["mozilla-roots"] }
