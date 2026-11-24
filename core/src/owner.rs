@@ -24,15 +24,17 @@
 //!   die de staat niet kan lenen, geeft `SQLITE_BUSY` zonder I/O.
 //! - **De eigenaar** leent de staat in [`Replica::sync`], [`Replica::tick`],
 //!   [`Replica::begin`], [`Replica::begin_capture`], [`Replica::abandon`],
-//!   [`Replica::finish`], [`Replica::maintenance_begin`] en
+//!   [`Replica::finish`], [`Replica::finish_begin`], [`Replica::finish_end`],
+//!   [`Replica::maintenance_begin`] en
 //!   [`Replica::maintenance_finish`], van begin tot eind, ook over hun I/O.
 //!   Kan hij niet lenen, dan geven ze [`Error::Busy`] zonder iets te wijzigen.
 //!   Ze mogen dus alleen lopen terwijl de SQL-kant **in rust** is: de host
 //!   sluit de verbinding, of laat haar actor wachten tussen twee verzoeken (geen
 //!   lopend statement, geen open transactie), en hervat haar daarna. Wat
 //!   ertussen hoort, is lokaal en kort: de capture naar de spool, het manifest
-//!   en de marker.
+//!   en de marker (de PUT van het manifest kan eruit: [`Replica::finish_begin`]).
 //! - **Zonder rust** mogen: [`Pending::upload`] (alleen spool en store),
+//!   [`Publishing::put`] (alleen de store en de lease),
 //!   [`Capturing::run`] (database, spool en schaduw), [`Maintenance::run`]
 //!   (alleen de store), [`Replica::renew`] (alleen de lease) en
 //!   [`Replica::status`]. Zo blokkeert een upload van megabytes geen enkel
@@ -52,7 +54,7 @@ use crate::{
     marker::{LocalMarker, Marker},
     object::{Store, StoreError},
     prepare::{self, Reason},
-    replication::{self, Batch, Staged, Uploaded},
+    replication::{self, Batch, Manifesting, Staged, Uploaded},
     string,
     time::Time,
     tracking::{Tracked, Tracking, sqlite_error},
@@ -283,6 +285,23 @@ impl Pending {
     /// marker of tracking, dus dit mag op een eigen stack naast de eigenaar.
     pub fn upload<B: Storage, S: Store>(&self, b: &mut B, store: &mut S) -> Result<Uploaded> {
         self.batch.upload(b, store, &self.staged)
+    }
+}
+/// Een manifest onderweg naar de store, tussen [`Replica::finish_begin`] en
+/// [`Replica::finish_end`]: de marker staat duurzaam onzeker op zijn sequence.
+pub struct Publishing {
+    manifesting: Manifesting,
+    writer: Rc<RefCell<Writer>>,
+    capture: u64,
+}
+impl Publishing {
+    /// Stap 2: het manifest in de store, alleen binnen de deadline van de
+    /// lease, gemeten op de klok van `b` vlak ervoor. Raakt geen SQLite,
+    /// marker of tracking, dus dit mag op een eigen stack naast de eigenaar
+    /// terwijl SQL doorschrijft. De uitkomst gaat naar [`Replica::finish_end`].
+    pub fn put<B: Storage, S: Store>(&self, b: &mut B, store: &mut S) -> Result {
+        fence(&self.writer, b)?;
+        self.manifesting.put(store)
     }
 }
 /// Wat [`Replica::begin_capture`] teruggeeft: een beeld om te lezen, of een
@@ -901,6 +920,77 @@ impl Replica {
             uploaded.and_then(|uploaded| self.complete(&mut st, b, store, pending, uploaded, now));
         self.settle(result, now)
     }
+    /// Stap 1 van [`Replica::finish`] in drie stappen, voor een host die het
+    /// manifest niet op de eigenaar wil PUT'en: het manifest klaar en de
+    /// marker duurzaam onzeker, lokaal en in rust. De [`Publishing`] gaat met
+    /// [`Publishing::put`] naar de store, buiten de eigenaar (SQL mag dan
+    /// doorschrijven), en komt met de uitkomst terug in
+    /// [`Replica::finish_end`]. Tot dan is een volgende `begin` een fout.
+    ///
+    /// Een mislukte upload of een fout hier is de fout van deze beurt (zoals
+    /// bij [`Replica::finish`]); er volgt dan geen `finish_end`.
+    pub fn finish_begin<B: Storage>(
+        &mut self,
+        b: &mut B,
+        pending: Pending,
+        uploaded: Result<Uploaded>,
+        now: Time,
+    ) -> Result<Publishing> {
+        let state = Rc::clone(&self.state);
+        let mut st = rest(&state)?;
+        self.disarm(&mut st, b);
+        if let Err(e) = self.clock(now) {
+            self.pending = false;
+            return Err(e);
+        }
+        let capture = pending.capture;
+        match uploaded.and_then(|uploaded| self.manifest(&mut st, b, pending, uploaded, now)) {
+            Ok(manifesting) => Ok(Publishing {
+                manifesting,
+                writer: Rc::clone(&self.writer),
+                capture,
+            }),
+            Err(e) => {
+                // De fout van deze beurt, zoals `settle` hem vastlegt.
+                self.pending = false;
+                self.status.error = Some(e);
+                Err(e)
+            }
+        }
+    }
+    /// Stap 3 van [`Replica::finish`] in drie stappen: de uitkomst van
+    /// [`Publishing::put`]. Gelukt: de marker op de nieuwe sequence en de
+    /// bevestiging van de tracking, lokaal en in rust. Mislukt: de marker
+    /// blijft onzeker en de volgende capture lost hem op, zoals na een
+    /// mislukte PUT in [`Replica::finish`]. Het onderhoud loopt hier niet
+    /// (geen store): met [`Config::background_maintenance`] via
+    /// [`Replica::maintenance_begin`], anders bij de volgende `begin`.
+    pub fn finish_end<B: Storage>(
+        &mut self,
+        b: &mut B,
+        publishing: Publishing,
+        put: Result,
+        now: Time,
+    ) -> Result<Synced> {
+        let state = Rc::clone(&self.state);
+        let mut st = rest(&state)?;
+        self.pending = false;
+        self.clock(now)?;
+        let Publishing {
+            manifesting,
+            capture,
+            ..
+        } = publishing;
+        let result = match put.and_then(|()| self.land(&mut st, b, manifesting, capture)) {
+            Ok(()) => Ok(Synced {
+                published: true,
+                capture,
+                ..Synced::default()
+            }),
+            Err(e) => Err(self.archive_error(&mut st, b, e)),
+        };
+        self.settle(result, now)
+    }
     /// Het onderhoud als losse taak (met [`Config::background_maintenance`]):
     /// hoogstens eens per minuut, nooit naast een andere taak. Legt de
     /// frontier op `now` duurzaam vast, zodat elk venster dat de taak
@@ -1085,6 +1175,29 @@ impl Replica {
         uploaded: Uploaded,
         now: Time,
     ) -> Result<Synced> {
+        let capture = pending.capture;
+        let manifesting = self.manifest(st, b, pending, uploaded, now)?;
+        if let Err(e) = manifesting.put(store) {
+            return Err(self.archive_error(st, b, e));
+        }
+        let mut result = match self.land(st, b, manifesting, capture) {
+            Ok(()) if self.config.background_maintenance => Synced::default(),
+            Ok(()) => self.maintain(st, b, store, now)?,
+            Err(e) => return Err(self.archive_error(st, b, e)),
+        };
+        result.published = true;
+        result.capture = capture;
+        Ok(result)
+    }
+    /// Het manifest na de upload, de marker onzeker op zijn sequence.
+    fn manifest<B: Storage>(
+        &mut self,
+        st: &mut State,
+        b: &mut B,
+        pending: Pending,
+        uploaded: Uploaded,
+        now: Time,
+    ) -> Result<Manifesting> {
         // De upload kan lang duren; het manifest gaat alleen uit onder een
         // geldige lease, gemeten nu en niet bij het begin van de beurt.
         self.fence(b)?;
@@ -1093,27 +1206,24 @@ impl Replica {
             .try_borrow()
             .map_err(|_| Error::Busy)?
             .generation();
-        if let Err(e) = pending.batch.finish(
-            b,
-            store,
-            uploaded,
-            &mut st.marker,
-            &mut st.tracking,
-            now,
-            lease,
-        ) {
-            return Err(self.archive_error(st, b, e));
-        }
+        pending
+            .batch
+            .manifest(b, uploaded, &mut st.marker, now, lease)
+            .map_err(|e| self.archive_error(st, b, e))
+    }
+    /// De marker op de sequence van een gelukte manifest-PUT, de tracking
+    /// bevestigd en het hervattingsrecord weg.
+    fn land<B: Storage>(
+        &mut self,
+        st: &mut State,
+        b: &mut B,
+        manifesting: Manifesting,
+        capture: u64,
+    ) -> Result {
+        manifesting.land(b, &mut st.marker, &mut st.tracking)?;
         Batch::clear_pending(b, self.config.path)?;
-        self.confirmed = self.confirmed.max(pending.capture);
-        let mut result = if self.config.background_maintenance {
-            Synced::default()
-        } else {
-            self.maintain(st, b, store, now)?
-        };
-        result.published = true;
-        result.capture = pending.capture;
-        Ok(result)
+        self.confirmed = self.confirmed.max(capture);
+        Ok(())
     }
     /// Onderhoud hoogstens eens per minuut; ook na een fout geen hotloop bij
     /// iedere SQL-wijziging.

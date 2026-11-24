@@ -5,15 +5,16 @@
 //! dan elk verzoek op zolang een publicatie, een onderhoudsbeurt of een
 //! leasevernieuwing op S3 wacht: tot de time-out van een hangende verbinding
 //! (EasyFlor op de M4, 20-11-2026: "na ~30 verzoeken staat alles 30 tot 60 s
-//! stil"). Met banen houdt de eigenaar alleen wat rust vraagt (de capture
-//! naar de spool, het manifest na een gelande upload); de uploads, het
-//! onderhoud en de lease gaan naar de banen, die het op hun eigen stack doen.
+//! stil"). Met banen houdt de eigenaar alleen wat rust vraagt en lokaal is
+//! (de capture naar de spool, het manifest en de marker na een gelande
+//! upload); de uploads, de PUT van het manifest, het onderhoud en de lease
+//! gaan naar de banen, die het op hun eigen stack doen.
 //!
 //! - [`Lane::Lease`]: de schrijverlease, één kleine voorwaardelijke call per
 //!   paar seconden, nooit achter een upload (een hangende segment-PUT liet
 //!   de lease anders verlopen).
-//! - [`Lane::Data`]: de uploads van de gecapturede pagina's en het onderhoud
-//!   (listings, manifesten, compactie).
+//! - [`Lane::Data`]: de uploads van de gecapturede pagina's, daarna hun
+//!   manifest, en het onderhoud (listings, manifesten, compactie).
 //!
 //! De host levert alleen de stacks: [`Offload`] is zijn haak ("draai dit op
 //! baan X"), `replica_hopos::lanes` doet dat op HopOS met twee

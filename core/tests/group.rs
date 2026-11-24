@@ -480,9 +480,18 @@ fn a_capture_on_its_way_confirms_no_later_write_and_the_owner_never_waits_for_s3
     let begun = write(&mut db);
     let before = group.publications().count("main.db");
     let n = lines.len();
+    let calls = owner_calls.get();
+    lanes.run_all();
+    group.rest().unwrap();
+    // De delen staan er; de PUT van het manifest gaat ook op de baan.
+    assert_eq!(lanes.data.borrow().len(), 1, "het manifest is onderweg");
+    assert!(!lines.since(n).iter().any(|l| l == "published file=main.db"));
+    // SQL schrijft door terwijl het manifest onderweg is.
+    exec(&mut db, "INSERT INTO t VALUES (4)");
     lanes.run_all();
     group.rest().unwrap();
     assert!(lines.since(n).iter().any(|l| l == "published file=main.db"));
+    assert_eq!(owner_calls.get(), calls, "geen store-call op de eigenaar");
     let after = group.publications().count("main.db");
     assert!(after > before, "de publicatie telt ({before} -> {after})");
     assert!(
@@ -541,6 +550,99 @@ fn a_capture_on_its_way_confirms_no_later_write_and_the_owner_never_waits_for_s3
     group.flush().unwrap();
     assert!(!group.has_changes());
     assert!(!lines.has("lost"), "{:?}", lines.since(0));
+}
+
+#[test]
+fn a_manifest_put_that_fails_on_the_lane_is_resolved_and_the_write_published_later() {
+    let _sqlite = SQLITE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let bed = Bed::new("manifest");
+    let (mut heap, mut a) = (vec![0_u64; 4 << 20], vec![0_u8; 1 << 16]);
+    let mut memory = Memory::new([Slot::new(&mut a)], 0, 1);
+    let engine = engine(&mut heap, &mut memory);
+    let verify = checker(&engine);
+    let lines = Lines::default();
+    let lanes = Lanes {
+        lease: RefCell::new(VecDeque::new()),
+        data: RefCell::new(VecDeque::new()),
+        side: RefCell::new(Side {
+            local: bed.root.join("a"),
+            bucket: bed.bucket(),
+        }),
+    };
+    let mut owner_bucket = bed.bucket();
+    let w = bed.claim("a", &mut owner_bucket).unwrap();
+    let group = Group::new(
+        bed.config(),
+        Rc::new(RefCell::new(owner_bucket)),
+        Rc::new(RefCell::new(w)),
+        millis,
+        Box::new(lines.clone()),
+    )
+    .with_offload(&lanes);
+    assert!(!group.prepare("main.db", bed.local("a"), &verify).unwrap());
+    let mut handle = bed.local("a");
+    let mut vfs = group.vfs("main.db", &mut handle).unwrap();
+    let mut db = engine.open_with(c"main.db", &mut vfs).unwrap();
+    exec(
+        &mut db,
+        "CREATE TABLE t(v INTEGER); INSERT INTO t VALUES (1)",
+    );
+    advance(15_000);
+    group.rest().unwrap();
+    lanes.run_all();
+    group.rest().unwrap();
+    lanes.run_all();
+    group.rest().unwrap();
+    assert!(lines.has("published file=main.db"), "{:?}", lines.since(0));
+
+    // The upload of the next capture lands; its manifest PUT fails on the lane.
+    exec(&mut db, "INSERT INTO t VALUES (2)");
+    let begun = group.publications().begun("main.db");
+    advance(15_000);
+    group.rest().unwrap();
+    lanes.run_all();
+    group.rest().unwrap();
+    assert_eq!(lanes.data.borrow().len(), 1, "the manifest is on its way");
+    let n = lines.len();
+    bed.faults.down.set(true);
+    lanes.run_all();
+    bed.faults.down.set(false);
+    group.rest().unwrap();
+    assert!(
+        lines
+            .since(n)
+            .iter()
+            .any(|l| l.starts_with("retry file=main.db step=upload error=Object(Transport)")),
+        "{:?}",
+        lines.since(n)
+    );
+    assert!(!lines.since(n).iter().any(|l| l.starts_with("published")));
+    assert!(group.publications().count("main.db") <= begun);
+    // SQL writes on; the next capture resolves the uncertain manifest and publishes.
+    exec(&mut db, "INSERT INTO t VALUES (3)");
+    for _ in 0..8 {
+        advance(5_000);
+        group.keep_lease();
+        group.rest().unwrap();
+        lanes.run_all();
+        group.rest().unwrap();
+        lanes.run_all();
+        group.rest().unwrap();
+    }
+    assert!(
+        lines.since(n).iter().any(|l| l == "published file=main.db"),
+        "{:?}",
+        lines.since(n)
+    );
+    assert!(group.publications().count("main.db") > begun);
+    assert!(!lines.has("failed"), "{:?}", lines.since(0));
+    assert!(!lines.has("lost"), "{:?}", lines.since(0));
+    drop(db);
+    drop(vfs);
+    group.flush().unwrap();
+    assert!(!group.has_changes());
 }
 
 #[test]

@@ -281,7 +281,8 @@ impl Batch {
         })
     }
     /// Manifest laatst, met de marker duurzaam vóór die onbekende PUT, en
-    /// daarna de bevestiging van de tracking. Kort, en op de eigenaar.
+    /// daarna de bevestiging van de tracking: [`Batch::manifest`],
+    /// [`Manifesting::put`] en [`Manifesting::land`] na elkaar.
     /// `lease` is het fencing-token van de schrijver
     /// (`writer::Writer::generation`), zie [`Manifest::lease`]; nul is onbekend.
     #[allow(clippy::too_many_arguments)]
@@ -295,6 +296,22 @@ impl Batch {
         now: Time,
         lease: u64,
     ) -> Result {
+        let manifesting = self.manifest(b, uploaded, local, now, lease)?;
+        manifesting.put(store)?;
+        manifesting.land(b, local, tracking)
+    }
+    /// Stap 1 van [`Batch::finish`], lokaal: het manifest van de geüploade
+    /// delen, en de marker duurzaam onzeker op zijn sequence vóór de PUT (een
+    /// crash na serveracceptatie mag de sequence nooit vrijgeven). Daarna
+    /// [`Manifesting::put`] (alleen de store) en [`Manifesting::land`].
+    pub fn manifest<B: Storage>(
+        self,
+        b: &mut B,
+        uploaded: Uploaded,
+        local: &mut LocalMarker,
+        now: Time,
+        lease: u64,
+    ) -> Result<Manifesting> {
         self.check(local)?;
         if uploaded.batch_id != self.id {
             return Err(Error::State);
@@ -346,35 +363,14 @@ impl Batch {
         local.value.uncertain_lease = lease;
         local.value.clean = false;
         local.save(b)?;
-        object::publish(store, &key, &manifest, &prefix)?;
-        if self.capture.snapshot {
-            let current = object::key(&namespace, "/current")?;
-            if let Err(original) = store.put(&current, self.generation.as_bytes()) {
-                match store.get(&current, 255) {
-                    Ok(found) if found == self.generation.as_bytes() => {}
-                    _ => return Err(original.into()),
-                }
-            }
-        }
-        local.value.sequence = seq;
-        local.value.at = at;
-        local.value.size = self.capture.size;
-        local.value.page_size = self.capture.page_size;
-        local.value.bytes = bytes;
-        local.value.complete = true;
-        local.value.uncertain = 0;
-        local.value.uncertain_lease = 0;
-        local.value.lease = lease;
-        local.value.previous.clear();
-        local.value.repair_from.clear();
-        local.save(b)?;
-        tracking.source_counter = Some(self.capture.counter);
-        if self.capture.witness.is_some() {
-            tracking.witness = self.capture.witness;
-        }
-        let clean = tracking.acknowledge_capture(b, &self.generation, seq, &self.capture)?;
-        local.value.clean = clean;
-        local.save(b)
+        Ok(Manifesting {
+            batch: self,
+            namespace,
+            prefix,
+            key,
+            manifest,
+            bytes,
+        })
     }
     /// Onderdelen eerst, manifest laatst, in één beurt op de eigenaar: stage,
     /// upload en finish. SQL mag tussen capture en deze call schrijven; die
@@ -408,6 +404,74 @@ pub struct Uploaded {
     namespace: String,
     prefix: String,
     parts: Vec<Part>,
+}
+/// Het manifest van één capture tussen [`Batch::manifest`] en
+/// [`Manifesting::land`]: de marker staat duurzaam onzeker op zijn sequence.
+pub struct Manifesting {
+    batch: Batch,
+    namespace: String,
+    prefix: String,
+    key: String,
+    manifest: Manifest,
+    /// De bytes van de generatie met deze delen erbij.
+    bytes: u64,
+}
+impl Manifesting {
+    /// Stap 2 van [`Batch::finish`]: het manifest (en bij een snapshot
+    /// `current`) in de store. Raakt geen marker, tracking of SQLite, dus dit
+    /// mag op een eigen stack naast de eigenaar; de host bewaakt de lease
+    /// vlak ervoor. Een fout laat de marker onzeker: de volgende capture lost
+    /// hem op (`resolve`).
+    pub fn put<S: Store>(&self, store: &mut S) -> Result {
+        object::publish(store, &self.key, &self.manifest, &self.prefix)?;
+        if self.batch.capture.snapshot {
+            let current = object::key(&self.namespace, "/current")?;
+            if let Err(original) = store.put(&current, self.batch.generation.as_bytes()) {
+                match store.get(&current, 255) {
+                    Ok(found) if found == self.batch.generation.as_bytes() => {}
+                    _ => return Err(original.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Stap 3 van [`Batch::finish`], lokaal, na een gelukte [`Manifesting::put`]:
+    /// de marker op de nieuwe sequence en de bevestiging van de tracking.
+    /// Writes van na de capture blijven dirty, ook die tijdens de PUT.
+    pub fn land<B: Storage>(
+        self,
+        b: &mut B,
+        local: &mut LocalMarker,
+        tracking: &mut Tracking,
+    ) -> Result {
+        let seq = self.manifest.sequence;
+        if local.value.generation != self.batch.generation
+            || local.value.uncertain != seq
+            || local.value.uncertain_lease != self.manifest.lease
+        {
+            return Err(Error::State);
+        }
+        let capture = &self.batch.capture;
+        local.value.sequence = seq;
+        local.value.at = self.manifest.at;
+        local.value.size = capture.size;
+        local.value.page_size = capture.page_size;
+        local.value.bytes = self.bytes;
+        local.value.complete = true;
+        local.value.uncertain = 0;
+        local.value.uncertain_lease = 0;
+        local.value.lease = self.manifest.lease;
+        local.value.previous.clear();
+        local.value.repair_from.clear();
+        local.save(b)?;
+        tracking.source_counter = Some(capture.counter);
+        if capture.witness.is_some() {
+            tracking.witness = capture.witness;
+        }
+        let clean = tracking.acknowledge_capture(b, &self.batch.generation, seq, capture)?;
+        local.value.clean = clean;
+        local.save(b)
+    }
 }
 /// Bestaande raw-keyvorm; tijden buiten Go's veilige UnixNano-bereik worden niet gepubliceerd.
 pub fn raw_key(prefix: &str, sequence: u64, at: Time) -> Result<String> {

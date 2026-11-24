@@ -35,9 +35,11 @@
 //!   de eerste zo'n fout, de host bedient door; de wijzigingen blijven in de
 //!   dirty logs tot een publicatie lukt ([`Report::recovered`]).
 //! - **Banen** ([`Group::with_offload`], zie [`crate::lanes`]): de uploads,
-//!   het onderhoud en de lease buiten de stack van de eigenaar. De eigenaar
-//!   doet in rust alleen de capture (lokaal) en het manifest na een gelande
-//!   upload (één kleine PUT, en alleen als een baan de store net hoorde).
+//!   de PUT van hun manifest, het onderhoud en de lease buiten de stack van
+//!   de eigenaar. De eigenaar doet in rust alleen wat lokaal is: de capture,
+//!   en de marker vóór en na het manifest. Alleen een onzeker manifest (na
+//!   een PUT die faalde) lost hij in rust met de store op, en alleen als een
+//!   baan de store net hoorde.
 //! - **Welke writes de store heeft** ([`Publications`]): de nummers die de
 //!   eigenaar van elke database zijn captures geeft ([`Replica::begun`],
 //!   [`Synced::capture`]), gedeeld met wie wacht.
@@ -55,7 +57,9 @@
 use crate::lanes::{DynStorage, DynStore, Job, Keep, KeepLease, Lane, LaneSide, Offload};
 use crate::local::Name;
 use crate::object::{Object, Parallel, Replies, Store, StoreError};
-use crate::owner::{Config as ReplicaConfig, Maintenance, Pending, Replica, Synced, Vfs};
+use crate::owner::{
+    Config as ReplicaConfig, Maintenance, Pending, Publishing, Replica, Synced, Vfs,
+};
 use crate::prepare::Reason;
 use crate::publications::Publications;
 use crate::replication::Uploaded;
@@ -253,9 +257,12 @@ impl<D: Storage> Storage for Ticking<'_, D> {
     reason = "één per database onderweg, één keer verplaatst: een box voegt alleen een allocatie toe"
 )]
 enum Landed {
-    /// De delen van een capture staan er (of niet): de eigenaar schrijft het
-    /// manifest ([`Replica::finish`]).
+    /// De delen van een capture staan er (of niet): de eigenaar zet het
+    /// manifest klaar ([`Replica::finish_begin`]) en de PUT op de baan.
     Upload(Pending, Result<Uploaded>),
+    /// Het manifest staat er (of niet): de eigenaar zet de marker
+    /// ([`Replica::finish_end`]).
+    Published(Publishing, Result),
     /// Een onderhoudsbeurt liep ([`Replica::maintenance_finish`]).
     Maintained(Result<Synced>),
 }
@@ -946,6 +953,26 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
         );
         slot
     }
+    /// Zet de PUT van een manifest op [`Lane::Data`].
+    fn push_publish(&self, off: &dyn Offload, publishing: Publishing) -> Slot<Landed> {
+        let slot: Slot<Landed> = Rc::new(RefCell::new(None));
+        let back = slot.clone();
+        let domain = self.config.domain.clone();
+        off.push(
+            Lane::Data,
+            Job::of(move |side: &mut dyn LaneSide| {
+                let mut out = Err(Error::State);
+                let opened = side.files(&domain, &mut |b, s| {
+                    out = publishing.put(&mut DynStorage(b), &mut DynStore(s));
+                });
+                if opened.is_err() {
+                    out = Err(Error::Storage(replica_sqlite::Error::CANNOT_OPEN));
+                }
+                *back.borrow_mut() = Some(Landed::Published(publishing, out));
+            }),
+        );
+        slot
+    }
     /// Zet een onderhoudsbeurt op [`Lane::Data`].
     fn push_maintenance(&self, off: &dyn Offload, round: Maintenance) -> Slot<Landed> {
         let slot: Slot<Landed> = Rc::new(RefCell::new(None));
@@ -1181,9 +1208,11 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
     /// antwoordt.
     ///
     /// 1. Een vernieuwing of een job die een baan afmaakte, komt terug: gemeld
-    ///    en geteld zoals die van de eigenaar zelf. Na een upload schrijft de
-    ///    eigenaar het manifest ([`Replica::finish`]): één kleine PUT, de enige
-    ///    store-call in rust.
+    ///    en geteld zoals die van de eigenaar zelf. Na een upload zet de
+    ///    eigenaar het manifest klaar ([`Replica::finish_begin`], lokaal) en
+    ///    gaat de PUT ervan op [`Lane::Data`]; komt die terug, dan zet hij de
+    ///    marker ([`Replica::finish_end`]). Alleen een flush doet het manifest
+    ///    nog op de eigenaar ([`Replica::finish`]).
     /// 2. De lease gaat op [`Lane::Lease`] als een vernieuwing aan de beurt is.
     /// 3. Per database, tenzij er een job van hem onderweg is: de capture van
     ///    wat veranderde als zijn interval voorbij is ([`Replica::begin`]:
@@ -1226,7 +1255,8 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
             let now = self.now()?;
             if let Some(l) = landed {
                 let (step, out) = match l {
-                    Landed::Upload(pending, uploaded) => {
+                    Landed::Upload(pending, uploaded) if all => {
+                        // Een flush publiceert de rest toch op de eigenaar.
                         if uploaded.is_ok() {
                             self.keeper.answered_at.set(at);
                         }
@@ -1234,6 +1264,27 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
                         let out =
                             f.replica
                                 .finish(&mut f.sync, &mut *store, pending, uploaded, now);
+                        ("upload", out)
+                    }
+                    Landed::Upload(pending, uploaded) => {
+                        if uploaded.is_ok() {
+                            self.keeper.answered_at.set(at);
+                        }
+                        match f.replica.finish_begin(&mut f.sync, pending, uploaded, now) {
+                            Ok(publishing) => {
+                                // De PUT van het manifest op de baan: de
+                                // eigenaar raakt de store niet.
+                                f.flight = Some(self.push_publish(off, publishing));
+                                continue;
+                            }
+                            Err(e) => ("upload", Err(e)),
+                        }
+                    }
+                    Landed::Published(publishing, put) => {
+                        if put.is_ok() {
+                            self.keeper.answered_at.set(at);
+                        }
+                        let out = f.replica.finish_end(&mut f.sync, publishing, put, now);
                         ("upload", out)
                     }
                     Landed::Maintained(round) => {
