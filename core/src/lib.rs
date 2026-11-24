@@ -61,6 +61,12 @@ pub enum Error {
     Unproven,
     /// De schrijverlease is niet meer bevestigd; de eigenaar moet stoppen met schrijven.
     LeaseLost,
+    /// De store is in deze generatie verder door een andere schrijver, terwijl
+    /// de lokale database eigen werk heeft dat nooit in de store kwam (of een
+    /// bevestigd manifest dat door de fencing afviel). Prepare opent niet en
+    /// laat de lokale bestanden en de store onaangeroerd: wie dit ziet, kiest
+    /// tussen de twee. Zie [`prepare`] ("Werk van een ander").
+    ForeignAhead,
     /// De gedeelde staat van eigenaar en VFS is op dit moment geleend: de
     /// SQL-kant staat midden in een callback. Het rustprotocol van
     /// [`owner`] is geschonden; niets is gewijzigd, probeer het in rust opnieuw.

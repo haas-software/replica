@@ -340,7 +340,10 @@ impl Batch {
             .filter(|n| *n <= i64::MAX as u64)
             .ok_or(Error::Limit)?;
         // Vóór de PUT: een crash na serveracceptatie mag de sequence nooit vrijgeven.
+        // Het token gaat mee: alleen een manifest met dit token is na een
+        // herstart het onze (zie `prepare`, "Werk van een ander").
         local.value.uncertain = seq;
+        local.value.uncertain_lease = lease;
         local.value.clean = false;
         local.save(b)?;
         object::publish(store, &key, &manifest, &prefix)?;
@@ -360,6 +363,8 @@ impl Batch {
         local.value.bytes = bytes;
         local.value.complete = true;
         local.value.uncertain = 0;
+        local.value.uncertain_lease = 0;
+        local.value.lease = lease;
         local.value.previous.clear();
         local.value.repair_from.clear();
         local.save(b)?;
@@ -479,6 +484,12 @@ pub fn resolve<B: Storage, S: Store>(
         if manifest.level != 0 || manifest.first != seq || manifest.sequence != seq {
             return Err(Error::Corrupt);
         }
+        // Een manifest op onze sequence met een ander token is niet het onze:
+        // een andere schrijver publiceerde die sequence (`prepare` vangt dat
+        // vóór een herstart al af; dit is de vangrail binnen één leven).
+        if local.value.uncertain_lease != 0 && manifest.lease != local.value.uncertain_lease {
+            return Err(Error::ForeignAhead);
+        }
         let last = manifest.parts.last().ok_or(Error::Corrupt)?;
         let bytes = object::committed(store, &last.key, last.size as usize)?;
         let segment = last.read(&bytes)?;
@@ -495,8 +506,10 @@ pub fn resolve<B: Storage, S: Store>(
         local.value.previous.clear();
         local.value.repair_from.clear();
         local.value.bytes = bytes;
+        local.value.lease = manifest.lease;
     }
     local.value.uncertain = 0;
+    local.value.uncertain_lease = 0;
     local.value.clean = false;
     local.save(b)?;
     Ok(landed)

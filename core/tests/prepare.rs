@@ -41,6 +41,10 @@ fn header() -> [u8; 512] {
     h
 }
 fn remote(store: &mut Bucket, generation: &str, seq: u64, value: u8) {
+    remote_by(store, generation, seq, value, 0);
+}
+/// Als [`remote`], door de schrijver met fencing-token `lease`.
+fn remote_by(store: &mut Bucket, generation: &str, seq: u64, value: u8, lease: u64) {
     let prefix = replication::generation_prefix(NS, generation).unwrap();
     let h = header();
     let page = [value; 512];
@@ -66,7 +70,7 @@ fn remote(store: &mut Bucket, generation: &str, seq: u64, value: u8) {
         start: Time::ZERO,
         end: Time::ZERO,
         parts: vec![part],
-        lease: 0,
+        lease,
     };
     let key = if seq == 1 {
         format!("{prefix}snapshot")
@@ -214,7 +218,12 @@ fn snapshot_fallback_keeps_local_writes_and_can_retry_an_unknown_commit() {
                 let mut bucket = Bucket::default();
                 remote(&mut bucket, OLD, 1, 2);
                 if remote_ahead {
-                    remote(&mut bucket, OLD, 2, 9);
+                    // Ons eigen manifest landde, de marker bleef onzeker (een
+                    // crash midden in de publicatie): het draagt ons token.
+                    marker.value.uncertain = 2;
+                    marker.value.uncertain_lease = 7;
+                    marker.save(&mut fs).unwrap();
+                    remote_by(&mut bucket, OLD, 2, 9, 7);
                 }
                 let mut cold = fs.cold();
                 let mut prepared = prepare::run(
@@ -384,4 +393,212 @@ fn proven_damage_repairs_own_generation_but_transport_never_becomes_bootstrap() 
         Err(Error::Object(StoreError::Denied))
     ));
     assert!(empty.files.is_empty());
+}
+/// Een lokale database op OLD sequence 1, gepubliceerd onder token `lease`.
+fn published(fs: &mut Fs, clean: bool, lease: u64) -> (LocalMarker, Tracking) {
+    let (mut marker, tracking) = local(fs, clean);
+    marker.value.lease = lease;
+    marker.save(fs).unwrap();
+    (marker, tracking)
+}
+/// Prepare op de koude bestanden, met de verificatie als bewijs van een herstel.
+fn reopen(fs: &Fs, bucket: &mut Bucket) -> (Result<Reason, Error>, bool, Fs) {
+    let mut cold = fs.cold();
+    let mut verified = false;
+    let result = prepare::run(&mut cold, bucket, options(&destination(), false), |_, _| {
+        verified = true;
+        Ok(())
+    })
+    .map(|p| p.reason);
+    (result, verified, cold)
+}
+#[test]
+fn the_work_of_another_writer_is_restored_over_a_clean_volume_and_never_over_own_work() {
+    // A publiceerde sequence 1 onder token 1; B (token 2) publiceerde 2 en 3.
+    for dirty_writes in [false, true] {
+        for clean in [true, false] {
+            let mut fs = Fs::default();
+            let (mut marker, mut tracking) = published(&mut fs, clean, 1);
+            if dirty_writes {
+                write(&mut fs, &mut marker, &mut tracking, 8);
+            }
+            let mut bucket = Bucket::default();
+            remote_by(&mut bucket, OLD, 1, 2, 1);
+            remote_by(&mut bucket, OLD, 2, 9, 2);
+            remote_by(&mut bucket, OLD, 3, 7, 2);
+            let objects = bucket.data.clone();
+            let files = fs.cold().stable;
+            let (result, verified, cold) = reopen(&fs, &mut bucket);
+            assert_eq!(bucket.data, objects, "de store onaangeroerd");
+            if clean && !dirty_writes {
+                assert_eq!(result, Ok(Reason::Restored));
+                assert!(verified);
+                assert_eq!(&cold.cold().data("db").unwrap()[512..], &[7; 512]);
+                let marker = LocalMarker::load(&mut cold.cold(), Name::new("db").unwrap()).unwrap();
+                assert_eq!(
+                    (marker.value.generation.as_str(), marker.value.sequence),
+                    (OLD, 3)
+                );
+            } else {
+                assert_eq!(result, Err(Error::ForeignAhead));
+                assert!(!verified);
+                assert_eq!(cold.cold().stable, files, "lokale bestanden onaangeroerd");
+            }
+        }
+    }
+}
+#[test]
+fn a_restored_old_volume_never_overrides_later_work_of_the_same_lease() {
+    // Een teruggezet volume uit hetzelfde leven van A: de marker staat op 1,
+    // A zelf publiceerde daarna nog 2 en 3 onder hetzelfde token. Hetzelfde
+    // token bewijst dus niets; alleen het ene onzekere manifest is van ons.
+    for clean in [true, false] {
+        let mut fs = Fs::default();
+        let _ = published(&mut fs, clean, 1);
+        let mut bucket = Bucket::default();
+        for seq in 1..=3 {
+            remote_by(&mut bucket, OLD, seq, seq as u8 + 4, 1);
+        }
+        let (result, verified, cold) = reopen(&fs, &mut bucket);
+        if clean {
+            assert_eq!(result, Ok(Reason::Restored));
+            assert!(verified);
+            assert_eq!(&cold.cold().data("db").unwrap()[512..], &[7; 512]);
+        } else {
+            assert_eq!(result, Err(Error::ForeignAhead));
+            assert_eq!(&cold.data("db").unwrap()[512..], &[2; 512]);
+        }
+    }
+}
+#[test]
+fn only_our_own_uncertain_manifest_lets_the_local_source_republish() {
+    // (token van het onzekere manifest in de marker, token in de store, verwacht)
+    for (ours, theirs, expected) in [
+        // Crash midden in onze publicatie: ons manifest landde.
+        (1, 1, Ok(Reason::NewSnapshot)),
+        // Een marker van vóór deze versie: de oude regel voor zijn sequence.
+        (0, 1, Ok(Reason::NewSnapshot)),
+        (0, 0, Ok(Reason::NewSnapshot)),
+        // Ons manifest landde niet (of viel af); B publiceerde dezelfde sequence.
+        (1, 2, Err(Error::ForeignAhead)),
+    ] {
+        let mut fs = Fs::default();
+        let (mut marker, mut tracking) = published(&mut fs, true, 1);
+        write(&mut fs, &mut marker, &mut tracking, 9);
+        marker.value.uncertain = 2;
+        marker.value.uncertain_lease = ours;
+        marker.save(&mut fs).unwrap();
+        let mut bucket = Bucket::default();
+        remote_by(&mut bucket, OLD, 1, 2, 1);
+        remote_by(&mut bucket, OLD, 2, 9, theirs);
+        let (result, verified, cold) = reopen(&fs, &mut bucket);
+        assert_eq!(result, expected, "ons token {ours}, in de store {theirs}");
+        assert!(!verified, "nooit een herstel over eigen werk heen");
+        assert_eq!(&cold.data("db").unwrap()[512..], &[9; 512]);
+    }
+    // Onzeker op 2, maar de store is verder dan dat ene manifest: B bouwde verder.
+    let mut fs = Fs::default();
+    let (mut marker, _) = published(&mut fs, false, 1);
+    marker.value.uncertain = 2;
+    marker.value.uncertain_lease = 1;
+    marker.save(&mut fs).unwrap();
+    let mut bucket = Bucket::default();
+    remote_by(&mut bucket, OLD, 1, 2, 1);
+    remote_by(&mut bucket, OLD, 2, 9, 1);
+    remote_by(&mut bucket, OLD, 3, 7, 2);
+    assert_eq!(reopen(&fs, &mut bucket).0, Err(Error::ForeignAhead));
+}
+#[test]
+fn our_own_volume_reopens_as_before() {
+    // Dezelfde stand als de store, met of zonder lokale writes, met of zonder
+    // token (een marker van vóór deze versie): gewoon doorgaan.
+    for lease in [0, 1] {
+        for dirty in [false, true] {
+            let mut fs = Fs::default();
+            let (mut marker, mut tracking) = published(&mut fs, true, lease);
+            if dirty {
+                write(&mut fs, &mut marker, &mut tracking, 8);
+            }
+            let mut bucket = Bucket::default();
+            remote_by(&mut bucket, OLD, 1, 2, lease);
+            let (result, verified, cold) = reopen(&fs, &mut bucket);
+            assert_eq!(result, Ok(Reason::Continued));
+            assert!(!verified);
+            let expected = if dirty { 8 } else { 2 };
+            assert_eq!(&cold.data("db").unwrap()[512..], &[expected; 512]);
+        }
+    }
+    // Een herstart onder een nieuwe lease verandert daar niets aan: de store
+    // draagt het token van toen.
+    let mut fs = Fs::default();
+    let _ = published(&mut fs, true, 1);
+    let mut bucket = Bucket::default();
+    remote_by(&mut bucket, OLD, 1, 2, 1);
+    let mut cold = fs.cold();
+    let first = prepare::run(
+        &mut cold,
+        &mut bucket,
+        options(&destination(), false),
+        |_, _| panic!("eigen volume"),
+    )
+    .unwrap();
+    assert_eq!(first.reason, Reason::Continued);
+    assert_eq!(first.marker.value.lease, 1);
+    assert_eq!(reopen(&cold, &mut bucket).0, Ok(Reason::Continued));
+}
+#[test]
+fn a_confirmed_manifest_that_lost_to_the_fencing_is_own_unpublished_work() {
+    // A bevestigde sequence 1 onder token 1, maar zijn PUT landde na B's
+    // overname en viel af: in de keten staat B's sequence 1 (token 2).
+    for clean in [true, false] {
+        let mut fs = Fs::default();
+        let _ = published(&mut fs, clean, 1);
+        let mut bucket = Bucket::default();
+        remote_by(&mut bucket, OLD, 1, 9, 2);
+        assert_eq!(reopen(&fs, &mut bucket).0, Err(Error::ForeignAhead));
+        // Ook als B daarna verder publiceerde.
+        remote_by(&mut bucket, OLD, 2, 7, 2);
+        assert_eq!(reopen(&fs, &mut bucket).0, Err(Error::ForeignAhead));
+    }
+}
+#[test]
+fn an_interrupted_renewal_never_falls_back_past_another_writer() {
+    // A begon een nieuwe generatie (vorige: OLD op 1) en stopte midden in de
+    // snapshot; B ging in OLD verder. Terugvallen of hervatten zou B verdringen.
+    let mut fs = Fs::default();
+    let (mut marker, mut tracking) = published(&mut fs, true, 1);
+    replication::renew(&mut fs, &mut marker, at(20)).unwrap();
+    write(&mut fs, &mut marker, &mut tracking, 8);
+    let mut bucket = Bucket::default();
+    remote_by(&mut bucket, OLD, 1, 2, 1);
+    remote_by(&mut bucket, OLD, 2, 9, 2);
+    let files = fs.cold().stable;
+    let (result, verified, cold) = reopen(&fs, &mut bucket);
+    assert_eq!(result, Err(Error::ForeignAhead));
+    assert!(!verified);
+    assert_eq!(cold.cold().stable, files);
+}
+#[test]
+fn the_marker_keeps_its_tokens_and_reads_older_markers() {
+    let mut value = Marker::new(&destination(), OLD, at(0)).unwrap();
+    value.page_size = 512;
+    value.sequence = 1;
+    value.size = 1024;
+    value.at = at(1);
+    value.complete = true;
+    let plain = String::from_utf8(value.encode().unwrap()).unwrap();
+    assert!(
+        !plain.contains("lease"),
+        "zonder token dezelfde bytes als Go"
+    );
+    value.lease = 3;
+    value.uncertain = 2;
+    value.uncertain_lease = 4;
+    let bytes = value.encode().unwrap();
+    assert_eq!(Marker::decode(&bytes).unwrap(), value);
+    let older = Marker::decode(plain.as_bytes()).unwrap();
+    assert_eq!((older.lease, older.uncertain_lease), (0, 0));
+    // Een token voor een onzekere sequence die er niet is: beschadigd.
+    value.uncertain = 0;
+    assert_eq!(value.encode(), Err(Error::Corrupt));
 }

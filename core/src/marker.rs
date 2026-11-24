@@ -43,7 +43,19 @@ pub struct Marker {
     pub repair_from: String,
     /// Een uitgezonden manifest waarvan de PUT-uitkomst nog moet worden opgehelderd.
     pub uncertain: u64,
+    /// Het fencing-token ([`crate::manifest::Manifest::lease`]) van het laatst
+    /// bevestigde manifest dat deze marker zelf publiceerde. Nul: onbekend
+    /// (een oudere marker, een herstel, of nog niets gepubliceerd).
+    pub lease: u64,
+    /// Het token van het manifest dat bij [`Marker::uncertain`] onderweg is;
+    /// nul zonder `uncertain` of bij een oudere marker.
+    pub uncertain_lease: u64,
 }
+/// JSON-sleutels van [`Marker::lease`] en [`Marker::uncertain_lease`]; alleen
+/// geschreven als ze niet nul zijn, zodat een marker zonder token dezelfde
+/// bytes houdt als Go.
+const LEASE: &str = "lease_generation";
+const UNCERTAIN_LEASE: &str = "uncertain_lease_generation";
 impl Marker {
     /// Een nog ongepubliceerde generatie; lege generatie is de bootstrapstaat.
     pub fn new(destination: &str, generation: &str, started_at: Time) -> Result<Self> {
@@ -62,6 +74,8 @@ impl Marker {
             previous: Vec::new(),
             repair_from: String::new(),
             uncertain: 0,
+            lease: 0,
+            uncertain_lease: 0,
         };
         out.validate(0)?;
         Ok(out)
@@ -84,10 +98,20 @@ impl Marker {
         if !self.repair_from.is_empty() {
             generation_time(&self.repair_from)?;
         }
-        for n in [self.sequence, self.size, self.bytes, self.uncertain] {
+        for n in [
+            self.sequence,
+            self.size,
+            self.bytes,
+            self.uncertain,
+            self.lease,
+            self.uncertain_lease,
+        ] {
             if n > i64::MAX as u64 {
                 return Err(Error::Corrupt);
             }
+        }
+        if self.uncertain_lease != 0 && self.uncertain == 0 {
+            return Err(Error::Corrupt);
         }
         if self.clean && !self.complete {
             return Err(Error::Corrupt);
@@ -152,6 +176,14 @@ impl Marker {
                 Some(_) => uint(o, "uncertain")?,
                 None => 0,
             },
+            lease: match o.get(LEASE) {
+                Some(_) => uint(o, LEASE)?,
+                None => 0,
+            },
+            uncertain_lease: match o.get(UNCERTAIN_LEASE) {
+                Some(_) => uint(o, UNCERTAIN_LEASE)?,
+                None => 0,
+            },
         };
         out.validate(depth)?;
         Ok(out)
@@ -200,6 +232,12 @@ impl Marker {
         }
         if self.uncertain != 0 {
             push(&mut o, "uncertain", Value::uint(self.uncertain))?;
+        }
+        if self.lease != 0 {
+            push(&mut o, LEASE, Value::uint(self.lease))?;
+        }
+        if self.uncertain_lease != 0 {
+            push(&mut o, UNCERTAIN_LEASE, Value::uint(self.uncertain_lease))?;
         }
         Ok(Value::Object(o))
     }

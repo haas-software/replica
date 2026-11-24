@@ -1,8 +1,22 @@
 //! Boot vóór SQLite openen: lineage controleren, log hervatten of offline herstellen.
+//!
+//! **Werk van een ander.** Een tenant draait op A, dan op B, dan weer op A met
+//! A's oude volume (of een teruggezet volume). De store is dan in dezelfde
+//! generatie verder dan A's marker, door B. Een store die verder is, is alleen
+//! van onszelf als het precies het ene manifest is dat de marker als onzeker
+//! (`uncertain`) wegstuurde, met ons token erin ([`Marker::uncertain_lease`]):
+//! de marker is duurzaam vóór elke PUT, dus een andere achterstand bestaat
+//! voor ons eigen volume niet. Is het van een ander, dan herstelt een schone
+//! database uit de store; heeft de lokale database eigen ongepubliceerd werk,
+//! dan opent hij niet ([`Error::ForeignAhead`]) en blijven de bestanden staan.
+//! Zo ook wanneer ons eigen bevestigde manifest door de fencing afviel (een
+//! ander manifest met dezelfde sequence en een ander token), en wanneer een
+//! onderbroken generatiewissel terug zou vallen op een generatie waarin de
+//! store sindsdien verder is.
 use crate::{
     Error, Result,
     local::{File, Name},
-    manifest::Layout,
+    manifest::{Layout, Manifest},
     marker::{self, LocalMarker, Marker},
     object::{self, Store, StoreError},
     replication,
@@ -72,6 +86,42 @@ fn tip<S: Store>(store: &mut S, namespace: &str, generation: String) -> Result<T
         layout,
     };
     Ok(out)
+}
+impl Tip {
+    /// Het raw-manifest (of de snapshot) met `sequence` in de keten, als het er
+    /// nog staat; bij twee met dezelfde sequence is dit het winnende token.
+    fn raw(&self, sequence: u64) -> Option<&Manifest> {
+        let snapshot = self.layout.snapshot();
+        if snapshot.sequence == sequence {
+            return Some(snapshot);
+        }
+        self.layout
+            .commits()
+            .iter()
+            .find(|m| m.level == 0 && m.sequence == sequence)
+    }
+}
+/// Is de store verder dan `marker` door ons eigen onzekere manifest? Alleen
+/// dat ene manifest, met ons token; een marker zonder token (een oudere
+/// versie) houdt de oude regel voor zijn onzekere sequence.
+fn ours(marker: &Marker, tip: &Tip) -> bool {
+    let seq = marker.uncertain;
+    seq != 0
+        && seq == tip.sequence
+        && marker.sequence.checked_add(1) == Some(seq)
+        && tip
+            .raw(seq)
+            .is_some_and(|m| marker.uncertain_lease == 0 || m.lease == marker.uncertain_lease)
+}
+/// Viel ons laatst bevestigde manifest af tegen een ander met dezelfde
+/// sequence (een late PUT na een overname)? Dan staat er lokaal werk dat
+/// nooit in de keten kwam. Zonder token of zonder raw-manifest: niet te zeggen.
+fn fenced_out(marker: &Marker, tip: &Tip) -> bool {
+    marker.lease != 0
+        && marker.complete
+        && tip
+            .raw(marker.sequence)
+            .is_some_and(|m| m.lease != 0 && m.lease != marker.lease)
 }
 fn fresh<B: Storage>(
     b: &mut B,
@@ -222,10 +272,31 @@ pub fn run<B: Storage, S: Store>(
         if !local.value.complete && local.value.repair_from == tip.generation {
             return fresh(b, &options, &tip.generation, Reason::Repair);
         }
+        if local.value.generation == tip.generation && fenced_out(&local.value, tip) {
+            return Err(Error::ForeignAhead);
+        }
         if local.value.generation == tip.generation && local.value.sequence < tip.sequence {
-            // Manifest gecommit, lokale marker achtergebleven: publiceer de
-            // lokale bron opnieuw zonder afhankelijkheid van het oude dirty log.
-            return fresh(b, &options, &tip.generation, Reason::NewSnapshot);
+            if ours(&local.value, tip) {
+                // Ons manifest gecommit, lokale marker onzeker gebleven: publiceer
+                // de lokale bron opnieuw zonder afhankelijkheid van het oude dirty log.
+                return fresh(b, &options, &tip.generation, Reason::NewSnapshot);
+            }
+            // Een ander publiceerde verder. Zonder eigen werk: diens stand
+            // herstellen; met eigen werk: niet openen en niets aanraken.
+            if local.value.complete && local.value.clean {
+                return restored(b, store, &options, remote.ok_or(Error::State)?, &mut verify);
+            }
+            return Err(Error::ForeignAhead);
+        }
+        if !local.value.complete
+            && local.value.previous.first().is_some_and(|old| {
+                old.generation == tip.generation
+                    && (old.sequence < tip.sequence || fenced_out(old, tip))
+            })
+        {
+            // Een onderbroken generatiewissel valt terug op (of hervat vanaf)
+            // de vorige generatie, maar daarin is een ander sindsdien verder.
+            return Err(Error::ForeignAhead);
         }
         if !local.value.repair_from.is_empty() {
             return Err(Error::Unproven);
