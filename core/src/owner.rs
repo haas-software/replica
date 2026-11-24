@@ -426,6 +426,14 @@ pub struct Vfs<'a, B: Storage> {
     /// vernieuwt (en dus leent); een vernieuwing schuift hem alleen op.
     deadline: i64,
 }
+impl<'a, B: Storage> Vfs<'a, B> {
+    /// De opslag terug na de verbinding: een host die zijn bestanden opnieuw
+    /// voorbereidt (een nieuwe lease na een verlopen, de vorige [`Replica`]
+    /// gesloten) opent de volgende verbinding op dezelfde opslag.
+    pub fn into_storage(self) -> &'a mut B {
+        self.storage
+    }
+}
 impl<B: Storage> Vfs<'_, B> {
     /// Dicht of verloren: geen write meer. Anders de actuele deadline.
     fn deadline(&mut self) -> replica_sqlite::Result<i64> {

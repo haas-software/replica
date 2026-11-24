@@ -283,6 +283,10 @@ fn sync_runs_between_statements_while_the_vfs_stays_open() {
         generation = r.marker().generation.clone();
         assert!(r.marker().complete);
         assert!(r.marker().sequence >= 9);
+        // De verbinding dicht: de opslag komt terug voor een volgende VFS.
+        drop(db);
+        let back = vfs.into_storage();
+        assert!(tracker.vfs(back).is_ok());
     }
     // De verbinding en de VFS zijn dicht; de eigenaar sluit en de lease gaat vrij.
     r.close();
