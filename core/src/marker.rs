@@ -12,7 +12,7 @@ use crate::{
 use alloc::{string::String, vec::Vec};
 use hop_types::json::{self, Object, Value};
 use replica_sqlite::Storage;
-/// Compleet Go-formaat, inclusief herstel van een onderbroken generatiewissel.
+/// De lokale marker, inclusief herstel van een onderbroken generatiewissel.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Marker {
     /// SHA-256 van endpoint, bucket, prefix en domain met nul ertussen.
@@ -53,7 +53,7 @@ pub struct Marker {
 }
 /// JSON-sleutels van [`Marker::lease`] en [`Marker::uncertain_lease`]; alleen
 /// geschreven als ze niet nul zijn, zodat een marker zonder token dezelfde
-/// bytes houdt als Go.
+/// bytes houdt als die van een oudere versie.
 const LEASE: &str = "lease_generation";
 const UNCERTAIN_LEASE: &str = "uncertain_lease_generation";
 impl Marker {
@@ -133,7 +133,7 @@ impl Marker {
         }
         Ok(())
     }
-    /// Gevalideerd lezen met dezelfde 64 KiB-grens als Go.
+    /// Gevalideerd lezen, hoogstens 64 KiB.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > 65536 {
             return Err(Error::Limit);
@@ -241,7 +241,7 @@ impl Marker {
         }
         Ok(Value::Object(o))
     }
-    /// Exacte veldvolgorde en optionele velden uit de Go-struct.
+    /// Vaste veldvolgorde en optionele velden, bytegelijk aan de fixtures.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let s = json::to_string(&self.value(0)?).map_err(json_error)?;
         if s.len() > 65536 {
@@ -280,7 +280,7 @@ pub fn generation_time(id: &str) -> Result<Time> {
     }
     Time::parse(core::str::from_utf8(&stamp).map_err(|_| Error::Corrupt)?)
 }
-/// Zelfde generatie-ID als Go, maar mislukte entropie komt expliciet terug.
+/// Een nieuwe generatie-ID; mislukte entropie komt expliciet terug.
 pub fn new_generation<B: Storage>(b: &mut B, now: Time) -> Result<String> {
     if now.seconds() < 1_577_836_800 {
         return Err(Error::State);

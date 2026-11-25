@@ -1,6 +1,6 @@
 //! Segmenten: paginabeelden met databasegrootte en SHA-256 van de hele body.
 //!
-//! - `SPINSEG1` (Go): `magic | page_size u32 | database_size u64 | count u32 |
+//! - `SPINSEG1`: `magic | page_size u32 | database_size u64 | count u32 |
 //!   (nummer u32, pagina)* | sha256`, alles big-endian.
 //! - `SPINSEG2` (gecomprimeerd): dezelfde kop, per pagina `nummer u32 |
 //!   lengte u32 | bytes`; lengte gelijk aan de paginamaat is rauw, nul is een
@@ -24,11 +24,11 @@ const PACKED: &[u8; 8] = b"SPINSEG2";
 pub struct Segments {
     /// Paginabytes per segment (vóór compressie): 64 KiB..16 MiB.
     pub bytes: usize,
-    /// `SPINSEG2` in plaats van Go's `SPINSEG1`.
+    /// `SPINSEG2` in plaats van `SPINSEG1`.
     pub compress: bool,
 }
 impl From<usize> for Segments {
-    /// Ongecomprimeerd, zoals Go.
+    /// Ongecomprimeerd (`SPINSEG1`).
     fn from(bytes: usize) -> Self {
         Self {
             bytes,
@@ -72,7 +72,7 @@ impl<'a> Page<'a> {
         self.stored
     }
 }
-/// SQLite-paginamaten uit het Go-formaat.
+/// Geldige SQLite-paginamaten in een segment.
 pub const fn valid_page_size(n: u32) -> bool {
     n >= 512 && n <= 65536 && n.is_power_of_two()
 }
@@ -197,7 +197,7 @@ impl<'a> Iterator for Pages<'a> {
 }
 impl ExactSizeIterator for Pages<'_> {}
 
-/// Schrijft exact het bestaande Go-formaat; ongeldige invoer levert geen segment.
+/// Schrijft exact `SPINSEG1`; ongeldige invoer levert geen segment.
 pub fn encode(page_size: u32, database_size: u64, pages: &[(u32, &[u8])]) -> Result<Vec<u8>> {
     encode_with(page_size, database_size, pages, false)
 }

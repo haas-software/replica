@@ -589,7 +589,7 @@ fn the_marker_keeps_its_tokens_and_reads_older_markers() {
     let plain = String::from_utf8(value.encode().unwrap()).unwrap();
     assert!(
         !plain.contains("lease"),
-        "zonder token dezelfde bytes als Go"
+        "zonder token dezelfde bytes als een oudere marker"
     );
     value.lease = 3;
     value.uncertain = 2;

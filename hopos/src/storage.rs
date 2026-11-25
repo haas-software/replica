@@ -171,7 +171,7 @@ impl Path {
 /// De meetlat: wat SQLite vroeg (de callbacks) tegenover wat er over de
 /// system-client ging (elke call is een ronde door de OS-core). Het verschil
 /// is wat deze laag wegneemt; de bench-app drukt beide per stap af. Tellers
-/// als atomics (handboek §1.3): zo leest de app ze terwijl SQLite de
+/// als atomics: zo leest de app ze terwijl SQLite de
 /// eigenaar geleend houdt.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Stats {

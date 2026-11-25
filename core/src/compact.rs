@@ -270,7 +270,7 @@ impl Output<'_> {
         Ok(())
     }
 }
-/// De bestaande Go-venstersleutel, met gehele UTC-seconden.
+/// De sleutel van een compactievenster, met gehele UTC-seconden.
 pub fn window_key(prefix: &str, level: u32, start: Time, end: Time) -> Result<String> {
     if level == 0
         || level > 32

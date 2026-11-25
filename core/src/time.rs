@@ -1,4 +1,4 @@
-//! RFC3339Nano met Go's echte nul-tijd, gescheiden van de Unix-epoch.
+//! RFC3339Nano met een echte nul-tijd (0001-01-01), gescheiden van de Unix-epoch.
 use crate::{Error, Result};
 use alloc::string::String;
 /// UTC-tijdstip; de representatie houdt ook jaar 0001 en nanoseconden exact.
@@ -8,7 +8,7 @@ pub struct Time {
     nanos: u32,
 }
 impl Time {
-    /// Go's `time.Time{}`; dit is niet 1970-01-01.
+    /// De nul-tijd 0001-01-01T00:00:00Z; dit is niet 1970-01-01.
     pub const ZERO: Self = Self {
         seconds: -62135596800,
         nanos: 0,
@@ -114,7 +114,7 @@ impl Time {
             era * 146097 + yo * 365 + yo / 4 - yo / 100 + (153 * mp + 2) / 5 + d - 1 - 719468;
         Self::unix(days * 86400 + h * 3600 + mi * 60 + se - offset, nanos)
     }
-    /// Canonieke UTC-vorm zoals Go met `RFC3339Nano`; geen onnauwkeurige floats.
+    /// Canonieke UTC-vorm in `RFC3339Nano`; geen onnauwkeurige floats.
     pub fn encode(self) -> Result<String> {
         let z = self.seconds.div_euclid(86400) + 719468;
         let era = z.div_euclid(146097);

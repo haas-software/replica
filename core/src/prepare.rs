@@ -29,7 +29,7 @@ use alloc::string::String;
 use replica_sqlite::Storage;
 /// Invoer van de exclusieve database-eigenaar, vóór er SQL-taken worden toegelaten.
 pub struct Options<'a> {
-    /// Go-namespace `prefix/domain`, zonder afsluitende slash.
+    /// Namespace `prefix/domain`, zonder afsluitende slash.
     pub namespace: &'a str,
     /// Gepinde bestemmingshash van endpoint/bucket/prefix/domain.
     pub destination: &'a str,
@@ -179,7 +179,7 @@ fn restored<B: Storage, S: Store>(
         reason: Reason::Restored,
     })
 }
-/// Bereidt de database voor volgens Go's lineage-regels. I/O-fouten zijn retries,
+/// Bereidt de database voor volgens de lineage-regels. I/O-fouten zijn retries,
 /// geen reden om met een lege DB te beginnen. De verificatiecallback krijgt de
 /// complete scratchdatabase vóór de bestaande bestemming verandert.
 pub fn run<B: Storage, S: Store>(

@@ -76,9 +76,9 @@ pub enum Dial {
     Normal,
     /// Voor de schrijverlease ([`lease_store`]): een dial die bij een lege pot
     /// ruimte maakt door een andere verbinding te sluiten. applib v3.2.3 heeft
-    /// die dial (`Dialer::forced()`), maar het gebruik is geparkeerd (21 nov
-    /// 2026): tot dat besluit is dit [`Dial::Normal`], en is
-    /// [`dialer`] de enige plek die verandert.
+    /// die dial (`Dialer::forced()`), maar die wordt nog niet
+    /// gebruikt: voorlopig is dit [`Dial::Normal`], en is [`dialer`] de enige
+    /// plek die verandert.
     Forced,
 }
 /// De TCP-dialer voor `dial`.

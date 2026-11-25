@@ -47,7 +47,7 @@ pub struct Manifest {
     /// In deze volgorde toe te passen onderdelen.
     pub parts: Vec<Part>,
     /// Het fencing-token van de schrijver: de generatie van zijn lease
-    /// (`writer::Writer::generation`). Nul is onbekend: Go en oudere versies
+    /// (`writer::Writer::generation`). Nul is onbekend: oudere versies
     /// schrijven het veld niet, en een lezer zonder dit veld negeert het.
     /// Bij twee raw-commits met dezelfde sequence wint het hoogste token
     /// ([`Layout::new`]); de andere is afval van een schrijver die zijn lease kwijt was.
@@ -80,7 +80,7 @@ pub(crate) fn timestamp(o: &Object, k: &str, optional: bool) -> Result<Time> {
         _ => Err(Error::Corrupt),
     }
 }
-/// Hash in dezelfde kleine hexletters als Go's `sha256hex`.
+/// Hash als 64 kleine hexletters.
 pub fn hex(hash: &[u8; 32]) -> [u8; 64] {
     let mut out = [0; 64];
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -153,7 +153,7 @@ impl Manifest {
         }
         Ok(())
     }
-    /// Leest het Go-formaat; onbekende velden mogen mee, dubbele sleutels niet.
+    /// Leest manifest v2; onbekende velden mogen mee, dubbele sleutels niet.
     pub fn decode(bytes: &[u8], prefix: &str) -> Result<Self> {
         let value = json::parse_with_limit(bytes, MAX_MANIFEST_BYTES).map_err(json_error)?;
         let o = value.as_object().ok_or(Error::Corrupt)?;
@@ -191,7 +191,7 @@ impl Manifest {
         m.validate(prefix)?;
         Ok(m)
     }
-    /// Dezelfde veldvolgorde en nul-tijden als `encoding/json` met de Go-struct.
+    /// Vaste veldvolgorde en nul-tijden, bytegelijk aan de fixtures.
     pub fn encode(&self, prefix: &str) -> Result<Vec<u8>> {
         self.validate(prefix)?;
         let mut o = Object::new();
@@ -228,7 +228,8 @@ impl Manifest {
             parts.push(Value::Object(o));
         }
         o.push("parts", Value::Array(parts)).map_err(json_error)?;
-        // Achteraan en alleen als hij er is: zonder token dezelfde bytes als Go.
+        // Achteraan en alleen als hij er is: zonder token dezelfde bytes als een
+        // manifest van een oudere versie.
         if self.lease != 0 {
             o.push(LEASE, Value::uint(self.lease)).map_err(json_error)?;
         }

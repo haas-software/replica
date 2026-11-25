@@ -25,7 +25,7 @@ pub struct Batch {
     generation: String,
     previous_sequence: u64,
 }
-/// Prefix van een generatie, gelijk aan Go's `prefix/domain/generations/id/`.
+/// Prefix van een generatie: `prefix/domain/generations/id/`.
 pub fn generation_prefix(namespace: &str, generation: &str) -> Result<String> {
     if namespace.is_empty() || namespace.ends_with('/') || namespace.contains("..") {
         return Err(Error::State);
@@ -473,7 +473,8 @@ impl Manifesting {
         local.save(b)
     }
 }
-/// Bestaande raw-keyvorm; tijden buiten Go's veilige UnixNano-bereik worden niet gepubliceerd.
+/// De raw-sleutel van een commit; tijden vóór de Unix-epoch of voorbij een
+/// `i64` aan nanoseconden worden niet gepubliceerd.
 pub fn raw_key(prefix: &str, sequence: u64, at: Time) -> Result<String> {
     let ns = at
         .seconds()

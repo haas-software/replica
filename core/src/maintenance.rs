@@ -37,7 +37,7 @@ pub struct Schedule {
     levels: Vec<Level>,
 }
 impl Schedule {
-    /// Go's defaults: 15m:2h, 1h:24h, 24h:168h.
+    /// Het standaardschema: 15m:2h, 1h:24h, 24h:168h.
     pub fn defaults() -> Result<Self> {
         Self::new(&[
             Level {
@@ -54,7 +54,8 @@ impl Schedule {
             },
         ])
     }
-    /// Alle vensters zijn ten minste één minuut en passen in Go's durationbereik.
+    /// Alle vensters zijn ten minste één minuut en passen in een duur van
+    /// hoogstens 2^63 ns (ongeveer 292 jaar).
     pub fn new(levels: &[Level]) -> Result<Self> {
         if levels.is_empty() || levels.len() > 32 {
             return Err(Error::Limit);
@@ -75,7 +76,7 @@ impl Schedule {
         out.extend_from_slice(levels);
         Ok(Self { levels: out })
     }
-    /// Leest dezelfde window:keep-notatie als Go, met begrensde invoer.
+    /// Leest de window:keep-notatie (`15m:2h,1h:24h`), met begrensde invoer.
     pub fn parse(text: &str) -> Result<Self> {
         if text.len() > 4096 {
             return Err(Error::Limit);

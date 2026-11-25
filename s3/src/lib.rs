@@ -377,7 +377,7 @@ impl<T: Transport, W: Suspend> S3<T, W> {
 /// Het CAS-protocol van de hop-lease op S3: GET geeft de lease met zijn ETag,
 /// PUT met `If-None-Match: *` maakt aan, PUT of DELETE met `If-Match` vervangt
 /// of verwijdert, en 412 (of 409) is "gehouden". Na een 412 op een geciteerde
-/// ETag volgt één poging met de kale (Hetzner, Ceph RGW), zoals agentd.
+/// ETag volgt één poging met de kale (Hetzner, Ceph RGW).
 /// Bunny Storage kan een "ghost" geven: GET 404 terwijl HEAD 200 en de
 /// aanmaak 412 zegt. Bleef die ETag een TTL onveranderd, dan is hij van
 /// niemand en volgt een overname op die ETag (gemeten 08-09-2026 in Hop).

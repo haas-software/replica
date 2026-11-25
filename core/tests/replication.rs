@@ -304,7 +304,7 @@ fn native_sqlite_replication_pipeline_with_concurrent_changes_and_unknown_commit
     ));
 }
 #[test]
-fn go_marker_and_renewal_bytes_and_generation_identity() {
+fn marker_and_renewal_bytes_and_generation_identity() {
     for bytes in [
         include_bytes!("fixtures/marker.json").as_slice(),
         include_bytes!("fixtures/renewal.json").as_slice(),

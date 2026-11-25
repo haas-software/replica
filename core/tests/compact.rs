@@ -1,4 +1,4 @@
-//! Zelfde shrink/grow-uitvoer als Go; iedere onderbroken prune blijft herstelbaar.
+//! Shrink/grow-uitvoer gelijk aan de vaste fixture; iedere onderbroken prune blijft herstelbaar.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod support;
 use replica_core::{
@@ -81,7 +81,7 @@ fn window() -> Window {
     }
 }
 #[test]
-fn merged_segment_matches_go_and_retains_truncation_history() {
+fn merged_segment_matches_fixture_and_retains_truncation_history() {
     let (mut fs, mut store, mut marker, m2, m3, _, _) = fixture();
     let merged = compact::merge(
         &mut fs,
@@ -132,11 +132,11 @@ fn a_compressed_input_makes_a_compressed_merge_with_the_same_pages() {
     let out = &store.data[&merged.parts[0].key];
     assert_eq!(&out[..8], b"SPINSEG2");
     let seg = segment::Segment::decode(out).unwrap();
-    let go = segment::Segment::decode(include_bytes!("fixtures/compact.bin")).unwrap();
-    assert_eq!(seg.database_size(), go.database_size());
+    let fixture = segment::Segment::decode(include_bytes!("fixtures/compact.bin")).unwrap();
+    assert_eq!(seg.database_size(), fixture.database_size());
     let (mut a, mut b) = (vec![0u8; 512], vec![0u8; 512]);
     let pages: Vec<_> = seg.pages().collect();
-    let want: Vec<_> = go.pages().collect();
+    let want: Vec<_> = fixture.pages().collect();
     assert_eq!(pages.len(), want.len());
     for ((n, p), (wn, wp)) in pages.iter().zip(&want) {
         assert_eq!(n, wn);
@@ -146,7 +146,7 @@ fn a_compressed_input_makes_a_compressed_merge_with_the_same_pages() {
     }
 }
 #[test]
-fn parallel_downloads_merge_to_the_same_go_segment() {
+fn parallel_downloads_merge_to_the_same_segment() {
     let (mut fs, mut store, mut marker, m2, m3, _, _) = fixture();
     store.parallel = Some(replica_core::object::Parallel {
         requests: 8,

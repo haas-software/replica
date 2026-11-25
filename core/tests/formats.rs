@@ -1,4 +1,4 @@
-//! Onafhankelijke Go-fixtures plus beschadigings- en herstelgrenzen.
+//! Vaste bytefixtures plus beschadigings- en herstelgrenzen.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use replica_core::{
     Error,
@@ -15,7 +15,7 @@ const MAN: &[u8] = include_bytes!("fixtures/manifest.json");
 const WIN: &[u8] = include_bytes!("fixtures/window.json");
 const GEN: &str = "20260930-123456-abcdef0123456789";
 #[test]
-fn go_segment_exact_and_untrusted_lengths() {
+fn segment_fixture_exact_and_untrusted_lengths() {
     let seg = Segment::decode(SEG).unwrap();
     assert_eq!((seg.page_size(), seg.database_size()), (512, 1536));
     // SPINSEG1 is rauw: de opgeslagen bytes zijn de pagina.
@@ -109,7 +109,7 @@ fn compressed_segments_roundtrip_and_reject_damage() {
     }
 }
 #[test]
-fn dirty_header_and_append_match_go_and_choose_conservatively() {
+fn dirty_header_and_append_match_fixture_and_choose_conservatively() {
     let log = dirty::Log::decode(DIRTY).unwrap();
     assert_eq!(log.generation, GEN);
     assert_eq!(log.sequence, 7);
@@ -187,7 +187,7 @@ fn equal_sequence_logs_require_a_proven_append_superset() {
     }
 }
 #[test]
-fn go_manifests_exact_and_parts_not_visible_without_valid_commit() {
+fn fixture_manifests_exact_and_parts_not_visible_without_valid_commit() {
     for fixture in [MAN, WIN] {
         let m = Manifest::decode(fixture, PREFIX).unwrap();
         assert_eq!(m.encode(PREFIX).unwrap(), fixture);
@@ -346,15 +346,15 @@ fn production_database_pages_are_bounded_by_owner_not_old_four_gib_limit() {
     assert!(pages.add((1 << 24) + 1).is_err());
 }
 #[test]
-fn lease_token_is_an_extra_field_that_go_manifests_lack() {
-    // Go's fixtures hebben geen token: nul, en dezelfde bytes terug.
+fn lease_token_is_an_extra_field_that_older_manifests_lack() {
+    // De fixtures hebben geen token: nul, en dezelfde bytes terug.
     for fixture in [MAN, WIN] {
         let m = Manifest::decode(fixture, PREFIX).unwrap();
         assert_eq!(m.lease, 0);
         assert_eq!(m.encode(PREFIX).unwrap(), fixture);
     }
-    // Met token: precies Go's bytes plus één veld achteraan. Een lezer die
-    // onbekende velden negeert (Go's `encoding/json`, een oudere Rust) leest
+    // Met token: precies de bytes van de fixture plus één veld achteraan. Een lezer die
+    // onbekende velden negeert (een oudere versie) leest
     // dus hetzelfde manifest.
     let mut m = Manifest::decode(MAN, PREFIX).unwrap();
     m.lease = 7;
@@ -392,7 +392,7 @@ fn duplicate_raw_sequence_keeps_the_highest_lease_token() {
         .collect();
     assert_eq!(plan, [(1, 0), (2, 2), (3, 2)]);
     assert_eq!(l.commits().len(), 2);
-    // Een token wint ook van onbekend (Go of een oudere versie).
+    // Een token wint ook van onbekend (een oudere versie).
     let l = Layout::new(snapshot(), vec![token(2, 1, 0), token(2, 2, 3)], PREFIX).unwrap();
     assert_eq!(l.commits()[0].lease, 3);
     // Gelijke tokens zijn geen fencing maar schade.

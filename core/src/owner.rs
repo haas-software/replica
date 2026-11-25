@@ -11,7 +11,7 @@
 //! eigenaar blijft vrij voor `tick`, `begin`, `finish`, `renew` en het
 //! onderhoud terwijl de verbinding openstaat.
 //!
-//! Het handboek (§1.2) noemt gedeeld eigendom een teken dat de eigenaar nog
+//! Gedeeld eigendom is meestal een teken dat de eigenaar nog
 //! niet gekozen is. Hier is hij gekozen, alleen niet in de tijd: in rust is de
 //! staat van de eigenaar, midden in een SQL-callback van de VFS. Dat is het
 //! rustprotocol, en de `RefCell` is de controle erop.
@@ -78,7 +78,7 @@ pub struct Config {
     /// Paginabytes per segment: 64 KiB..16 MiB, standaard 4 MiB.
     pub segment_bytes: usize,
     /// Segmenten gecomprimeerd (`SPINSEG2`) in de objectopslag; standaard uit,
-    /// zodat Go's lezer ze kan lezen. Lezen kan altijd beide.
+    /// zodat ook een lezer zonder `SPINSEG2` ze kan lezen. Lezen kan altijd beide.
     pub compress: bool,
     /// Synchronisatie-interval in hele seconden, standaard 15.
     pub interval: u32,
@@ -96,7 +96,7 @@ pub struct Config {
     pub background_maintenance: bool,
 }
 impl Config {
-    /// Defaults zoals Go, met expliciet databasebudget en bestemming.
+    /// Standaardwaarden, met expliciet databasebudget en bestemming.
     pub fn new(namespace: &str, destination: &str, path: Name, pages: u32) -> Result<Self> {
         let out = Self {
             namespace: string(namespace)?,

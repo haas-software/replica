@@ -94,7 +94,7 @@ fn schedule_validation_age_and_closed_boundaries() {
         [(at(0), at(60))]
     );
     assert!(schedule().elapsed(&layout, 0, at(60)).is_err());
-    // Go truncate gebruikt maandag als weekanker, niet de Unix-epoch op donderdag.
+    // Afronden op een week gebruikt maandag als weekanker, niet de Unix-epoch op donderdag.
     let mut m = manifest(
         &mut bucket,
         3,
