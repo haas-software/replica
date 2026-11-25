@@ -1,306 +1,344 @@
-# Replica in Rust
+# Replica
 
-Native SQLite en paginareplicatie voor `no_std`-apps op HopOS. SQLite wordt als
-C gelinkt en gebruikt een Rust-VFS, een vaste heap en rollback-journals.
-De bestaande Go-formaten blijven behouden: `SPINSEG1`, `SPINDRT1`, manifest v2,
-markers en objectnamen; gecomprimeerde segmenten (`SPINSEG2`) zijn een keuze
-per eigenaar (`owner::Config::compress`). Geen WASM, POSIX-bestandssysteem of verborgen executor.
+Native SQLite with page-level replication to S3, for `no_std` apps on
+[HopOS](https://github.com/hop-os/HopOS). SQLite is linked as C and runs on a
+Rust VFS, a fixed heap and rollback journals. No WASM, no POSIX file system,
+no hidden executor or background thread.
 
-De replicatiebibliotheek bevat tracking, prepare/restore, snapshot/increment,
-onzekere-publicatieherstel, compactie, retentie, generatieopruiming, herstelpuntcatalogus, offline Fetch en de schrijverlease in S3.
-Op HopOS heeft SQLite echte persistente bestands-I/O
-via de parkeerbare C-stack (`applib::stacktask`) en de bevestigde barrière
-`sys::Client::sync` (OP_SYNC). Dit is nog geen vervanging van een bestaande
-Spin-instantie: de hostapp moet zijn database-eigenaar en de renew van de
-schrijverlease nog op deze bibliotheek aansluiten.
-Zie [contracten en resterende aansluiting](docs/port.md).
+**Licence:** Business Source License 1.1 (see [LICENSE](LICENSE)). Production
+use needs a commercial licence. Each version becomes available under the GNU
+Affero General Public License v3.0 or later four years after its publication.
+The vendored SQLite sources are public domain.
 
-## Onderdelen
+## Status
 
-| Crate | Verantwoordelijkheid |
+Version **3.2.7**. The library covers the whole life cycle of a replicated
+database: change tracking, prepare/restore, snapshots and increments, recovery
+from uncertain publications, compaction, retention, generation cleanup, a
+restore-point catalogue, offline fetch, and a single-writer lease in S3 with
+fencing. On top of that: several databases under one lease (`group`), store
+work on separate lanes next to the owner (`lanes`, on HopOS
+`replica_hopos::lanes::Lanes::spawn`), lease keeping during long store calls,
+and a lease-less reader that follows the writer (`follow`).
+
+On HopOS, SQLite has real persistent file I/O through a parkable C stack
+(`applib::stacktask`) and the confirmed barrier `sys::Client::sync`
+(`OP_SYNC`). Replica is used by a HopOS application in production-like tests
+against external S3.
+
+Not done yet: parallel uploads of one capture, promoting a following reader
+to writer, and a RISC-V runtime test (see [TODO.md](TODO.md)).
+
+## Crates
+
+| Crate | Responsibility |
 | --- | --- |
-| `replica-sqlite` | SQLite 3.53.4, C-shim, veilige verbindingen/statements, vaste `memsys5`-heap en VFS; transparante paginacompressie (`compress`, `lz`, zie [docs/compress.md](docs/compress.md)) |
-| `replica-core` | Go-formaten, tracking/dirty logs, lokale markers, capture, publicatie, prepare, restore, compactie, retentie en schrijverlease; meer databases onder één lease (`group`), banen (`lanes`), capturenummers (`publications`) en een volgende lezer (`follow`), zie [docs/group.md](docs/group.md) |
-| `replica-s3` | Concrete objectadapter op Lean S3 (`leans3`), SigV4, begrensd streamen en volledige listings; één stroom- en bytepoort per app (`Gate`) |
-| `replica-hopos` | Async system-client als SQLite-opslag via de private stack; `xSync` is OP_SYNC; de banen van een eigenaarslot (`lanes`) |
-| `replica-sqlite-smoke` | RAM-SQLite als echte Hop-job, twee onafhankelijke slots |
-| `replica-sqlite-persist` | HopFS-commit, koude herstart, echte capture/restore en annulering van langlopende SQL |
-| `replica-sqlite-bench` | De meetkern: dezelfde stappen op HopOS (`tools/qemu-bench.py`, of als job op ijzer) en op de host (`cargo run -p replica-sqlite-bench`, RAM) naast `tools/bench-host.sh` (SQLite's unix-VFS) |
+| `replica-sqlite` | SQLite 3.53.4, C shim, safe connections/statements, fixed `memsys5` heap and VFS; transparent page compression (`compress`, `lz`, see [docs/compress.md](docs/compress.md)) |
+| `replica-core` | Storage formats, tracking/dirty logs, local markers, capture, publication, prepare, restore, compaction, retention and the writer lease; several databases under one lease (`group`), lanes (`lanes`), capture numbers (`publications`) and a following reader (`follow`), see [docs/group.md](docs/group.md) |
+| `replica-s3` | Object store adapter on Lean S3 (`leans3`): SigV4, bounded streaming and complete listings; one stream and byte gate per app (`Gate`) |
+| `replica-hopos` | The async HopOS system client as SQLite storage via the private stack; `xSync` is `OP_SYNC`; the lanes of an owner (`lanes`, `Lanes::spawn`); lease keeping while waiting (`keep`); S3 from an app slot (`s3`) |
+| `replica-sqlite-smoke` | RAM SQLite as a real Hop job, two independent slots |
+| `replica-sqlite-persist` | HopFS commit, cold restart, real capture/restore and cancellation of long-running SQL |
+| `replica-sqlite-bench` | Benchmark kernel: the same steps on HopOS (`tools/qemu-bench.py`, or as a job on hardware) and on the host (`cargo run -p replica-sqlite-bench`, RAM), next to `tools/bench-host.sh` (SQLite's unix VFS); see [docs/bench.md](docs/bench.md) |
 
-De Go-versie gebruikte `ncruces/go-sqlite3` en SQLite in WASM. Beide versies
-gebruiken echte SQLite; de Rust-versie verandert de uitvoeringsomgeving.
-SQLite draait met één eigenaar, `locking_mode=EXCLUSIVE`, `journal_mode=DELETE`
-en **`synchronous=EXTRA`**. Bij DELETE-journals moet ook het verwijderen van het
-journal duurzaam worden: FULL alleen was in de koude HopFS-proef onvoldoende.
-In EXCLUSIVE blijft het journal tussen transacties open met een gewiste kop en
-kijkt SQLite niet per transactie opnieuw naar een heet journal, pagina 1 en de
-bestandsmaat; verwijderd wordt het pas bij sluiten, met de mapbarrière van
-EXTRA. De VFS meldt HopFS' blok van 4 KiB als sector en `SAFE_APPEND` (de
-boom en dus de maat worden pas na een flush van de data vastgelegd), wat per
-commit één journalsync spaart. Tijdelijke bestanden (de sorter en temp-B-trees
-boven `cache_size`) gaan via de VFS, zoals op Linux. De heap die de app leent
-wordt gesplitst: drie achtste is de paginacache (`SQLITE_CONFIG_PAGECACHE`, een
-pagina kost daar wat hij is; in `memsys5` kostte hij het dubbele) en elke
-verbinding opent met `cache_size` op die pool, de rest is `memsys5` voor de
-sorter, statements en schema, met een soft heap limit waardoor de sorter spilt
-en de paginacache pagina's teruggeeft in plaats van NOMEM. `replica-hopos`
-bundelt aaneengesloten writes tot één call en leest bij een sequentiële lees
-vooruit (64 KiB tot 512 KiB) in zestien vensters, één per stroom, zodat ook de
-merge van de sorter (tot zestien PMA's door elkaar uit één tempbestand) per
-stroom aaneengesloten leest; elke call is een ronde door de OS-core. WAL is niet ingebouwd: de replicatie leest het
-databasebestand als de enige waarheid (capture, dirty tracking, restore), en
-een WAL zou die pagina's pas bij een checkpoint laten zien.
+Storage formats: segments `SPINSEG1`, dirty logs `SPINDRT1`, manifest v2,
+markers and object names. Compressed segments (`SPINSEG2`) are a per-owner
+choice (`owner::Config::compress`); readers accept both.
 
-## Versies en pins
+## SQLite configuration
 
-Replica zelf: **v3.2.7** (de nummering van HopOS; een patch van Replica
-alleen loopt voor op de HopOS-pin; v3.2.5 en v3.2.6 pinnen HopOS v3.2.4, v3.2.7 pint HopOS v3.2.5). Afnemers pinnen
-een tag, geen rev op een branch.
+SQLite runs with one owner, `locking_mode=EXCLUSIVE`, `journal_mode=DELETE`
+and **`synchronous=EXTRA`**: with DELETE journals the journal deletion must be
+durable as well, and FULL alone was not enough in a cold HopFS test. In
+EXCLUSIVE mode the journal stays open between transactions with a zeroed
+header; it is deleted on close, with EXTRA's directory barrier. The VFS
+reports HopFS' 4 KiB block as sector size and `SAFE_APPEND`, which saves one
+journal sync per commit. Temporary files (sorter, temp B-trees above
+`cache_size`) go through the VFS.
 
-| Afhankelijkheid | Crates | Pin |
+The heap the app lends is split: three eighths is the page cache
+(`SQLITE_CONFIG_PAGECACHE`, each connection opens with `cache_size` on that
+pool), the rest is `memsys5` for the sorter, statements and schema, with a
+soft heap limit so the sorter spills and the cache gives pages back instead
+of returning NOMEM. `replica-hopos` coalesces contiguous writes into one call
+and reads ahead on sequential reads (64 KiB to 512 KiB) in sixteen windows,
+one per stream, so the sorter merge reads contiguously per stream.
+
+WAL is not supported: replication treats the database file as the single
+source of truth (capture, dirty tracking, restore), and WAL would only expose
+those pages at a checkpoint.
+
+## Versions and pins
+
+Replica follows the HopOS version numbers; a Replica-only patch may run ahead
+of its HopOS pin (3.2.5 and 3.2.6 pinned HopOS v3.2.4; 3.2.7 pins HopOS
+v3.2.5). Consumers pin a tag, not a branch revision.
+
+| Dependency | Crates | Pin |
 | --- | --- | --- |
 | HopOS (`hop-os/HopOS`) | `applib`, `sync` | `v3.2.5` |
-| Lean (`haas-software/lean`) | `leans3`, `leans3http`, `leanhttp`, `leanhttps`, `leantls`, `leancrypto` (en `leannet` via applib) | `v3.2.3` |
+| Lean (`haas-software/lean`) | `leans3`, `leans3http`, `leanhttp`, `leanhttps`, `leantls`, `leancrypto` (and `leannet` via applib) | `v3.2.3` |
 | Hop (`hop-os/hop`) | `types`, `discovery` | `v3.2.1` |
-| SQLite | gevendord in `vendor/sqlite` | 3.53.4 |
+| SQLite | vendored in `vendor/sqlite` | 3.53.4 |
 | Rust | `rust-toolchain.toml` | 1.93.0 |
 
-Lean heeft de tag die HopOS zelf pint (HopOS v3.2.4 pint Lean v3.2.3):
-applib brengt `leannet` mee en `TcpConn` moet dezelfde `Dial` kennen als
-leanhttp. `tools/gate.sh` legt deze tabel
-tegen de `Cargo.toml`'s.
+Lean uses the tag HopOS itself pins (HopOS v3.2.5 pins Lean v3.2.3): applib
+brings `leannet`, and `TcpConn` must know the same `Dial` as leanhttp.
+`tools/gate.sh` checks this table against the `Cargo.toml` files.
 
-**Het contract met Hop.** De schrijverlease is het leaseobject van
-`hop-discovery` (formaat en CAS-regels van Hop `v3.2.1`, met `hop-types` voor
-node en generatie): één JSON-object per namespace in de bucket, aangemaakt met
-`If-None-Match: *` en vernieuwd met `If-Match: <etag>`. Een Hop-cluster en
-Replica lezen elkaars lease dus zonder vertaling; een nieuwe Hop-tag met een
-ander leaseformaat is een nieuwe Replica-versie. Het call-budget staat onder
-"Inbouwen": één store-call < TTL/3 min het klokverschil.
+**The contract with Hop.** The writer lease is the lease object of
+`hop-discovery` (format and CAS rules of Hop `v3.2.1`, with `hop-types` for
+node and generation): one JSON object per namespace in the bucket, created
+with `If-None-Match: *` and renewed with `If-Match: <etag>`. A Hop cluster and
+Replica read each other's lease without translation; a Hop tag with a
+different lease format means a new Replica version.
 
-## Bouwen en toetsen
+## Build and test
 
-Rust 1.93.0 staat vast in `rust-toolchain.toml`. Nodig: clang, llvm-ar en
-Python 3. Getoetst met Homebrew LLVM 23.1.0 op macOS ARM64; voor het bare-metal
-ARM-target zijn `-mgeneral-regs-only -mabi=aapcs-soft` nodig. Apple's clang
-ondersteunt die combinatie hier niet. `tools/gate.sh` vindt Homebrew LLVM;
-elders stel je `SQLITE_CC` en `SQLITE_AR` in.
+Rust 1.93.0 is fixed in `rust-toolchain.toml` (with the
+`aarch64-unknown-none-softfloat` and `riscv64gc-unknown-none-elf` targets).
+You also need clang, llvm-ar and Python 3. The bare-metal ARM target needs
+`-mgeneral-regs-only -mabi=aapcs-soft`, which Apple's clang does not support;
+tested with Homebrew LLVM on macOS ARM64. The scripts find Homebrew LLVM in
+`/opt/homebrew/opt/llvm`; elsewhere set `SQLITE_CC` and `SQLITE_AR`.
 
 ```sh
-tools/gate.sh
-QEMU=1 tools/gate.sh
-python3 tools/qemu-persist.py
+cargo test --workspace                          # host tests only
+tools/gate.sh                                   # the full gate
+QEMU=1 tools/gate.sh                            # plus the RAM probe under QEMU
+python3 tools/qemu-persist.py                   # HopFS persistence under QEMU
 REPLICA_BENCH_MIB=64 python3 tools/qemu-bench.py
+REPLICA_BENCH_MIB=64 cargo run --release -p replica-sqlite-bench   # host, RAM
+tools/bench-host.sh 64                          # host, SQLite's unix VFS
 ```
 
-De gewone poort controleert de meegeleverde SQLite-bronhashes, formatting,
-strikte clippy, hosttests en volledige ARM64- en RISC-V-builds. Met `QEMU=1`
-start hij de RAM-probe tweemaal onder de **gepinde HopOS** (zie de pins hierboven). Beide apps
-bouwen ook voor RISC-V; uitvoering is alleen onder ARM64 QEMU getoetst.
+`tools/gate.sh` checks the vendored SQLite source hashes and the pins table
+above, then runs `cargo fmt --check`, strict clippy, the host tests, and
+release builds plus clippy of all crates for ARM64 and RISC-V. With `QEMU=1`
+it also runs `tools/qemu-smoke.py`: the RAM probe in two slots under the
+pinned HopOS. The apps build for RISC-V; they have only been run under
+ARM64 QEMU.
 
-De laatste opdracht is de persist-proef, zonder kopie of patch: de app bouwt
-tegen de gepinde tag, en de kern en `tools/qemu-test-sync.py` (plaatsen via Hop
-met een eigen volume, SIGKILL, koude herstart) komen uit dezelfde SDK-checkout.
-Hop wordt als bestand gebouwd uit `../hop/hop` (`HOP_DIR`). Er worden geen
-hardwarejobs vervangen.
+The QEMU scripts build against the pinned HopOS tag and take the QEMU runner
+and the hard-stop test (`tools/qemu-test-sync.py`) from that same SDK
+checkout. They need Hop as a checkout (`HOP_DIR`, default `../hop/hop`) and
+expect the default `target/` directory. Evidence of `tools/qemu-persist.py`
+lands in `out/persist/`:
 
-Bewijs:
+- `boot-0.log` and `boot-1.log`: commit/rollback, 1,000 rows and
+  `integrity_check`; QEMU is killed hard between the two boots.
+- Both boots: `REPLICA_PIPELINE_OK` and `REPLICA_OWNER_OK` (the complete
+  `owner::Replica` chain on HopFS: prepare, dirty logs, sync, maintenance,
+  restore-point catalogue and verified fetch into a second database) and
+  `REPLICA_SQLITE_CANCEL_OK` (cancelling a long SQL query via the progress
+  callback, then reopening on the same heap).
+- Second boot: `REPLICA_PIPELINE_REPAIR_OK` (the deliberately volatile test
+  bucket is empty; the owner rebuilds it from the local database) and
+  `REPLICA_RESTORED_COLD_OK` (the restored database survives the restart).
+- `checks.json` records these checks. The bucket of this test is in RAM; it
+  does not prove external S3 persistence.
 
-- `out/qemu-sqlite.log`: twee slots, ieder `REPLICA_SQLITE_OK`, exit 0.
-- `out/persist/boot-0.log` en `boot-1.log`: commit/rollback, 1.000
-  rijen en `integrity_check`; QEMU wordt tussen beide boots hard gestopt.
-- Beide boots: `REPLICA_PIPELINE_OK` en `REPLICA_OWNER_OK`, de complete
-  `owner::Replica`-keten op HopFS: Prepare, dirty logs, Sync, onderhoud,
-  herstelpuntcatalogus en geverifieerde Fetch naar een tweede database.
-- De tweede boot: `REPLICA_PIPELINE_REPAIR_OK`. De bewust vluchtige testbucket
-  is leeg; de eigenaar herbouwt die uit de bestaande lokale database.
-- De tweede boot: `REPLICA_RESTORED_COLD_OK`, controle van de bestaande
-  herstelde database vóór die opnieuw wordt aangemaakt.
-- Beide boots: `REPLICA_SQLITE_CANCEL_OK`, afbreken van een lange SQL-query
-  via de C-progresscallback en vervolgens heropenen met dezelfde heap.
-- `checks.json` legt deze afzonderlijke controles vast. De bucket van deze
-  QEMU-proef is RAM; dit bewijst geen externe S3-persistentie of O6N-doorvoer.
+## Integration
 
-## Inbouwen
+The caller owns storage, object store, clock/entropy and one SQLite runtime.
+The app must provide a reliable UTC clock and entropy source; the
+deterministic test environment is not a production entropy provider.
+`owner::Replica` ties together prepare, VFS, sync, repair, cadence and
+maintenance. The host calls `tick` from its own executor; `sync` forces one
+round. A failure also gets an interval before the next timed attempt. Proven
+archive damage schedules a new snapshot that keeps the repair lineage;
+transport errors keep the existing generation. `close` refuses new VFS loans
+and syncs. `core/tests/owner.rs` tests this with real SQLite.
 
-De aanroeper bezit storage, objectstore, klok/entropie en één SQLite-runtime.
-`owner::Replica` verbindt Prepare, VFS, Sync, reparatie, cadans en onderhoud.
-De host roept `tick` aan vanuit zijn bestaande executor; `sync` forceert één
-beurt. Een fout krijgt ook een interval vóór de volgende timerpoging. Bewezen
-archiefschade plant een nieuwe snapshot met behoud van repair-lineage;
-transportfouten behouden de bestaande generatie. `close` weigert nieuwe VFS-
-leningen en synchronisaties. `core/tests/owner.rs` toetst dit met echte SQLite.
+There is exactly one writer per namespace. It holds the Hop lease
+(`discovery`) as an object in the bucket, for example `prefix/domain/lease`.
+Every claim and renewal is a conditional PUT (`If-None-Match: *`,
+`If-Match: <etag>`); the backend must honour those conditions. The S3 lease
+handles quoted ETags and ghost objects of some providers the way Hop does.
 
-Er is precies één schrijver per namespace. Die houdt de hop-lease
-(`discovery`, hetzelfde protocol en formaat als het Hop-cluster) als object in
-de bucket, bijvoorbeeld `prefix/domain/lease`. Elke claim en renew is een
-voorwaardelijke PUT (`If-None-Match: *`, `If-Match: <etag>`). De backend moet
-die voorwaarden honoreren; de S3-lease kent de herkansingen van Hop voor
-geciteerde ETags (Hetzner, Ceph) en voor een Bunny-ghost.
+1. **Claim.** `writer::claim(b, &mut s3.lease(key, ttl_ms), node, ttl_ms, now)`
+   returns `Role::Writer` or `Role::Reader`; an unreachable store is an error,
+   not a role. A reader opens SQLite with `Engine::open_read_only` on
+   `writer::ReadOnly`; every write is then `SQLITE_READONLY`. Only a `Writer`
+   can create a `Replica`. Call `Replica::renew` often (it writes at most once
+   per sixth of the TTL), also while storage or network is waiting. From one
+   third of the TTL before expiry, VFS, sync and manifest publication refuse
+   hard; losing the lease closes the owner. Another node takes over only after
+   expiry, with a higher generation.
 
-1. `writer::claim(b, &mut s3.lease(key, ttl_ms), node, ttl_ms, now)` geeft
-   `Role::Writer` of `Role::Reader`. Een lezer opent SQLite met
-   `Engine::open_read_only` op `writer::ReadOnly`; iedere write is dan
-   `SQLITE_READONLY`. Alleen een `Writer` kan een `Replica` maken.
-   Roep `Replica::renew` vaak aan (hij schrijft hoogstens eens per zesde TTL),
-   ook terwijl opslag of netwerk wacht. Een derde TTL vóór het verlopen
-   weigeren VFS, sync en manifestpublicatie hard; verlies sluit de eigenaar.
-   Een andere node neemt pas na het verlopen over, met een hogere generatie.
-   **Schrijfdeadline en call-budget.** Een schrijver schrijft tot tweederde
-   van de TTL na zijn laatste bevestigde renew; een ander neemt pas na de hele
-   TTL over. De check staat vlak vóór elke PUT en DELETE, dus de PUT zelf moet
-   in het resterende derde passen: **het budget van één store-call (connect,
-   TLS, upload, antwoord) is kleiner dan TTL/3 min het klokverschil tussen de
-   nodes**. Bij een TTL van 15 s en 1 s klokverschil is dat minder dan 4 s per
-   call; een segment van 4 MiB moet daar ook in passen. Een call die toch
-   langer duurt (een proxy die het verzoek vasthoudt) kan landen na een
-   overname; daarvoor is het fencing hieronder.
+   **Write deadline and call budget.** A writer writes until two thirds of the
+   TTL after its last confirmed renewal; another node takes over only after
+   the full TTL. The check sits right before every PUT and DELETE, so the PUT
+   itself must fit in the remaining third: **the budget of one store call
+   (connect, TLS, upload, response) is less than TTL/3 minus the clock skew
+   between nodes**. With a 15 s TTL and 1 s skew that is under 4 s per call,
+   including a 4 MiB segment. A call that takes longer anyway (a proxy holding
+   the request) can land after a takeover; that is what fencing is for.
 
-   **Fencing in de store.** Elk manifest draagt het fencing-token van zijn
-   schrijver (`lease_generation`, de generatie van de lease; Go en oudere
-   versies schrijven het niet en lezen eroverheen). De raw-sleutel bevat
-   `at`, dus een late PUT van de oude schrijver is een tweede manifest met
-   dezelfde sequence: `object::layout` houdt dan het hoogste token en laat het
-   andere als afval staan, in plaats van `Corrupt`. Vaste sleutels (snapshot,
-   vensters) gaan met `Store::put_new` (`If-None-Match: *`); bestaat de sleutel
-   al met een hoger token, dan is dat `LeaseLost`. Het onderhoud kijkt vóór
-   elke PUT en DELETE naar de deadline en leest vóór elke reeks DELETEs de
-   lease in de store (`Maintenance::run(b, store, |s| s.lease(key, ttl).read())`);
-   is die niet meer van deze schrijver, dan stopt de ronde. Zette een oude
-   schrijver current nog op zijn nieuwe generatie, dan zet het onderhoud van
-   de houder hem terug (lager token in die snapshot). Het inline onderhoud
-   (zonder `background_maintenance`) heeft geen lease-lezer en kijkt alleen
-   naar de deadline.
+   **Fencing in the store.** Every manifest carries its writer's fencing token
+   (`lease_generation`; older manifests without it are still read). The raw
+   key contains `at`, so a late PUT from an old writer is a second manifest
+   with the same sequence: `object::layout` keeps the highest token and leaves
+   the other as garbage instead of reporting `Corrupt`. Fixed keys (snapshot,
+   windows) use `Store::put_new` (`If-None-Match: *`); if the key already
+   exists with a higher token, that is `LeaseLost`. Maintenance checks the
+   deadline before every PUT and DELETE and reads the lease in the store
+   before every series of DELETEs
+   (`Maintenance::run(b, store, |s| s.lease(key, ttl).read())`); if it no
+   longer belongs to this writer, the round stops. If an old writer still
+   moved `current` to its new generation, the holder's maintenance moves it
+   back. Inline maintenance (without `background_maintenance`) has no lease
+   reader and only checks the deadline.
 
-2. Voer `prepare::run` uit **vóór** SQLite opent. De callback controleert een
-   eventuele scratch-restore met echte SQLite `PRAGMA integrity_check`.
+2. **Prepare.** Run `prepare::run` **before** SQLite opens. The callback
+   verifies a scratch restore with real SQLite `PRAGMA integrity_check`.
 
-   **Werk van een ander (`Error::ForeignAhead`, v3.2.5).** Een tenant draait
-   op A, dan op B, dan weer op A met A's oude (of teruggezette) volume: de
-   store is in dezelfde generatie verder dan A's marker. Tot v3.2.4
-   publiceerde Prepare dan A's lokale bron als nieuwe snapshot en verdween
-   B's werk stil uit beeld. Nu is een store die verder is alleen van ons als
-   het precies het ene manifest is dat de marker als onzeker wegstuurde, met
-   ons token erin (de marker bewaart `lease_generation` van zijn laatst
-   bevestigde manifest en `uncertain_lease_generation` van het manifest
-   onderweg; een marker zonder die velden houdt de oude regel voor zijn
-   onzekere sequence). Anders:
-   - lokaal schoon (marker `clean`): herstel uit de store (`Reason::Restored`);
-   - lokaal eigen ongepubliceerd werk: Prepare faalt met
-     `Error::ForeignAhead` en raakt niets aan, lokaal noch in de store.
+   **Someone else's work (`Error::ForeignAhead`, since 3.2.5).** A database
+   runs on node A, then on B, then on A again with A's old (or restored)
+   volume: the store is ahead of A's marker in the same generation. A store
+   that is ahead is only ours if it is exactly the one manifest the marker
+   recorded as uncertain, carrying our token (the marker keeps the
+   `lease_generation` of its last confirmed manifest and the
+   `uncertain_lease_generation` of the manifest in flight). Otherwise:
+   - local copy clean: restore from the store (`Reason::Restored`);
+   - local unpublished work: prepare fails with `Error::ForeignAhead` and
+     touches nothing, locally or in the store.
 
-   Ook `ForeignAhead`: ons bevestigde manifest viel door de fencing af (een
-   ander manifest met dezelfde sequence en een hoger token), of een
-   onderbroken generatiewissel zou terugvallen op een generatie waarin een
-   ander sindsdien verder is.
+   Also `ForeignAhead`: our confirmed manifest lost to fencing (another
+   manifest with the same sequence and a higher token), or an interrupted
+   generation switch would fall back to a generation in which someone else
+   has moved on.
 
-   **Wat de host met `ForeignAhead` doet:** de database (bij EasyFlor: de
-   tenant) blijft dicht, met één logregel die de database en `ForeignAhead`
-   noemt; niet opnieuw proberen in een lus, niets weggooien. Iemand kiest: de lokale bestanden apart zetten en uit de store
-   openen, of het lokale werk eerst veiligstellen. `Error` is niet
-   `non_exhaustive`: een host met een volledige `match` krijgt er een arm bij.
+   **What the host does with `ForeignAhead`:** keep that database closed, log
+   one line naming the database and `ForeignAhead`, do not retry in a loop
+   and do not discard anything. An operator chooses: set the local files
+   aside and open from the store, or save the local work first. `Error` is
+   not `non_exhaustive`.
 
-3. Gebruik uitsluitend `prepared.tracking.wrap(&mut storage, &mut marker)`
-   voor SQL, of gebruik `Replica::vfs` bij de samengevoegde eigenaar.
-   Initialiseer de engine met een geleende, gealigneerde `u64`-heap:
+3. **SQL.** Use only `prepared.tracking.wrap(&mut storage, &mut marker)` for
+   SQL, or `Replica::vfs` with the combined owner. Initialise the engine with
+   a borrowed, aligned `u64` heap:
 
-```rust,ignore
-let mut vfs = prepared.tracking.wrap(&mut storage, &mut prepared.marker);
-// SAFETY: de boot-eigenaar garandeert één globale SQLite-runtime, geen herintrede.
-let mut engine = unsafe { Engine::initialize(&mut heap, &mut vfs) }?;
-let mut db = engine.open(c"replica.db")?;
-db.execute(c"CREATE TABLE IF NOT EXISTS item(id INTEGER PRIMARY KEY, title TEXT)")?;
-```
+   ```rust,ignore
+   let mut vfs = prepared.tracking.wrap(&mut storage, &mut prepared.marker);
+   // SAFETY: the boot owner guarantees one global SQLite runtime, no re-entry.
+   let mut engine = unsafe { Engine::initialize(&mut heap, &mut vfs) }?;
+   let mut db = engine.open(c"replica.db")?;
+   db.execute(c"CREATE TABLE IF NOT EXISTS item(id INTEGER PRIMARY KEY, title TEXT)")?;
+   ```
 
-4. Voor een kopie: sluit SQLite of houd een echte leestransactie die alle
-   schrijvers uitsluit. `Batch::capture` kopieert naar één herbruikbare lokale
-   spool. Netwerk-I/O begint pas bij `Batch::publish`; SQL-writes tussen die
-   calls blijven in de volgende dirty set. Houd maximaal één batch tegelijk.
-5. Roep vóór herpublicatie `replication::resolve` aan wanneer de marker een
-   onzekere sequence heeft. Nooit zomaar dezelfde sequence opnieuw gebruiken.
-6. `maintenance::renewal_due` bepaalt generatievernieuwing op leeftijd;
-   `replication::renew` bewaart de vorige complete generatie tijdens de kopie.
-   Plan `maintenance::run` hoogstens eens per minuut, ook na een fout.
-   `maintenance::generations` verwijdert verlopen generaties in veilige volgorde.
-7. Sluit SQL vóór stoppen; de private taak verwerkt annulering en ruimt
-   C-handvatten op vóór de stack vrijgegeven wordt. `Replica::release` geeft
-   daarna de lease vrij, zodat een lezer meteen kan overnemen.
+4. **Capture.** Close SQLite or hold a real read transaction that excludes
+   all writers. `Batch::capture` copies into one reusable local spool.
+   Network I/O starts only at `Batch::publish`; SQL writes between those calls
+   go into the next dirty set. Hold at most one batch at a time.
+5. Before republishing, call `replication::resolve` when the marker has an
+   uncertain sequence. Never just reuse the same sequence.
+6. `maintenance::renewal_due` decides generation renewal by age;
+   `replication::renew` keeps the previous complete generation during the
+   copy. Schedule `maintenance::run` at most once per minute, also after an
+   error. `maintenance::generations` removes expired generations in a safe
+   order.
+7. **Close.** Close SQL before stopping; the private task handles
+   cancellation and cleans up C handles before the stack is freed.
+   `Replica::release` then releases the lease so a reader can take over at
+   once.
 
-`apps/sqlite-persist/src/pipeline.rs` toont de complete opslagketen op HopOS;
-`core/tests/replication.rs` doet hetzelfde met echte native SQLite en
-foutinjectie. De app moet een betrouwbare UTC-klok en entropiebron leveren.
-De deterministische testomgeving is geen productie-entropyprovider.
+`apps/sqlite-persist/src/pipeline.rs` shows the complete chain on HopOS;
+`core/tests/replication.rs` does the same with native SQLite and fault
+injection.
 
-### Veel databases, één engine (v3.0.1)
+### Many databases, one engine
 
-Een app met een database per tenant initialiseert één engine en opent per
-database een verbinding met `Engine::open_with(path, &mut backend)`: de engine
-gedeeld geleend, de opslag van die verbinding exclusief, elk met een eigen
-VFS `replica-<n>` in de C-shim. Elke verbinding mag op een eigen
-`applib::stacktask` parkeren terwijl de andere SQL doen; het
-veiligheidsargument staat in de moduledocs van `replica-sqlite`, de toets in
-`hopos/tests/interleave.rs` (twee stacks die bij elke callback wisselen).
+An app with a database per tenant initialises one engine and opens a
+connection per database with `Engine::open_with(path, &mut backend)`
+(`open_read_only_with` for a reader): the engine shared, the storage of that
+connection exclusive, each with its own VFS `replica-<n>` in the C shim. Each
+connection may park on its own `applib::stacktask` while others run SQL; the
+safety argument is in the module docs of `replica-sqlite`, the test in
+`hopos/tests/interleave.rs`.
 
-De eigenaar is los van de VFS: `Replica::tracker()` geeft de SQL-kant
-(`Tracker::vfs(&mut storage)`) en de `Replica` blijft bij de Sync-taak. Zolang
-de verbinding openstaat, lopen `begin`/`finish`/`tick`/`maintenance_*` alleen
-terwijl de SQL-kant in rust is (geen lopend statement, geen open transactie);
-de upload, `Capturing::run`, `Maintenance::run` en `renew` mogen altijd. Wie
-het protocol schendt, krijgt `Error::Busy` (eigenaar) of `SQLITE_BUSY` (VFS),
-nooit een halve wijziging. Zie de moduledocs van `owner` en
-`core/tests/owner_split.rs`. `Replica::has_changes` zegt zonder I/O of er iets
-te publiceren is, zodat een host de rust alleen vraagt als het nodig is;
-`writer::renew_shared` vernieuwt de gedeelde lease in stappen, bijvoorbeeld
-vóór elke PUT van een lange upload.
+The owner is separate from the VFS: `Replica::tracker()` gives the SQL side
+(`Tracker::vfs(&mut storage)`) and the `Replica` stays with the sync task.
+While the connection is open, `begin`/`finish`/`tick`/`maintenance_*` only
+run while the SQL side is at rest (no running statement, no open
+transaction); the upload, `Capturing::run`, `Maintenance::run` and `renew`
+may always run. Violating the protocol gives `Error::Busy` (owner) or
+`SQLITE_BUSY` (VFS), never a half change. See the module docs of `owner` and
+`core/tests/owner_split.rs`. `Replica::has_changes` says without I/O whether
+there is anything to publish; `writer::renew_shared` renews the shared lease
+in steps, for example before every PUT of a long upload. `Vfs::into_storage`
+returns the storage after the connection, so a host can prepare its files
+again under a new lease (for example after the previous one expired while S3
+was unreachable) and open the next connection on the same storage.
 
-### Meer databases per domein
+### Several databases per domain
 
-`group::Group` repliceert de databases van één domein elk als eigen
-namespace onder één gedeelde schrijverlease: lui voorbereid per database,
-de lease bijgehouden (ook voorbij de schrijfdeadline heroverd zolang niemand
-hem nam), publiceren in rust met backoff in plaats van fencen bij een store
-die even niet antwoordt, en met banen (`lanes::Offload`) het store-werk naast
-de eigenaar. De eigenaar nummert zijn captures (`Replica::begun`,
-`Synced::capture`), zodat een host weet welke writes in de store staan.
-`follow::Follow` is een lezer zonder lease. Zie [docs/group.md](docs/group.md).
+`group::Group` replicates the databases of one domain, each as its own
+namespace, under one shared writer lease: prepared lazily per database, the
+lease kept up (and reclaimed past the write deadline as long as nobody took
+it), publishing at rest with backoff instead of fencing when the store
+briefly does not answer, and store work on lanes (`lanes::Offload`) next to
+the owner. With lanes the owner only does local work at rest: the capture and
+the two local halves of a publication (`Replica::finish_begin`,
+`Replica::finish_end`); uploads, the manifest PUT (`Publishing::put`) and
+maintenance run on the data lane, lease renewal on the lease lane.
+`Group::standing` tells the host whether writes must wait (`Standing::Held`)
+or the lease is lost. The owner numbers its captures (`Replica::begun`,
+`Synced::capture`), so a host knows which writes are in the store.
+`follow::Follow` is a reader without a lease. See
+[docs/group.md](docs/group.md).
 
-S3 vanuit een app-slot: `replica_hopos::s3::store(&endpoint, Wait(s))` is een
+On HopOS, `replica_hopos::lanes::Lanes::spawn` starts the two lanes on their
+own stacks (`Stacks`: lease lane 2 MiB, data lane sized by the host) and
+`Lanes::owner` gives the `Offload` for the group.
+
+S3 from an app slot: `replica_hopos::s3::store(&endpoint, Wait(s))` is a
 `replica_s3::S3` over `leans3http::Http` over Lean's `WebDial` over
-`applib::tcp::Dialer`, met `MOZILLA_ROOTS`, de wandklok van de app en een
-`applib::rand::Rng` per verbinding; `store.lease(key, ttl)` is de hop-lease
-erover. De store van een eigenaar met een groep wacht met
-`replica_hopos::keep::Keeping::new(Wait(s), &keep)`: terwijl één call wacht,
-houdt hij de lease van de open groep bij (`Group::with_keep_lease(&keep)`,
-zie [docs/group.md](docs/group.md)). Op de host (feature `std`): `replica_sqlite::host::Dir` (bestanden,
-`fsync`, mapbarrière) en `replica_core::host::{Dir, DirLease}` (objectstore en
-lease in een map).
+`applib::tcp::Dialer`, with `MOZILLA_ROOTS`, the app's wall clock and an
+`applib::rand::Rng` per connection; `store.lease(key, ttl)` is the Hop lease
+on top. The store of an owner with a group waits with
+`replica_hopos::keep::Keeping::new(Wait(s), &keep)`: while one call waits, it
+keeps the lease of the open group (`Group::with_keep_lease(&keep)`). On the
+host (feature `std`): `replica_sqlite::host::Dir` (files, `fsync`, directory
+barrier) and `replica_core::host::{Dir, DirLease}` (object store and lease in
+a directory).
 
-## Grenzen
+## Limits
 
-Alle allocaties voor buffers/metadata zijn faalbaar en expliciet begrensd.
-Snapshotpaginanummers worden per segment opgesomd; ze vragen geen vector voor
-de hele database. De lokale spool moet wel de gekopieerde data kunnen bevatten.
-Een restore heeft daarnaast ruimte voor een complete scratchdatabase nodig.
+All allocations for buffers and metadata are fallible and explicitly bounded.
+Snapshot page numbers are enumerated per segment; they need no vector for the
+whole database. The local spool must hold the captured data, and a restore
+also needs room for a complete scratch database.
 
-De huidige capture houdt de bron tijdens de volledige lokale kopie exclusief.
-Restore en compactie halen segmenten in rondes tegelijk op, binnen
-`Store::parallel` (aantal en bytes). `S3::new` krijgt een functie die één
-verbinding opent (bijvoorbeeld `leans3http::Http` over Lean's `WebDial`) en
-de `Gate` van de app (`replica_hopos::s3::GATE`): één poort voor de stromen en
-bytes van de rondes van alle stores samen. De store opent er zelf tot 16, pas
-als een ronde ze nodig heeft en zoveel als de poort vrij heeft; tegen Bunny's
-ongeveer 10 MB/s per stroom haalt dat 40 tot 69 MB/s. `S3::streams` stelt een
-andere grens per store in. De extra verbindingen vallen bij de eerste call die
-geen ronde is (PUT, GET, LIST, DELETE) of bij `S3::rest`, niet op een klok; de
-lease gaat buiten de poort om. Toepassen blijft in planvolgorde. Uploads zijn opeenvolgend; de
-Go-optimalisaties met korte leestransacties en twee gelijktijdige uploads zijn
-nog niet aangesloten. Writes na capture bewaren conservatief de hele dirty superset.
-Daarom is hiermee geen gelijkwaardige grote-databaseprestatie gemeten.
+A capture holds the source exclusively during the full local copy. Restore
+and compaction fetch segments in concurrent rounds within `Store::parallel`
+(count and bytes). `S3::new` takes a function that opens one connection and
+the app's `Gate` (`replica_hopos::s3::GATE`): one gate for the streams and
+bytes of all stores' rounds together. A store opens up to 16 connections,
+only when a round needs them and as many as the gate allows; at roughly
+10 MB/s per stream that gave 40 to 69 MB/s. `S3::streams` sets another limit
+per store. The extra connections are dropped at the first call that is not a
+round (PUT, GET, LIST, DELETE) or at `S3::rest`, not on a timer; the lease
+bypasses the gate. Uploads of one capture are sequential. Writes after a
+capture conservatively keep the whole dirty superset.
 
-De S3-adapter is getoetst met onder meer een 5 MiB-response, afgebroken bodies,
-403/404, onvolledige listings en annulering. Een echte externe S3-endpointrun,
-fysieke stroomuitval, O6N-NVMe en RISC-V-runtime zijn niet getoetst.
-De backend moet sterke GET/LIST-consistentie en atomaire PUT leveren.
+The S3 adapter is tested with, among others, a 5 MiB response, aborted
+bodies, 403/404, incomplete listings and cancellation. The repository's own
+tests use in-memory and directory stores. Physical power loss and a RISC-V
+runtime are not tested. The backend must provide strong GET/LIST consistency
+and atomic PUT.
 
-Eigen code: MIT. SQLite: public domain; bronherkomst en hashes staan in
-`vendor/sqlite/SOURCE.json`.
+More: [docs/port.md](docs/port.md) (contracts per module and the HopOS
+storage path), [docs/group.md](docs/group.md), [docs/compress.md](docs/compress.md),
+[docs/bench.md](docs/bench.md). The docs are in Dutch.
+
+## Licence
+
+Replica's own code is licensed under the Business Source License 1.1; see
+[LICENSE](LICENSE). There is no Additional Use Grant: non-production use is
+free, production use needs a commercial licence from the licensor. Each
+version converts to the GNU Affero General Public License v3.0 or later
+(AGPL-3.0-or-later) four years after that version is published.
+
+SQLite is public domain and not part of the licensed work; its source
+provenance and hashes are in `vendor/sqlite/SOURCE.json`.
