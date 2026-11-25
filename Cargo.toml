@@ -7,7 +7,7 @@ default-members = ["sqlite", "core"]
 version = "3.2.7"
 edition = "2024"
 rust-version = "1.93"
-license = "MIT"
+license = "BUSL-1.1"
 
 # De harde set uit rustdoc/README.md §12.
 [workspace.lints.rust]
