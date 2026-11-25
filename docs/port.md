@@ -1,16 +1,15 @@
-# Replica: portcontract en aansluiting
+# Replica: contracten en aansluiting
 
-Bron: `spin/replica` op `f6dd0322f9b1baa63262bf5015e0889cbad1fca0`, inclusief
-PRODUCTION_REVIEW.md, SCALE_REVIEW.md en foutinjectietests. De oudere
-`haasdb/replica` is geen semantische bron. Stijl: `rustdoc/README.md` en
-`PORT.md`, één eigenaar, `no_std + alloc`, faalbare allocaties en Git-tags over
-repo-grenzen. De kern van Replica verbiedt unsafe.
+Uitgangspunten: één eigenaar, `no_std + alloc`, faalbare allocaties en
+Git-tags over repo-grenzen. `replica-core` en `replica-s3` verbieden unsafe;
+`replica-hopos` staat het alleen toe op de stacks van de banen
+(`Lanes::spawn`).
 
 ## SQLite op HopOS: één async opslagpad
 
 Er ontbraken twee HopOS-functies, geen SQLite-formaat. Beide zitten sinds SDK
 `v3.0.0-alpha.16` in de gewone Git-tag. De huidige pins (HopOS, Lean en Hop)
-staan in de README onder "Versies en pins".
+staan in de README onder "Versions and pins".
 
 Replica gebruikt Hop sinds `v3.0.9` voor het expliciete JSON-bytebudget en Lean
 sinds `v3.1.11` voor delimiterlistings van generatieprefixen. Deze functies staan in
@@ -61,21 +60,20 @@ app veilige handvatten; engine/verbinding/statement zijn geen Send/Sync.
 databases een harde emulatorstop overleven, met apps met de MMU aan
 (`applib::mmu`). Hij test ook annuleren/heropenen. Dezelfde app linkt voor
 ARM64 en RISC-V. Details/logs staan in de README. Volumeoverdracht zit in
-HopOS/Hop; Lumen heeft nog oudere alpha.10-pins en moet die afzonderlijk
-bijwerken.
+HopOS/Hop.
 
-## Geporteerde contracten
+## Contracten per module
 
 | Pad | Gedrag en bewijs |
 | --- | --- |
-| `segment`, `dirty`, `manifest`, `time` | Bytegelijke Go-fixtures, SHA-256, nanoseconden, lengte-/versiecontrole vóór allocatie, aaneengesloten herstelplan |
+| `segment`, `dirty`, `manifest`, `time` | Bytegelijke vaste fixtures (`core/tests/fixtures`), SHA-256, nanoseconden, lengte-/versiecontrole vóór allocatie, aaneengesloten herstelplan |
 | `tracking` | Marker ongeldig vóór write; dirty-logrecords duurzaam vóór DB-sync; twee slots, header als laatste; foutinjectie op iedere rewritefase |
 | `marker`, `replication` | Previous/repair_from/uncertain, onderdelen vóór manifest, exacte readback na onbekende PUT, geen sequencehergebruik vóór resolve |
 | `capture` | Consistente lokale spool, per-segment snapshotpaginabereik, gebundelde reads; detectie van externe wijzigingen en ongedekte groei |
 | `prepare` | Lineage vóór open, bootstrappen alleen bij bewijs, volledige snapshot als de remote sequence voorloopt door ons eigen onzekere manifest (anders herstel, of `ForeignAhead` bij eigen ongepubliceerd werk), beschadiging onderscheiden van transportproblemen |
 | `restore` | Scratch + verplichte verificatie, duurzame intent, oud journal weg, kopie/barrière, intent weg; koude foutinjectie vóór/na publicatiefasen |
-| `compact` | Vensters `(start,end]`, contiguous sequences, Go-gelijke shrink/grow-uitvoer en veilige verwijdervolgorde |
-| `maintenance` | Go-bewaarschema en jaar-0001-tijdanker, multilevel samenvoegen; alle twaalf afgebroken verwijderstappen blijven herstelbaar |
+| `compact` | Vensters `(start,end]`, contiguous sequences, shrink/grow-uitvoer gelijk aan de vaste fixture en veilige verwijdervolgorde |
+| `maintenance` | Bewaarschema (standaard 15m:2h, 1h:24h, 24h:168h) en jaar-0001-tijdanker, multilevel samenvoegen; alle twaalf afgebroken verwijderstappen blijven herstelbaar |
 | `owner` | Prepare/VFS/Sync/Tick/Close samen, interval ook na fouten, herstelbeslissing duurzaam vóór nieuwe tracking, automatische reparatie met lineage |
 | `archive` | Begrensde catalogus met nanoseconden; offline Fetch weigert levende DB en sidecars, verificatie vóór publicatie |
 | `writer` | Hop-lease met CAS: tweede node is lezer, renew op leeftijd, deadline een derde TTL vóór verlopen, verloren PUT-antwoord alleen voor de eigen eigenaar, overname met hogere generatie, VFS en publicatie hard dicht na de deadline, read-only opslag |
@@ -91,9 +89,9 @@ geen WAL en geen onbeheerste SQL-wijzigingen aan de journal-/syncinstellingen.
 De lokale filesystembarrières en remote atomic-PUT/strong-GET/LIST zijn voorwaarden,
 geen gedrag dat Replica bovenop een zwakkere backend kan verzinnen.
 
-## Resterende integratie vóór bestaande gebruikers overgaan
+## Levensloop en aansluiting
 
-Dit is een bibliotheek, zoals Go. `owner::Replica` verbindt de levensloop:
+Dit is een bibliotheek. `owner::Replica` verbindt de levensloop:
 Prepare vóór open, een geleende tracking-VFS voor SQL, Sync/Tick en permanente
 Close. Eén eigenaar sluit gelijktijdige publicatie uit; Tick en onderhoud
 onthouden ook mislukte pogingen, zodat er geen hot retrylus ontstaat. Bewezen
@@ -104,7 +102,8 @@ De host sluit SQLite vóór Sync, roept Tick vanuit zijn executor aan en roept
 achtergrondtaak. Na de leasedeadline weigert de VFS iedere write en gaat er
 geen manifest meer uit, ook niet aan het eind van een lange upload. Wie
 uploads langer dan een paar seconden heeft, gebruikt `begin`/`finish` en
-vernieuwt de lease daartussen.
+vernieuwt de lease daartussen, of gebruikt `group::Group` met banen, die de
+lease zelf bijhoudt (zie [group.md](group.md)).
 
 `archive::points` somt behouden herstelpunten op met nanoseconden, current en
 niveau, nieuwste eerst. Het resultaat is begrensd op maximaal 4.096 punten;
@@ -121,14 +120,17 @@ als een manifest is gecommit maar de lokale marker na een crash achterloopt.
 De snapshotlijst en
 herstelplanner zijn wel begrensd en vermijden de eerdere volledige
 paginanummervector respectievelijk een volledige metadatascan per commit.
-Meet doorvoer en SQL-latency op een representatieve database voordat de Go-host
-wordt vervangen. Er is nog geen live S3- of O6N-run uitgevoerd.
+Meet doorvoer en SQL-latency op een representatieve database voordat een
+host overgaat. Een HopOS-app draait Replica in productie-achtige tests tegen
+een echte S3-bucket, onder QEMU en op ijzer (Apple M4); de metingen staan bij
+`replica_s3::STREAMS` en `APP_STREAMS` en in [group.md](group.md). Een
+O6N-NVMe-run is niet gedaan.
 
 De objectstore op HopOS heeft sinds v3.0.1 een transport voor een app-slot:
 `replica_hopos::s3` (`leans3http::Http` over `leanhttps::WebDial` over
 `applib::tcp::Dialer`, `MOZILLA_ROOTS`, de wandklok en `applib::rand::Rng`), met
-de sleutels in de app (de env van de jobspec). Het bouwt voor ARM64 en RISC-V;
-een run tegen een echte bucket vanuit QEMU of ijzer is nog niet gedaan. De
+de sleutels in de app (de env van de jobspec). Het bouwt voor ARM64 en RISC-V
+en draait tegen een echte bucket vanuit QEMU en op ijzer (ARM64). De
 andere weg, de
 store-ops van Hop (`store_push/pull/list/drop`), vraagt een `Store`-adapter in
 `replica-hopos`: een objectnaam los van het lokale spoolpad (de ABI kan het via
@@ -136,7 +138,3 @@ store-ops van Hop (`store_push/pull/list/drop`), vraagt een `Store`-adapter in
 `Req` wel). In HopOS/Hop ontbreken nog gepagineerde listings boven 8 KiB
 en een limiet vóór download. Hop is dan de eigenaar van S3-sleutels en
 TLS.
-
-Lumen gebruikt zelf geen SQLite. Zijn disc-/backup-/SMP-/PWA-aansluiting is
-inmiddels in code geschreven; de afzonderlijke compileer- en uitvoerstatus staat in `../hop-app-lumen/docs/RUST-PORT.md`; een geslaagde Replica-proef maakt
-die mediaketen niet automatisch af.

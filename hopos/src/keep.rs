@@ -5,7 +5,7 @@
 //! Een S3-call van de eigenaar parkeert zijn stack. De eigenaar zet een
 //! vernieuwing op de leasebaan alleen als hij zelf loopt, dus één call die
 //! langer wacht dan de marge van de lease (een segment-GET die zijn budget
-//! vol maakt en opnieuw gaat) liet de lease stil verlopen (EasyFlor,
+//! vol maakt en opnieuw gaat) liet de lease stil verlopen (een host-app,
 //! 23-11-2026: een GET van 39 s bij een lease van 30 s). [`Keeping`] verlaat
 //! de wacht elke [`KEEP_EVERY`], roept [`KeepLease::keep`] aan (de groep zet
 //! een vernieuwing op de leasebaan als die aan de beurt is) en wacht verder

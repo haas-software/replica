@@ -45,7 +45,7 @@ impl Rng {
     }
 }
 
-/// Een JSON-document zoals EasyFlor ze opslaat, ongeveer `len` bytes.
+/// Een JSON-document zoals een host-app ze opslaat, ongeveer `len` bytes.
 fn body(rng: &mut Rng, len: usize) -> String {
     let mut s = String::with_capacity(len + 200);
     while s.len() < len {

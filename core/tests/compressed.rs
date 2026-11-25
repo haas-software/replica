@@ -19,7 +19,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-const NS: &str = "easyflor/test/main.db";
+const NS: &str = "app/test/main.db";
 
 fn scratch() -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -55,7 +55,7 @@ fn integrity<B: Storage>(db: &mut Connection<'_, '_, B>) {
     assert!(s.step().unwrap());
     assert_eq!(s.column(0).unwrap(), Value::Text("ok"));
 }
-/// JSON-documenten zoals EasyFlor ze heeft, `n` rijen vanaf `from`.
+/// JSON-documenten zoals een host-app ze heeft, `n` rijen vanaf `from`.
 fn insert<B: Storage>(db: &mut Connection<'_, '_, B>, from: i64, n: i64, tag: &str) {
     let sql = format!(
         "WITH RECURSIVE k(i) AS (SELECT {from} UNION ALL SELECT i+1 FROM k WHERE i<{last})
@@ -69,7 +69,7 @@ fn insert<B: Storage>(db: &mut Connection<'_, '_, B>, from: i64, n: i64, tag: &s
     db.execute(&std::ffi::CString::new(sql).unwrap()).unwrap();
 }
 fn claim(local: &mut impl Storage, bucket: &Bucket, node: &str) -> (Writer, DirLease) {
-    let mut lease = DirLease::new(bucket, "easyflor/test/lease").unwrap();
+    let mut lease = DirLease::new(bucket, "app/test/lease").unwrap();
     let Role::Writer(w) = writer::claim(local, &mut lease, node, 30_000, now()).unwrap() else {
         panic!("a free lease makes a writer");
     };

@@ -124,7 +124,7 @@ impl Writer {
     /// Een harde fout zodra de lease verloren is of de deadline voorbij. Een
     /// bevestiging mag iets vóór `now` liggen: de eigenaar meet `now` aan het
     /// begin van een beurt, een vernieuwing midden in een capture meet later
-    /// (Spin 06-10-2026: LeaseLost direct na een geslaagde capture). Meer dan
+    /// (06-10-2026: LeaseLost direct na een geslaagde capture). Meer dan
     /// een zesde TTL terug is wel een klok die terugspringt.
     pub fn check(&self, now: Time) -> Result {
         let at = millis(now)?;
@@ -296,7 +296,7 @@ pub fn renew_shared<L: Backend + ?Sized>(
 /// [`Writer::renew_request`] markeert de schrijver blijvend verloren zodra
 /// zijn deadline (twee derde lease na de laatste vernieuwing) voorbij is,
 /// zonder de store te vragen. Een store die 20 s niet antwoordde, kostte zo
-/// de eigenaar (EasyFlor op de M4, 19-11-2026: `LeaseLost` direct na twee
+/// de eigenaar (een host-app op de M4, 19-11-2026: `LeaseLost` direct na twee
 /// transportfouten, dan fencing en minutenlang heropenen). Een andere
 /// eigenaar of generatie in de lease, of een voorwaardelijke schrijf die
 /// verliest, is wel blijvend [`Error::LeaseLost`]; tot de lease verloopt kan

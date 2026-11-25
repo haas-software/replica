@@ -178,7 +178,7 @@ int replica_sqlite_init(void *heap,int bytes,int page_size,const ReplicaStorage 
  /* Een slot per pagina van de paginamaat van de app (standaard 4 KiB): een
   * grotere pagina past niet in een slot en komt uit memsys5, tegen het dubbele;
   * met cache_size in slots van de pool liep die dan vol (NOMEM, GEMETEN
-  * 15-11-2026: EasyFlor met 16 KiB-pagina's in een heap van 64 MiB). */
+  * 15-11-2026: een host-app met 16 KiB-pagina's in een heap van 64 MiB). */
  int page=(page_size+hdr+7)&~7;
  /* De cache zestien pagina's kleiner dan de pool: pcache1 meldt "druk" zodra
   * er minder dan tien slots vrij zijn, en dan spilt de pager bij elke nieuwe

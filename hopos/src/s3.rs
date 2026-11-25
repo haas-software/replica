@@ -1,8 +1,7 @@
 //! S3 vanuit een app-slot: `leans3` over `leans3http::Http` over Lean's
 //! `WebDial` over `applib::tcp::Dialer`.
 //!
-//! De keten is die van Lumen (`hop-app-lumen/rust/platform/src/web.rs`): DNS
-//! en TCP uit applib, TLS met ketenverificatie tegen `leantls::MOZILLA_ROOTS`
+//! De keten: DNS en TCP uit applib, TLS met ketenverificatie tegen `leantls::MOZILLA_ROOTS`
 //! op de wandklok van de app ([`applib::App::wall_ns`]), met verse entropie
 //! uit [`applib::rand::Rng`] per handshake. Zonder gezette wandklok faalt een
 //! `https://`-dial vóór er een verbinding opengaat, en tekent `leans3` niets:
@@ -27,7 +26,7 @@ use replica_sqlite::asynchronous::Suspend;
 
 /// 2020-01-01: een wandklok daarvoor is niet gezet.
 const EPOCH: u64 = 1_577_836_800;
-/// De TCP-opbouw en de handshake elk hoogstens zo lang, zoals Lumen.
+/// De TCP-opbouw en de handshake elk hoogstens zo lang.
 const CONNECT: Duration = Duration::from_secs(10);
 
 /// De wandklok van de app in Unix-seconden, of `None` zolang de kern hem niet
@@ -77,15 +76,15 @@ pub enum Dial {
     Normal,
     /// Voor de schrijverlease ([`lease_store`]): een dial die bij een lege pot
     /// ruimte maakt door een andere verbinding te sluiten. applib v3.2.3 heeft
-    /// die dial (`Dialer::forced()`), maar het gebruik is geparkeerd (replica-plan
-    /// R4, Derek 21 nov 2026): tot dat besluit is dit [`Dial::Normal`], en is
+    /// die dial (`Dialer::forced()`), maar het gebruik is geparkeerd (21 nov
+    /// 2026): tot dat besluit is dit [`Dial::Normal`], en is
     /// [`dialer`] de enige plek die verandert.
     Forced,
 }
 /// De TCP-dialer voor `dial`.
 fn dialer(dial: Dial) -> Dialer {
     match dial {
-        // De geforceerde dial is geparkeerd (replica-plan R4): beide gewoon.
+        // De geforceerde dial is geparkeerd: beide gewoon.
         Dial::Normal | Dial::Forced => Dialer::new(EXEC.get(), CONNECT),
     }
 }

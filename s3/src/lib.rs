@@ -26,7 +26,7 @@ pub const STREAM_BYTES: u64 = 64 << 20;
 /// De bytes van één stroom in een ronde: één deel van 4 MiB.
 pub const PART_BYTES: u64 = 4 << 20;
 /// Stromen van de hele app samen, over alle stores ([`Gate`]). Gemeten 21-11
-/// (replica-plan §4.2, EasyFlor op QEMU, een herstel van 304 MiB met 40
+/// (een host-app op QEMU, een herstel van 304 MiB met 40
 /// pollers): 4, 8 en 16 stromen elk 41 tot 43 s; met een draad van 10 ms 272,
 /// 264 en 301 s; nergens een mislukte leasevernieuwing. Het kleinste aantal
 /// binnen 20 % van het snelste.
@@ -538,7 +538,7 @@ fn is_closed(e: &leans3::Error) -> bool {
 /// kant van S3; het eerste verzoek erop faalt dan meteen zonder de store te
 /// bereiken. `leanhttp` speelt zo'n verzoek alleen opnieuw af voor GET en
 /// HEAD, dus faalde een lease-vrijgave of een manifest-PUT na een stilte
-/// (EasyFlor P1 en p31-stall: de opvolger wachtte de hele TTL). Opnieuw is
+/// (een host-app: de opvolger wachtte de hele TTL). Opnieuw is
 /// hier veilig: een PUT van dezelfde bytes naar dezelfde sleutel is
 /// idempotent; een tweede `If-None-Match: *` op een geland eerste geeft 412
 /// ([`StoreError::Exists`], `object::publish` leest dan terug); een tweede

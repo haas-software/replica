@@ -63,7 +63,7 @@
 //! Eigenaren op dezelfde map (de SQL-kant en de sync-kant van replica-core,
 //! leessessies) die één [`Maps`] delen ([`Compressed::shared`]), delen per
 //! bestand één kaart: 8 B per pagina één keer per bestand in plaats van per
-//! eigenaar (Nagel `main.db`: 17,2 MB; meting 21 nov 2026). De ene schrijver
+//! eigenaar (een productie-`main.db`: 17,2 MB; meting 21 nov 2026). De ene schrijver
 //! werkt hem bij; de anderen zien tijdens zijn transactie de gecommitte staat
 //! (de oude ingangen van wat hij veranderde, bewaard zodra de `Maps` meer
 //! houders heeft) en na zijn commit meteen de nieuwe. Er schrijft er maar één tegelijk, zoals het [`Storage`]-contract al
@@ -1364,7 +1364,7 @@ fn check_entry(c: &Container, entry: u64) -> Result {
 
 /// Vergroot `v` faalbaar tot `n` nullen. Is er geen ruimte, dan komt er een
 /// achtste bij in plaats van een verdubbeling: de kaart van een groot bestand
-/// staat dan niet tot de helft leeg (Nagel `main.db`: 17 MB).
+/// staat dan niet tot de helft leeg (een productie-`main.db`: 17 MB).
 fn grow(v: &mut Vec<u64>, n: usize) -> Result {
     if n > v.len() {
         let need = n - v.len();

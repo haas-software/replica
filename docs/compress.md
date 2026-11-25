@@ -4,7 +4,6 @@
 `Storage`: de host (`host::Dir`), HopFS (`replica-hopos`, of de opslag van een
 app) en RAM. SQLite, de tracking-VFS en replica-core zien gewone pagina's; op
 schijf staan ze gecomprimeerd. In S3 staan ze ook gecomprimeerd (`SPINSEG2`).
-Besloten door Derek op 15-11-2026.
 
 ## Codec (`replica_sqlite::lz`)
 
@@ -14,8 +13,8 @@ diepte 16, één positie lazy. Invoer per blok hoogstens 64 KiB (een pagina).
 Veilige Rust: decoderen controleert elke grens en geeft `Corrupt`, nooit een
 paniek. Geen woordenboek (gemeten: voegt weinig toe).
 
-Gemeten op 15-11-2026 (M4, release) op een steekproef van Nagel (`main.db` en
-`2024.db`, 2048 pagina's per soort, alleen totalen):
+Gemeten op 15-11-2026 (M4, release) op een steekproef van een gemigreerde productiedatabase (`main.db`
+en `2024.db`, 2048 pagina's per soort, alleen totalen):
 
 | Steekproef | Ratio | Comprimeren | Decomprimeren |
 | --- | ---: | ---: | ---: |
@@ -42,16 +41,16 @@ sidecars nooit (`compress::is_sidecar`, de restore-scratch wel).
 ```
 
 - **Pagina's.** De container heeft één paginamaat: die van SQLite's kop in de
-  eerste write (16 KiB in EasyFlor), anders `Policy::page_size`. Een write
+  eerste write (bijvoorbeeld 16 KiB), anders `Policy::page_size`. Een write
   die geen hele pagina is, wordt read-modify-write. Een app met pagina's van
   16 KiB start de engine met `Engine::initialize_paged(heap, opslag, 16384)`:
   met de slots van 4 KiB van `initialize` komen grotere pagina's uit memsys5 en
-  loopt de heap onder belasting vol (NOMEM, gemeten in EasyFlor).
+  loopt de heap onder belasting vol (NOMEM, gemeten in een HopOS-app).
 - **Slot.** Een gecomprimeerde pagina staat zonder kop aaneengesloten in één
   segment. Onsamendrukbaar: rauw. Een nulpagina heeft geen slot.
 - **Kaart.** Per pagina een `u64`: byte-offset (48 bits) en lengtecode (0: nul,
   `0xFFFF`: rauw, anders de lengte). In het geheugen een vector van 8 bytes per
-  pagina (Nagel `main.db` op 16 KiB: 2 miljoen pagina's, 16 MB).
+  pagina (een productie-`main.db` op 16 KiB: 2 miljoen pagina's, 16 MB).
 - **Segmenten, log-gestructureerd.** Nieuwe slots komen achter elkaar in het
   open segment; een slot van de laatst gecommitte staat wordt nooit
   overschreven. Een segment zonder levende bytes is na de commit vrij en wordt
@@ -109,8 +108,8 @@ duurzaam is); daarna leest de volgende toegang het bestand opnieuw.
 
 **Meerdere eigenaren op één map** (de SQL-kant en de sync-kant van replica-core,
 leessessies): wie dezelfde `Maps` krijgt (`Compressed::shared`), deelt per
-bestand één kaart, 8 B per pagina één keer in plaats van per eigenaar (Nagel
-`main.db` 17,2 MB; EasyFlor had per bestand 2 eigenaren plus één per
+bestand één kaart, 8 B per pagina één keer in plaats van per eigenaar (een
+productie-`main.db`: 17,2 MB; een HopOS-app had per bestand 2 eigenaren plus één per
 leessessie, meting 21 nov 2026). De ene schrijver werkt hem bij; zolang zijn
 transactie loopt, zien de anderen de gecommitte staat (de oude ingang van elke
 pagina die hij veranderde, 16 B per pagina tot de commit, bewaard zodra de
@@ -126,7 +125,7 @@ binnenste opslag (die kan parkeren); de compiler bewijst dat (`with`).
 Na een commit gaat een grote gewijzigde-paginalijst terug naar de heap, en een
 kaart met meer dan een achtste lege capaciteit (na een herstel of krimp) wordt
 passend gemaakt; groeien doet de kaart met een achtste, niet door te
-verdubbelen. Na een herstel van Nagel `main.db` stond de kaart op 33,5 MB in
+verdubbelen. Na een herstel van die `main.db` stond de kaart op 33,5 MB in
 plaats van 17,2 en de lege lijst op 33,5 MB.
 
 ## Replicatie (`SPINSEG2`)
@@ -144,7 +143,8 @@ gelijk aan de paginamaat is rauw, nul een nulpagina; de rest van het segment
 - de kosten zijn klein: comprimeren gaat met 300+ MB/s, een upload met 10-60 MB/s.
 
 `owner::Config::compress` kiest het formaat van nieuwe segmenten (standaard
-uit, zodat Go's lezer ze kan lezen); lezen kan altijd beide. Een compactie
+uit, zodat ook een lezer zonder `SPINSEG2` ze kan lezen); lezen kan altijd
+beide. Een compactie
 schrijft `SPINSEG2` zodra één invoersegment het is. Een restore decodeert per
 pagina; de scratch en de herstelde database worden containers als de `Policy`
 van de opslag dat zegt (anders gewone bestanden: het formaat in S3 staat los
@@ -154,19 +154,19 @@ van het lokale).
 
 Een bestaand bestand wordt een container met `PRAGMA page_size = 16384;
 VACUUM INTO '<nieuw>'` op een `Compressed`-opslag (de doelnaam is nieuw, dus een
-container met SQLite's paginamaat), controleren, dan hernoemen. EasyFlor's
-`migrate compress` doet precies dat. Na omzetten krijgt een gerepliceerd
+container met SQLite's paginamaat), controleren, dan hernoemen. Het
+omzetcommando van een HopOS-app (`migrate compress`) doet precies dat. Na omzetten krijgt een gerepliceerd
 bestand een nieuw snapshot (alle pagina's zijn anders).
 
 ## Metingen (15-11-2026, M4, USB-SSD, release)
 
-Klonen van EasyFlor's gemigreerde tenants, omgezet met `migrate compress` (16 KiB):
+Klonen van gemigreerde productiedatabases, omgezet met `migrate compress` (16 KiB):
 
 | Bestand | Ongecomprimeerd (4 KiB) | Container (16 KiB) | Ratio | Omzetten | In S3 (`SPINSEG2`) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Nagel `main.db` | 32,55 GB | 6,22 GB | 5,24 | 463 s | 6,04 GB |
-| Nagel `2024.db` | 11,71 GB | 2,10 GB | 5,58 | 112 s | 2,05 GB |
-| LGFlowers, 5 bestanden | 720 MB | 115 MB | 6,3 | 17 s | |
+| Productie A `main.db` | 32,55 GB | 6,22 GB | 5,24 | 463 s | 6,04 GB |
+| Productie A `2024.db` | 11,71 GB | 2,10 GB | 5,58 | 112 s | 2,05 GB |
+| Productie B, 5 bestanden | 720 MB | 115 MB | 6,3 | 17 s | |
 
 Het containerbestand is iets groter dan zijn gecomprimeerde pagina's: het
 metadatagebied (8 bytes per pagina plus log), de sectoralignering per commit en
@@ -187,5 +187,5 @@ piekgeheugen van 44 MB.
 | `plain_files_stay_plain_and_both_formats_mix`, `two_owners_see_each_others_commits`, `vacuum_into_converts_to_compressed_16k`, `damaged_containers_give_errors_not_panics` | gemengde formaten (ATTACH), `Policy::plain`, twee eigenaren (ook met `synchronous=OFF` en `journal_mode=TRUNCATE`: de ander ziet elke afgeronde transactie), omzetten, 300 beschadigde containers |
 | `owners_on_one_maps_share_one_map_and_give_it_back`, `readers_see_the_committed_state_while_one_writes`, `a_writer_gone_mid_transaction_leaves_readers_the_file`, `a_restore_leaves_a_tight_map` | vier eigenaren op één `Maps`: één kaart, commits meteen zichtbaar (ook via SQLite), heap leeg na het laatste handvat; tijdens een transactie (overschrijven, groeien, deelwrite, krimp) ziet een lezer de gecommitte staat, een tweede schrijver `SQLITE_BUSY`, een late opener deelt de kaart; een schrijver weg zonder commit: de lezer leest het bestand opnieuw; een herstel van 40.000 pagina's laat een kaart van precies 8 B per pagina |
 | `core/tests/formats.rs` | `SPINSEG2` rondgang (nul, ruis, JSON, half) voor 512 B..64 KiB, afgebroken en omgedraaide bytes, kapot LZ-blok onder een kloppende hash |
-| `core/tests/compact.rs` | een `SPINSEG2`-invoer geeft een `SPINSEG2`-compactie met dezelfde pagina's als Go |
+| `core/tests/compact.rs` | een `SPINSEG2`-invoer geeft een `SPINSEG2`-compactie met dezelfde pagina's als de vaste fixture |
 | `core/tests/compressed.rs` | SQL- en sync-kant elk een `Compressed<Dir>`: publiceren (alleen `SPINSEG2`, store < 1/3 van logisch), increment, herstel op een lege map (container of gewoon), een oude replica (`SPINSEG1`, gewoon bestand) door de nieuwe code, en oud en nieuw door elkaar |

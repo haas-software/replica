@@ -3,7 +3,7 @@
 //!
 //! Een S3-call parkeert de stack die hem doet. Op de stack van een eigenaar
 //! die één verzoek tegelijk bedient, hield elke publicatie, onderhoudsbeurt en
-//! leasevernieuwing alle verzoeken op zolang S3 erover deed (EasyFlor op de
+//! leasevernieuwing alle verzoeken op zolang S3 erover deed (een host-app op de
 //! M4, 20-11-2026). Met banen:
 //!
 //! - **Leasebaan**: de schrijverlease, één kleine voorwaardelijke call per

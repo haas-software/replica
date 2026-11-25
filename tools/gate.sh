@@ -26,7 +26,7 @@ print('SQLite-bronhashes: OK')
 PY
 python3 - <<'PY'
 # De README noemt de echte pins: elke git-tag in een Cargo.toml staat in de
-# tabel "Versies en pins", per repo één tag (replica-plan R8).
+# tabel "Versions and pins", per repo één tag.
 import re
 from pathlib import Path
 repos = {'HopOS.git': 'HopOS', 'lean.git': 'Lean', 'hop.git': 'Hop'}

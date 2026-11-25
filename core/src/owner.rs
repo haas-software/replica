@@ -618,7 +618,7 @@ impl Replica {
     /// Met [`Replica::begin`] en [`Replica::finish`] wordt een capture in het
     /// ene rustmoment genomen en in een later gepubliceerd; een write die
     /// ertussen kwam, zit er niet in. Een host die zelf publicaties telde,
-    /// bevestigde zo een write die nog niet in de store stond (EasyFlor,
+    /// bevestigde zo een write die nog niet in de store stond (een host-app,
     /// 21-11-2026). Daarom nummert de eigenaar zijn captures zelf.
     pub fn begun(&self) -> u64 {
         self.begun
@@ -787,7 +787,7 @@ impl Replica {
             },
             // Met `background_maintenance` doet de losse taak het onderhoud,
             // ook als er niets veranderde (zoals `begin`); anders liep het
-            // hier toch op de eigenaar (EasyFlor p31-stall, 20-11-2026).
+            // hier toch op de eigenaar (een host-app, 20-11-2026).
             Ok(None) if self.config.background_maintenance => Ok(Synced::default()),
             Ok(None) => self.maintain(&mut st, b, store, now),
             Err(e) => Err(e),

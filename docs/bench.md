@@ -7,7 +7,7 @@ Op de host doet `tools/bench-host.sh` dezelfde SQL op de unix-VFS; onder QEMU
 
 ## M4 (Apple ANS-NVMe, HopOS 3.0.11), 2048 MiB, heap 64 MiB, 04-10-2026
 
-Als Hop-job naast Derek's spin (core-class big, sharegroup bench, 128 MiB,
+Als Hop-job naast een andere app (core-class big, sharegroup bench, 128 MiB,
 eigen volume). Replica 2f3fdb5. Totaal 136 s, db 1950 MiB.
 
 | Stap | M4 | cpm | Host unix-VFS (dezelfde Mac, 256 MiB) | Wat telt |

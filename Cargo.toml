@@ -9,7 +9,8 @@ edition = "2024"
 rust-version = "1.93"
 license = "BUSL-1.1"
 
-# De harde set uit rustdoc/README.md §12.
+# De harde set lints voor alle crates: geen unsafe zonder SAFETY-commentaar,
+# geen unwrap/expect/panic, faalbare paden in plaats van paniek.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 non_ascii_idents = "deny"

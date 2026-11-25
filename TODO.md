@@ -24,7 +24,7 @@ weegt niet op tegen uren downtime.
 3. **Volgen.** Een lezer past nieuwe manifesten incrementeel toe op zijn
    lokale kopie (de file change counter op pagina 1 maakt SQLite's cache
    ongeldig); een nieuwe generatie in `current` geeft een volledige restore.
-   Gedaan: `follow::Follow` (uit EasyFlor, 21-11-2026); de host heropent zijn
+   Gedaan: `follow::Follow` (21-11-2026); de host heropent zijn
    verbinding na een update.
 4. **Promotie.** Lease overnemen, inhalen tot de tip, nieuwe generatie,
    SQLite read-write heropenen. Eerst handmatig, daarna automatisch.
@@ -32,7 +32,8 @@ weegt niet op tegen uren downtime.
 ## Segmenten parallel uploaden
 
 Downloads gaan nu in rondes tegelijk (`Store::get_all`, standaard 16 stromen in `S3`).
-Uploads van een capture nog na elkaar; de Go-versie deed er twee tegelijk.
+Uploads van een capture gaan nog na elkaar; twee of meer tegelijk zou de
+upload van een grote capture inkorten.
 
 ## Restjes via de buren (na het bovenstaande)
 

@@ -1,6 +1,6 @@
 //! Meerdere databases onder één schrijverlease: een groep.
 //!
-//! Een app met meer dan één database per domein (EasyFlor: per tenant
+//! Een app met meer dan één database per domein (bijvoorbeeld per klant
 //! `main.db` en een bestand per jaar) repliceert elke database als een eigen
 //! namespace, `<prefix>/<domain>/<file>`: snapshots en incrementen van zijn
 //! pagina's, een `current`-generatie. Eén schrijverlease per domein
@@ -17,11 +17,11 @@
 //!   vóór elke store-call en tijdens de integriteitscontrole ([`Ticking`]),
 //!   en gaan de GET's in rondes die zich aanpassen aan hun duur: een herstel
 //!   langer dan twee derde lease verloor anders de lease bij de volgende
-//!   database (EasyFlor, 16-11-2026, 256 MiB op QEMU). Tijdens één lange
+//!   database (een host-app, 16-11-2026, 256 MiB op QEMU). Tijdens één lange
 //!   call houdt de waiter van de store de lease bij ([`KeepLease`],
 //!   [`Group::with_keep_lease`]); is hij toch verloren, dan stopt het herstel
 //!   bij de call waar dat bleek, met [`Report::lost`] op die database
-//!   (EasyFlor, 23-11-2026: één GET van 39 s, lease 30 s).
+//!   (een host-app, 23-11-2026: één GET van 39 s, lease 30 s).
 //! - **De lease bijhouden** ([`Group::keep_lease`]): hoogstens eens per
 //!   seconde gekeken, vernieuwd op leeftijd, ook uit de progresscallback van
 //!   een lang statement. Voorbij de schrijfdeadline maar vóór het verlopen
@@ -298,7 +298,7 @@ struct Member<D> {
 /// dan faalt de call met [`StoreError::Cancelled`] en is `lost` gezet: een
 /// herstel stopt bij de call waar het gebeurde, in plaats van minutenlang
 /// door te lopen tot de volgende database de lease verloren vindt
-/// (EasyFlor, 23-11-2026). Een call langer dan de marge van de lease wordt
+/// (een host-app, 23-11-2026). Een call langer dan de marge van de lease wordt
 /// gemeld ([`Report::slow`]).
 struct Renewing<'a, 'k, S: Bucket> {
     /// Per call geleend, zodat de controle tussendoor kan vernieuwen.
@@ -1405,7 +1405,7 @@ impl<'h, D: Storage, S: Bucket> Group<'h, D, S> {
 /// per verzoek (`replica_s3` doet sinds v3.2.5 nog één bij een verbinding die
 /// meteen dicht bleek; een andere store misschien niet). Bij een stop is de
 /// keep-alive-verbinding vaak een tijd stil geweest en faalt dat eerste
-/// verzoek met `Object(Transport)` zonder de store te bereiken (EasyFlor,
+/// verzoek met `Object(Transport)` zonder de store te bereiken (een host-app,
 /// 17-11-2026: elke stop in de recreate-proef; de opvolger wachtte tot de
 /// lease verliep). Na een transportfout dus nog hoogstens twee keer, op een
 /// nieuwe verbinding, bij naam ([`writer::release_named`]).

@@ -1,6 +1,6 @@
 //! De lezer van een gerepliceerde database: een lokale kopie die volgt wat
 //! de schrijver publiceert, zonder de schrijverlease en zonder ooit naar de
-//! store te schrijven (TODO "Volgen"; uit EasyFlor, 21-11-2026).
+//! store te schrijven (TODO "Volgen"; uit een host-app, 21-11-2026).
 //!
 //! [`crate::owner`] heeft de kant van de schrijver (Prepare zet een kopie
 //! voort of herstelt hem onder de lease) en [`crate::restore`] een volledig

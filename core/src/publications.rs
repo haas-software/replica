@@ -7,7 +7,7 @@
 //! bevat. Met [`crate::lanes`] wordt een capture in het ene rustmoment
 //! genomen en in een later moment gepubliceerd, nadat de upload landde; een
 //! write die ertussen kwam, zit er niet in. Een teller die elke landing telde,
-//! bevestigde zo een write die nog niet in de store stond (EasyFlor,
+//! bevestigde zo een write die nog niet in de store stond (een host-app,
 //! 21-11-2026: een jaarbestand gepubliceerd zonder de factuur waarop gewacht
 //! werd, en een verplaatsing die haar router kon omzetten vóór haar kopie
 //! gepubliceerd was).

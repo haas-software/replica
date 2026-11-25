@@ -1,5 +1,5 @@
 //! Een groep: meerdere databases onder één schrijverlease, met echte SQLite
-//! op een hostmap en de bucket in een map (de toetsen van EasyFlor die met de
+//! op een hostmap en de bucket in een map (de toetsen van een host-app die met de
 //! groep naar replica verhuisden, 21-11-2026).
 //!
 //! 1. Banen: een capture die onderweg is als een write komt, bevestigt die

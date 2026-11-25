@@ -1,4 +1,4 @@
-//! De lease tijdens één lange call van de store van de eigenaar (EasyFlor,
+//! De lease tijdens één lange call van de store van de eigenaar (een host-app,
 //! 23-11-2026, de flood-ring: na het herstel van een `main.db` van 64 MiB
 //! onder last `step=prepare error=LeaseLost` op `2026.db`, zonder één
 //! mislukte vernieuwing).

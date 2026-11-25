@@ -4,7 +4,7 @@
 //! op dezelfde stack bedient als zijn eigenaar (één verzoek tegelijk), houdt
 //! dan elk verzoek op zolang een publicatie, een onderhoudsbeurt of een
 //! leasevernieuwing op S3 wacht: tot de time-out van een hangende verbinding
-//! (EasyFlor op de M4, 20-11-2026: "na ~30 verzoeken staat alles 30 tot 60 s
+//! (een host-app op de M4, 20-11-2026: "na ~30 verzoeken staat alles 30 tot 60 s
 //! stil"). Met banen houdt de eigenaar alleen wat rust vraagt en lokaal is
 //! (de capture naar de spool, het manifest en de marker na een gelande
 //! upload); de uploads, de PUT van het manifest, het onderhoud en de lease
@@ -33,7 +33,7 @@
 //! vóór elke store- en opslagcall van een herstel, uit de progresscallback
 //! van een statement. Eén call die langer wacht dan de marge van de lease
 //! (een segment-GET die zijn budget vol maakt en opnieuw gaat) liet de lease
-//! dan verlopen zonder dat iets het zei (EasyFlor, 23-11-2026: een GET van
+//! dan verlopen zonder dat iets het zei (een host-app, 23-11-2026: een GET van
 //! 39 s bij een lease van 30 s, daarna `LeaseLost` bij de prepare van het
 //! volgende bestand). De store van de eigenaar wacht daarom met een waiter
 //! die tijdens het wachten [`KeepLease::keep`] aanroept (op HopOS

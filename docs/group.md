@@ -1,8 +1,8 @@
 # Meer databases onder één lease: de groep
 
-Uit EasyFlor overgenomen (21-11-2026): wat elke app met meer databases per
-domein anders zelf moet bouwen. EasyFlor heeft per tenant `main.db` en een
-bestand per jaar; dat is hier een domein met databases.
+Wat elke app met meer databases per domein anders zelf moet bouwen
+(21-11-2026, uit een HopOS-app met per klant een `main.db` en een bestand
+per jaar; dat is hier een domein met databases).
 
 ## Indeling in de bucket
 
@@ -26,7 +26,7 @@ elke database publiceert op zijn eigen moment.
 | `lanes::KeepLease` | De haak tussen de store van de eigenaar en zijn open groep: de waiter van de store houdt de lease bij terwijl één call wacht (`Group::with_keep_lease`) |
 | `publications::Publications` | Gedeelde kijk op de capturenummers van de eigenaars |
 | `follow::Follow` | Een lezer zonder lease die de publicaties van de schrijver volgt |
-| `replica_hopos::lanes` | De banen op HopOS: `Lanes::run` per stack, `OwnerLanes` als `Offload` |
+| `replica_hopos::lanes` | De banen op HopOS: `Lanes::spawn` start beide banen op eigen stacks (`Stacks`: leasebaan 2 MiB, databaan de maat van de host) en opent op elke stack de kant van de host; `Lanes::run` draait de jobs van één baan, `Lanes::owner` geeft de `OwnerLanes` als `Offload` |
 | `replica_hopos::keep::Keeping` | De waiter op HopOS: wacht als `Wait`, en roept elke seconde van een wachtbeurt `KeepLease::keep` aan |
 | `replica_hopos::s3::lease_store` | De store van de lease met `Dial::Forced`: de plek voor de geforceerde dial van lean/applib (nu nog gewoon) |
 
@@ -65,8 +65,8 @@ vóór elke store- en opslagcall van een herstel (`Group::prepare`), uit
 `cooperate`. Eén call die langer wacht dan de marge van de lease (een
 segment-GET die zijn budget vol maakt en opnieuw gaat) liet de lease verlopen
 zonder dat iets het zei; het herstel liep minuten door en pas de prepare van
-de volgende database vond hem verloren (EasyFlor, 23-11-2026: een GET van
-39 s bij een lease van 30 s).
+de volgende database vond hem verloren (23-11-2026, in een HopOS-app: een GET
+van 39 s bij een lease van 30 s).
 
 - **Bijhouden tijdens het wachten.** De store van de eigenaar wacht met een
   waiter die elke seconde `KeepLease::keep` aanroept (`Keeping` uit
@@ -93,16 +93,28 @@ leven. Wie wacht tot een write in de store staat, onthoudt `begun` op het
 moment van de write en wacht tot `confirmed` erboven is. Met banen wordt een
 capture in het ene rustmoment genomen en in een later gepubliceerd; een host
 die zelf landingen telde, bevestigde zo een write die nog niet in de store
-stond (EasyFlor, 21-11-2026). De groep zet de nummers per database in
+stond (21-11-2026). De groep zet de nummers per database in
 `Publications`.
 
 ## Banen
 
 Een S3-call parkeert de stack die hem doet. Met banen doet de eigenaar in
-rust alleen de capture (lokaal) en het manifest na een gelande upload (één
-kleine PUT, en alleen als een baan de store de laatste 10 s hoorde). De
-leasebaan doet de vernieuwing, nooit achter een upload; de databaan de uploads
-en het onderhoud (`owner::Config::background_maintenance` staat dan aan).
+rust alleen lokaal werk, sinds v3.2.6 ook bij het manifest:
+
+1. de capture;
+2. `Replica::finish_begin` na een gelande upload: fencen, het manifest klaar,
+   de marker duurzaam onzeker op zijn sequence;
+3. `Replica::finish_end` nadat de databaan de PUT deed: de marker op de
+   nieuwe sequence en de bevestiging van de tracking. Een mislukte PUT laat de
+   marker onzeker; de volgende capture lost hem op.
+
+De leasebaan doet de vernieuwing, nooit achter een upload; de databaan de
+uploads, de PUT van het manifest (`Publishing::put`, met een fence op de
+gedeelde lease, en bij een snapshot `current`) en het onderhoud
+(`owner::Config::background_maintenance` staat dan aan). Writes tijdens de
+PUT blijven dirty, zoals writes tijdens de upload. Zonder banen doet
+`Replica::finish` de drie stappen achter elkaar op de eigenaar; `Group::flush`
+doet het manifest ook op de eigenaar.
 
 ## Toetsen
 
